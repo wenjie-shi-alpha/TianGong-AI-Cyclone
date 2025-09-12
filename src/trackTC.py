@@ -21,7 +21,7 @@ from pathlib import Path
 from scipy import ndimage
 import trackpy as tp
 import warnings
-import tempfile
+import tempfile  # 保留但当前不再使用临时目录删除策略
 import boto3
 from botocore import UNSIGNED
 from botocore.config import Config
@@ -504,6 +504,7 @@ def process_from_csv(
     model_filter: str | None = None,
     start_date: str | None = None,
     end_date: str | None = None,
+    skip_if_track_exists: bool = False,
 ):
     if not csv_path.exists():
         raise FileNotFoundError(f"CSV 不存在: {csv_path}")
@@ -522,8 +523,10 @@ def process_from_csv(
     print(f"📄 待处理文件数: {len(df)}")
     output_dir = Path("track_output")
     output_dir.mkdir(exist_ok=True)
-    tmp_root = Path(tempfile.mkdtemp(prefix="tc_tmp_"))
-    print(f"🗂️ 临时目录: {tmp_root}")
+    # 改为持久化存储下载的NC文件，供后续 extractSyst 使用
+    persist_dir = Path("data/nc_files")
+    persist_dir.mkdir(parents=True, exist_ok=True)
+    print(f"🗂️ 持久化NC目录: {persist_dir}")
     total_tracks = 0
     try:
         for idx, row in df.iterrows():
@@ -539,31 +542,45 @@ def process_from_csv(
                 safe_prefix = sanitize_filename(model_prefix)
                 safe_init = sanitize_filename(init_time.replace(":", "").replace("-", ""))
                 expected_csv = output_dir / f"tracks_{safe_prefix}_{safe_init}_{forecast_tag}.csv"
-                if expected_csv.exists():
-                    print(f"⏭️  已存在轨迹文件, 跳过: {expected_csv}")
-                    continue
+                if expected_csv.exists() and skip_if_track_exists:
+                    # 若显式要求跳过且NC也已存在则完全跳过; 若NC缺失则继续以便后续环境分析
+                    nc_candidate = persist_dir / Path(fname).name  # 保留原始文件名
+                    if nc_candidate.exists():
+                        print(f"⏭️  已存在轨迹与NC文件, 跳过: {expected_csv}")
+                        continue
+                    else:
+                        print(f"🔁  轨迹存在但缺少NC，继续下载NC供后续分析: {nc_candidate.name}")
             except Exception as _e:
                 # 不因构造输出文件名失败而中断, 继续按原逻辑下载处理
                 print(f"⚠️ 构造输出文件名时出错(继续处理): {_e}")
             # ------------------------------------------------------------------
             print(f"\n⬇️  下载 {idx+1}/{len(df)}: {s3_url}")
-            tmp_file = tmp_root / sanitize_filename(Path(s3_url).name)
-            try:
-                download_s3_public(s3_url, tmp_file)
-            except Exception as e:
-                print(f"❌ 下载失败: {e}")
-                continue
+            original_name = Path(s3_url).name
+            tmp_file = persist_dir / original_name  # 保留原始扩展名
+            # 兼容旧版本已经下载且被sanitize去掉点号的文件: 尝试匹配并改名
+            if not tmp_file.exists():
+                legacy_pattern = sanitize_filename(original_name)
+                legacy_file = persist_dir / legacy_pattern
+                # 如果旧文件存在且没有 .nc 扩展名，执行重命名
+                if legacy_file.exists() and legacy_file.suffix != '.nc':
+                    try:
+                        legacy_file.rename(tmp_file)
+                        print(f"♻️  迁移旧命名文件 -> {tmp_file.name}")
+                    except Exception:
+                        pass
+            if not tmp_file.exists():
+                try:
+                    download_s3_public(s3_url, tmp_file)
+                except Exception as e:
+                    print(f"❌ 下载失败: {e}")
+                    continue
+            else:
+                print(f"📦 已存在本地文件: {tmp_file.name}, 跳过下载")
             track_count = process_single_file(tmp_file, model_prefix, init_time, output_dir)
             total_tracks += track_count
-            try:
-                tmp_file.unlink()
-            except Exception:
-                pass
+            # 不再删除 tmp_file，保留供后续环境场提取使用
     finally:
-        try:
-            shutil.rmtree(tmp_root)
-        except Exception:
-            pass
+        pass  # 保留结构，未来可加入资源回收逻辑
     print(f"\n✅ 完成. 总轨迹数(文件内去重): {total_tracks}")
     return total_tracks
 
@@ -581,6 +598,11 @@ def parse_args():
     p.add_argument("--model", default=None, help="Filter model_prefix (substring or regex)")
     p.add_argument("--start", default=None, help="Filter init_time start date YYYY-MM-DD")
     p.add_argument("--end", default=None, help="Filter init_time end date YYYY-MM-DD")
+    p.add_argument(
+        "--skip-if-track-exists",
+        action="store_true",
+        help="若轨迹CSV已存在且对应NC存在则跳过处理",
+    )
     # Plot option removed
     return p.parse_args()
 
@@ -593,6 +615,7 @@ def main():
         model_filter=args.model,
         start_date=args.start,
         end_date=args.end,
+        skip_if_track_exists=args.skip_if_track_exists,
     )
 
 

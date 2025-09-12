@@ -34,6 +34,8 @@ pip freeze > requirements_freeze.txt
 
 
 aws s3 ls --no-sign-request --region us-east-1 s3://noaa-oar-mlwp-data/
+
+python3 src/extractSyst.py --csv output/nc_file_urls.csv --limit 1 --auto
 ```
 
 Auto lint:
