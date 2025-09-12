@@ -1,0 +1,9 @@
+black
+boto3
+h5netcdf
+netCDF4
+numpy
+pandas
+scipy
+trackpy
+xarray
