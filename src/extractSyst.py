@@ -13,6 +13,7 @@ from datetime import datetime
 import json
 import math
 import warnings
+import re
 
 # 引入新的库用于图像处理和等值线提取
 try:
@@ -1624,130 +1625,117 @@ def main():
     nc_file: Path | None = None
     track_file: Path | None = None
 
-    # 1. 确定 NC 文件 (加入基于已存在 final_output 的提前跳过逻辑)
+    # 1. 处理逻辑: 单文件 (--nc) 或多文件 (来自CSV与缓存)
+    multi_mode = not bool(args.nc)
+
     if args.nc:
         nc_file = Path(args.nc)
         if not nc_file.exists():
             print(f"❌ 指定NC不存在: {nc_file}")
             sys.exit(1)
-        # 若用户显式指定 --nc, 则先判断对应 final_output 是否已存在
-        nc_stem_candidate = nc_file.stem
-        fo_dir = Path("final_output")
-        if fo_dir.exists():
-            existing = list(fo_dir.glob(f"{nc_stem_candidate}_TC_Analysis_*.json"))
-            if existing:
-                # 快速检查文件非空
-                non_empty = [p for p in existing if p.stat().st_size > 10]
-                if non_empty:
-                    print(f"⏩ 检测到已存在分析结果 ({len(non_empty)} 个) 对应 NC '{nc_stem_candidate}', 直接跳过全部流程。")
-                    return
+        target_nc_files = [nc_file]
     else:
-        # 查找已缓存, 兼容旧无扩展命名
+        # 调用追踪下载(可能只做部分, 只负责产生轨迹与NC). 不在此提前退出; 逐文件判断是否跳过
+        from trackTC import process_from_csv
+        print("⬇️ 未指定NC, 将根据CSV下载/追踪 (limit=", args.limit, ") (若已存在轨迹将跳过下载)")
+        process_from_csv(Path(args.csv), limit=args.limit)
         cache_dir = Path("data/nc_files")
-        if cache_dir.exists():
-            cached = sorted(cache_dir.glob("*.nc"))
-            if not cached:
-                legacy = [p for p in cache_dir.iterdir() if p.is_file() and p.suffix == "" and "nc" in p.name.lower()]
-                if legacy:
-                    # 只处理第一个legacy
-                    legacy_file = legacy[0]
-                    new_name = legacy_file.with_suffix(".nc")
-                    try:
-                        legacy_file.rename(new_name)
-                        print(f"♻️  修复旧NC文件命名 -> {new_name.name}")
-                        cached = [new_name]
-                    except Exception as e:
-                        print(f"⚠️  旧文件重命名失败: {e}")
-            if cached:
-                nc_file = cached[0]
-        if nc_file is None:
-            # 若无缓存, 且未禁用下载, 尝试从CSV下载(使用 trackTC 模块逻辑)
-            # 在真正下载前，尝试从CSV首行推测目标文件名 stem (简单解析)
-            csv_path = Path(args.csv)
-            nc_stem_candidate = None
-            if csv_path.exists():
-                try:
-                    import csv as _csv
-                    with csv_path.open("r", encoding="utf-8") as cf:
-                        reader = _csv.DictReader(cf)
-                        first = next(reader, None)
-                        # 期望有 s3_url 字段，文件名末尾可能是 *.nc 或 *_derived_fields.nc
-                        if first and 's3_url' in first and first['s3_url']:
-                            url_last = first['s3_url'].rstrip('/').split('/')[-1]
-                            if url_last.endswith('.nc'):
-                                nc_stem_candidate = Path(url_last).stem
-                except Exception:
-                    pass
-            fo_dir = Path("final_output")
-            if nc_stem_candidate and fo_dir.exists():
-                existing = list(fo_dir.glob(f"{nc_stem_candidate}_TC_Analysis_*.json"))
-                non_empty = [p for p in existing if p.stat().st_size > 10]
-                if non_empty:
-                    print(f"⏩ 检测到已存在分析结果 ({len(non_empty)} 个) 对应推测 NC '{nc_stem_candidate}', 跳过下载、追踪与分析。")
-                    return
-
-            from trackTC import process_from_csv
-            print("⬇️ 未指定NC, 将根据CSV下载并追踪 (limit=", args.limit, ")")
-            process_from_csv(Path(args.csv), limit=args.limit)
-            cached = sorted(Path("data/nc_files").glob("*.nc"))
-            if not cached:
-                print("❌ 下载后仍未找到NC文件, 退出")
-                sys.exit(1)
-            nc_file = cached[0]
-
-    print(f"✅ 使用NC文件: {nc_file}")
-
-    # 2. 确定轨迹文件
-    if args.tracks:
-        track_file = Path(args.tracks)
-        if not track_file.exists():
-            print(f"❌ 指定轨迹不存在: {track_file}")
+        if not cache_dir.exists():
+            print("❌ 没有找到 data/nc_files 目录")
             sys.exit(1)
-    else:
-        # 搜索 track_output
-        tdir = Path("track_output")
-        if tdir.exists():
-            tracks = sorted(tdir.glob("tracks_*.csv"))
-            if tracks:
-                track_file = tracks[0]
-        if track_file is None and args.auto:
-            # 自动追踪
-            from trackTC import process_single_file, UnifiedTropicalCycloneTracker
-            print("🔄 自动追踪阶段...")
-            # 直接运行追踪: 需要构造最小元数据
-            tracker = UnifiedTropicalCycloneTracker(str(nc_file))
-            features_df, tracks_df = tracker.track_cyclones(search_range=args.search_range, memory=args.memory)
-            if tracks_df.empty:
-                print("❌ 未生成任何轨迹, 无法继续环境分析")
-                sys.exit(1)
-            out_dir = Path("track_output")
-            out_dir.mkdir(exist_ok=True)
-            # 构造文件名
-            ts0 = pd.to_datetime(tracks_df.iloc[0]["time"]).strftime("%Y%m%d%H") if "time" in tracks_df.columns else "T000"
-            track_file = out_dir / f"tracks_auto_{ts0}.csv"
-            tracks_df.to_csv(track_file, index=False)
-            print(f"💾 自动轨迹文件: {track_file}")
-    if track_file is None:
-        print("❌ 未找到轨迹CSV且未启用 --auto 自动追踪。")
-        sys.exit(1)
+        cached = sorted(cache_dir.glob("*.nc"))
+        if not cached:
+            print("❌ 未发现任何NC文件")
+            sys.exit(1)
+        # 如果用户给了 limit, 这里再裁剪一次(防止旧缓存>limit)
+        if args.limit is not None:
+            target_nc_files = cached[: args.limit]
+        else:
+            target_nc_files = cached
 
-    print(f"✅ 使用轨迹文件: {track_file}")
+    print(f"📦 待环境分析NC数量: {len(target_nc_files)}")
 
-    # 3. 运行环境系统分析
-    extractor = TCEnvironmentalSystemsExtractor(str(nc_file), str(track_file))
-    extractor.analyze_and_export_as_json("final_output")
+    final_output_dir = Path("final_output")
+    final_output_dir.mkdir(exist_ok=True)
 
-    # 4. 清理 NC (除非保留)
-    if not (args.no_clean or args.keep_nc):
+    processed = 0
+    skipped = 0
+    for idx, nc_file in enumerate(target_nc_files, start=1):
+        nc_stem = nc_file.stem
+        print(f"\n[{idx}/{len(target_nc_files)}] ▶️ 处理 NC: {nc_file.name}")
+        # 检查是否已有输出
+        existing = list(final_output_dir.glob(f"{nc_stem}_TC_Analysis_*.json"))
+        non_empty = [p for p in existing if p.stat().st_size > 10]
+        if non_empty:
+            print(f"⏭️  已存在分析结果 ({len(non_empty)}) -> 跳过 {nc_stem}")
+            skipped += 1
+            continue
+
+        # 寻找匹配的轨迹文件 (优先 forecast_tag 匹配)
+        track_file = None
+        if args.tracks:
+            t = Path(args.tracks)
+            if t.exists():
+                track_file = t
+        if track_file is None:
+            tdir = Path("track_output")
+            if tdir.exists():
+                forecast_tag_match = re.search(r"(f\d{3}_f\d{3}_\d{2})", nc_stem)
+                potential = []
+                if forecast_tag_match:
+                    tag = forecast_tag_match.group(1)
+                    potential = list(tdir.glob(f"tracks_*_{tag}.csv"))
+                tracks_all = sorted(tdir.glob("tracks_*.csv"))
+                if potential:
+                    track_file = potential[0]
+                elif tracks_all:
+                    # 退化选择: 选第一个 (提示不精确)
+                    track_file = tracks_all[0]
+                    print(f"⚠️ 未精确匹配 forecast_tag, 使用 {track_file.name}")
+        if track_file is None:
+            if args.auto:
+                from trackTC import UnifiedTropicalCycloneTracker
+                print("🔄 自动追踪当前NC以生成轨迹...")
+                tracker = UnifiedTropicalCycloneTracker(str(nc_file))
+                features_df, tracks_df = tracker.track_cyclones(search_range=args.search_range, memory=args.memory)
+                if tracks_df.empty:
+                    print("⚠️ 无轨迹 -> 跳过该NC")
+                    skipped += 1
+                    continue
+                out_dir = Path("track_output")
+                out_dir.mkdir(exist_ok=True)
+                ts0 = pd.to_datetime(tracks_df.iloc[0]["time"]).strftime("%Y%m%d%H") if "time" in tracks_df.columns else "T000"
+                track_file = out_dir / f"tracks_auto_{nc_stem}_{ts0}.csv"
+                tracks_df.to_csv(track_file, index=False)
+                print(f"💾 自动轨迹文件: {track_file.name}")
+            else:
+                print("⚠️ 未找到对应轨迹且未启用 --auto, 跳过")
+                skipped += 1
+                continue
+
+        print(f"✅ 使用轨迹文件: {track_file}")
         try:
-            nc_file.unlink()
-            print(f"🧹 已删除 NC: {nc_file}")
+            extractor = TCEnvironmentalSystemsExtractor(str(nc_file), str(track_file))
+            extractor.analyze_and_export_as_json("final_output")
+            processed += 1
         except Exception as e:
-            print(f"⚠️ 删除NC失败: {e}")
-    else:
-        print("ℹ️ 按参数保留NC文件。")
+            print(f"❌ 分析失败 {nc_file.name}: {e}")
+            continue
 
-    print("\n🎉 一体化流程完成。结果目录: final_output")
+        if not (args.no_clean or args.keep_nc):
+            try:
+                nc_file.unlink()
+                print(f"🧹 已删除 NC: {nc_file.name}")
+            except Exception as e:
+                print(f"⚠️ 删除NC失败: {e}")
+        else:
+            print("ℹ️ 按参数保留NC文件")
+
+    print("\n🎉 多文件环境分析完成. 统计:")
+    print(f"  ✅ 已分析: {processed}")
+    print(f"  ⏭️ 跳过(已有结果/无轨迹): {skipped}")
+    print(f"  📦 总计遍历: {len(target_nc_files)}")
+    print("结果目录: final_output")
 
 
 if __name__ == "__main__":
