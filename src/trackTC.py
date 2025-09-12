@@ -520,7 +520,7 @@ def process_from_csv(
     if limit is not None:
         df = df.head(limit)
     print(f"📄 待处理文件数: {len(df)}")
-    output_dir = Path("data")
+    output_dir = Path("track_output")
     output_dir.mkdir(exist_ok=True)
     tmp_root = Path(tempfile.mkdtemp(prefix="tc_tmp_"))
     print(f"🗂️ 临时目录: {tmp_root}")
