@@ -1604,6 +1604,123 @@ class TCEnvironmentalSystemsExtractor:
         return np.outer(lat_mask, lon_mask)
 
 
+    # ================= 新增: 流式顺序处理函数 =================
+def streaming_from_csv(
+    csv_path: Path,
+    limit: int | None = None,
+    search_range: float = 3.0,
+    memory: int = 3,
+    keep_nc: bool = False,
+):
+    """逐行读取CSV, 每个NC文件执行: 下载 -> 追踪 -> 环境分析 -> (可选删除)
+
+    与原批量模式最大区别: 不预先下载全部; 每个文件完成后即可释放磁盘。
+    """
+    if not csv_path.exists():
+        print(f"❌ CSV不存在: {csv_path}")
+        return
+    import pandas as pd, re, traceback
+    from trackTC import UnifiedTropicalCycloneTracker, sanitize_filename, download_s3_public
+
+    df = pd.read_csv(csv_path)
+    required_cols = {"s3_url", "model_prefix", "init_time"}
+    if not required_cols.issubset(df.columns):
+        print(f"❌ CSV缺少必要列: {required_cols - set(df.columns)}")
+        return
+    if limit is not None:
+        df = df.head(limit)
+    print(f"📄 流式待处理数量: {len(df)} (limit={limit})")
+
+    persist_dir = Path("data/nc_files")  # 仍放入该目录, 便于复用逻辑
+    persist_dir.mkdir(parents=True, exist_ok=True)
+    track_dir = Path("track_output"); track_dir.mkdir(exist_ok=True)
+    final_dir = Path("final_output"); final_dir.mkdir(exist_ok=True)
+
+    processed = 0
+    skipped = 0
+    for idx, row in df.iterrows():
+        s3_url = row["s3_url"]
+        model_prefix = row["model_prefix"]
+        init_time = row["init_time"]
+        fname = Path(s3_url).name
+        m = re.search(r"(f\d{3}_f\d{3}_\d{2})", Path(fname).stem)
+        forecast_tag = m.group(1) if m else "track"
+        safe_prefix = sanitize_filename(model_prefix)
+        safe_init = sanitize_filename(init_time.replace(":", "").replace("-", ""))
+        track_csv = track_dir / f"tracks_{safe_prefix}_{safe_init}_{forecast_tag}.csv"
+        nc_local = persist_dir / fname
+
+        print(f"\n[{idx+1}/{len(df)}] ▶️ 处理: {fname}")
+
+        # 如果 final 已存在则跳过整个流程
+        existing_json = list(final_dir.glob(f"{Path(fname).stem}_TC_Analysis_*.json"))
+        if existing_json:
+            non_empty = [p for p in existing_json if p.stat().st_size > 10]
+            if non_empty:
+                print(f"⏭️  已存在最终JSON({len(non_empty)}) -> 跳过")
+                skipped += 1
+                continue
+
+        # 下载 (若不存在)
+        if not nc_local.exists():
+            try:
+                print(f"⬇️  下载NC: {s3_url}")
+                download_s3_public(s3_url, nc_local)
+            except Exception as e:
+                print(f"❌ 下载失败, 跳过: {e}")
+                skipped += 1
+                continue
+        else:
+            print("📦 已存在NC文件, 复用")
+
+        # 轨迹: 若不存在则计算
+        if not track_csv.exists():
+            try:
+                print("🧭 执行追踪算法...")
+                tracker = UnifiedTropicalCycloneTracker(str(nc_local))
+                features_df, tracks_df = tracker.track_cyclones(search_range=search_range, memory=memory)
+                if tracks_df.empty:
+                    print("⚠️ 无有效轨迹 -> 跳过环境分析")
+                    if not keep_nc:
+                        try:
+                            nc_local.unlink(); print("🧹 已删除NC (无轨迹)")
+                        except Exception: pass
+                    skipped += 1
+                    continue
+                tracks_df.to_csv(track_csv, index=False)
+                print(f"💾 保存轨迹: {track_csv.name}")
+            except Exception as e:
+                print(f"❌ 追踪失败: {e}")
+                traceback.print_exc()
+                if not keep_nc:
+                    try:
+                        nc_local.unlink(); print("🧹 已删除NC (追踪失败)")
+                    except Exception: pass
+                skipped += 1
+                continue
+        else:
+            print("🗺️  已存在轨迹CSV, 直接环境分析")
+
+        # 环境分析
+        try:
+            extractor = TCEnvironmentalSystemsExtractor(str(nc_local), str(track_csv))
+            extractor.analyze_and_export_as_json("final_output")
+            processed += 1
+        except Exception as e:
+            print(f"❌ 环境分析失败: {e}")
+        finally:
+            if not keep_nc:
+                try:
+                    nc_local.unlink(); print("🧹 已删除NC文件")
+                except Exception as ee:
+                    print(f"⚠️ 删除NC失败: {ee}")
+
+    print("\n📊 流式处理结果:")
+    print(f"  ✅ 完成: {processed}")
+    print(f"  ⏭️ 跳过: {skipped}")
+    print(f"  📁 输出目录: final_output")
+
+
 def main():
     import argparse, sys, subprocess
 
@@ -1617,6 +1734,7 @@ def main():
     parser.add_argument("--auto", action="store_true", help="无轨迹则自动运行追踪")
     parser.add_argument("--search-range", type=float, default=3.0, help="追踪搜索范围")
     parser.add_argument("--memory", type=int, default=3, help="追踪记忆时间步")
+    parser.add_argument("--batch", action="store_true", help="使用旧的批量模式: 先全部下载+追踪, 再统一做环境分析")
     args = parser.parse_args()
 
     print("🌀 一体化热带气旋分析流程启动")
@@ -1625,35 +1743,42 @@ def main():
     nc_file: Path | None = None
     track_file: Path | None = None
 
-    # 1. 处理逻辑: 单文件 (--nc) 或多文件 (来自CSV与缓存)
-    multi_mode = not bool(args.nc)
-
+    # 1. 单文件直通模式 (--nc) 或 CSV 多文件顺序流式模式 (默认) / 旧批量模式 (--batch)
     if args.nc:
         nc_file = Path(args.nc)
         if not nc_file.exists():
             print(f"❌ 指定NC不存在: {nc_file}")
             sys.exit(1)
         target_nc_files = [nc_file]
+        print("📦 单文件分析模式")
     else:
-        # 调用追踪下载(可能只做部分, 只负责产生轨迹与NC). 不在此提前退出; 逐文件判断是否跳过
-        from trackTC import process_from_csv
-        print("⬇️ 未指定NC, 将根据CSV下载/追踪 (limit=", args.limit, ") (若已存在轨迹将跳过下载)")
-        process_from_csv(Path(args.csv), limit=args.limit)
-        cache_dir = Path("data/nc_files")
-        if not cache_dir.exists():
-            print("❌ 没有找到 data/nc_files 目录")
-            sys.exit(1)
-        cached = sorted(cache_dir.glob("*.nc"))
-        if not cached:
-            print("❌ 未发现任何NC文件")
-            sys.exit(1)
-        # 如果用户给了 limit, 这里再裁剪一次(防止旧缓存>limit)
-        if args.limit is not None:
-            target_nc_files = cached[: args.limit]
+        if args.batch:
+            # 旧批量模式: 兼容原逻辑
+            from trackTC import process_from_csv
+            print("⬇️ [批量模式] 先统一下载/追踪后再做环境分析 (limit=", args.limit, ")")
+            process_from_csv(Path(args.csv), limit=args.limit)
+            cache_dir = Path("data/nc_files")
+            if not cache_dir.exists():
+                print("❌ 没有找到 data/nc_files 目录")
+                sys.exit(1)
+            cached = sorted(cache_dir.glob("*.nc"))
+            if not cached:
+                print("❌ 未发现任何NC文件")
+                sys.exit(1)
+            target_nc_files = cached[: args.limit] if args.limit is not None else cached
+            print(f"📦 待环境分析NC数量: {len(target_nc_files)}")
         else:
-            target_nc_files = cached
-
-    print(f"📦 待环境分析NC数量: {len(target_nc_files)}")
+            # 新的流式顺序处理: 逐条CSV -> 下载 -> 追踪 -> 环境分析 -> (可选清理)
+            print("🚚 启用流式顺序处理: 每个NC独立完成(下载->追踪->环境分析->清理)")
+            streaming_from_csv(
+                csv_path=Path(args.csv),
+                limit=args.limit,
+                search_range=args.search_range,
+                memory=args.memory,
+                keep_nc=(args.no_clean or args.keep_nc),
+            )
+            print("🎯 流式处理完成 (无需进入批量后处理循环)")
+            return
 
     final_output_dir = Path("final_output")
     final_output_dir.mkdir(exist_ok=True)
