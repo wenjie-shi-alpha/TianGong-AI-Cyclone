@@ -1624,12 +1624,23 @@ def main():
     nc_file: Path | None = None
     track_file: Path | None = None
 
-    # 1. 确定 NC 文件
+    # 1. 确定 NC 文件 (加入基于已存在 final_output 的提前跳过逻辑)
     if args.nc:
         nc_file = Path(args.nc)
         if not nc_file.exists():
             print(f"❌ 指定NC不存在: {nc_file}")
             sys.exit(1)
+        # 若用户显式指定 --nc, 则先判断对应 final_output 是否已存在
+        nc_stem_candidate = nc_file.stem
+        fo_dir = Path("final_output")
+        if fo_dir.exists():
+            existing = list(fo_dir.glob(f"{nc_stem_candidate}_TC_Analysis_*.json"))
+            if existing:
+                # 快速检查文件非空
+                non_empty = [p for p in existing if p.stat().st_size > 10]
+                if non_empty:
+                    print(f"⏩ 检测到已存在分析结果 ({len(non_empty)} 个) 对应 NC '{nc_stem_candidate}', 直接跳过全部流程。")
+                    return
     else:
         # 查找已缓存, 兼容旧无扩展命名
         cache_dir = Path("data/nc_files")
@@ -1651,9 +1662,32 @@ def main():
                 nc_file = cached[0]
         if nc_file is None:
             # 若无缓存, 且未禁用下载, 尝试从CSV下载(使用 trackTC 模块逻辑)
+            # 在真正下载前，尝试从CSV首行推测目标文件名 stem (简单解析)
+            csv_path = Path(args.csv)
+            nc_stem_candidate = None
+            if csv_path.exists():
+                try:
+                    import csv as _csv
+                    with csv_path.open("r", encoding="utf-8") as cf:
+                        reader = _csv.DictReader(cf)
+                        first = next(reader, None)
+                        # 期望有 s3_url 字段，文件名末尾可能是 *.nc 或 *_derived_fields.nc
+                        if first and 's3_url' in first and first['s3_url']:
+                            url_last = first['s3_url'].rstrip('/').split('/')[-1]
+                            if url_last.endswith('.nc'):
+                                nc_stem_candidate = Path(url_last).stem
+                except Exception:
+                    pass
+            fo_dir = Path("final_output")
+            if nc_stem_candidate and fo_dir.exists():
+                existing = list(fo_dir.glob(f"{nc_stem_candidate}_TC_Analysis_*.json"))
+                non_empty = [p for p in existing if p.stat().st_size > 10]
+                if non_empty:
+                    print(f"⏩ 检测到已存在分析结果 ({len(non_empty)} 个) 对应推测 NC '{nc_stem_candidate}', 跳过下载、追踪与分析。")
+                    return
+
             from trackTC import process_from_csv
             print("⬇️ 未指定NC, 将根据CSV下载并追踪 (limit=", args.limit, ")")
-            # 下载+追踪生成轨迹; trackTC 会把NC放入 data/nc_files
             process_from_csv(Path(args.csv), limit=args.limit)
             cached = sorted(Path("data/nc_files").glob("*.nc"))
             if not cached:
