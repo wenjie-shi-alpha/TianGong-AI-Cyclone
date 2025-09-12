@@ -42,6 +42,8 @@ class UnifiedTropicalCycloneTracker:
         self.lon_180 = np.where(self.lon > 180, self.lon - 360, self.lon)
         self.lat_spacing = np.abs(np.diff(self.lat).mean())
         self.lon_spacing = np.abs(np.diff(self.lon).mean())
+        # 缓存: 850hPa 涡度 (按时间步) 避免重复计算
+        self._vort_cache: dict[int, np.ndarray | None] = {}
         self.params = {
             "mslp_threshold": 1010.0,
             "vorticity_threshold": 3.0e-5,
@@ -124,6 +126,21 @@ class UnifiedTropicalCycloneTracker:
             print(f"⚠️ 涡度计算失败: {e}")
             return np.zeros_like(u)
 
+    def _get_vorticity_850(self, time_idx):
+        """获取(并缓存) 850hPa 涡度场; 若缺少风场返回 None"""
+        if time_idx in self._vort_cache:
+            return self._vort_cache[time_idx]
+        if not (self.has_u and self.has_v):
+            self._vort_cache[time_idx] = None
+            return None
+        u_850 = self._get_data_at_level("u", 850, time_idx)
+        v_850 = self._get_data_at_level("v", 850, time_idx)
+        if u_850 is None or v_850 is None:
+            self._vort_cache[time_idx] = None
+        else:
+            self._vort_cache[time_idx] = self._calculate_vorticity(u_850, v_850)
+        return self._vort_cache[time_idx]
+
     def _get_region_stats(self, field, center_lat_idx, center_lon_idx, radius_deg):
         radius_lat = int(radius_deg / self.lat_spacing)
         radius_lon = int(
@@ -146,6 +163,9 @@ class UnifiedTropicalCycloneTracker:
                 min_coords = np.where(local_minima)
                 for i in range(len(min_coords[0])):
                     lat_idx, lon_idx = min_coords[0][i], min_coords[1][i]
+                    # 低风险加速: 跳过高纬 (>40°) 区域
+                    if abs(self.lat[lat_idx]) > 40:
+                        continue
                     pressure = mslp[lat_idx, lon_idx]
                     if pressure < self.params["mslp_threshold"]:
                         candidates.append(
@@ -162,22 +182,18 @@ class UnifiedTropicalCycloneTracker:
                 print(f"⚠️ MSLP候选点寻找失败: {e}")
         if self.has_u and self.has_v:
             try:
-                u_850 = self._get_data_at_level("u", 850, time_idx)
-                v_850 = self._get_data_at_level("v", 850, time_idx)
-                if u_850 is not None and v_850 is not None:
-                    vorticity = self._calculate_vorticity(u_850, v_850)
+                vorticity = self._get_vorticity_850(time_idx)
+                if vorticity is not None:
                     vorticity_smooth = ndimage.gaussian_filter(vorticity, sigma=1.0)
                     if np.mean(self.lat) >= 0:
-                        local_maxima = (
-                            ndimage.maximum_filter(vorticity_smooth, size=7) == vorticity_smooth
-                        )
+                        local_ext = ndimage.maximum_filter(vorticity_smooth, size=7) == vorticity_smooth
                     else:
-                        local_maxima = (
-                            ndimage.minimum_filter(vorticity_smooth, size=7) == vorticity_smooth
-                        )
-                    max_coords = np.where(local_maxima)
+                        local_ext = ndimage.minimum_filter(vorticity_smooth, size=7) == vorticity_smooth
+                    max_coords = np.where(local_ext)
                     for i in range(len(max_coords[0])):
                         lat_idx, lon_idx = max_coords[0][i], max_coords[1][i]
+                        if abs(self.lat[lat_idx]) > 40:
+                            continue
                         vort_value = vorticity[lat_idx, lon_idx]
                         threshold = self.params["vorticity_threshold"]
                         if (np.mean(self.lat) >= 0 and vort_value > threshold) or (
@@ -228,8 +244,8 @@ class UnifiedTropicalCycloneTracker:
             return []
         diagnosed = []
         mslp = self.ds.msl.isel(time=time_idx).values / 100 if self.has_mslp else None
-        u_850 = self._get_data_at_level("u", 850, time_idx) if self.has_u and self.has_v else None
-        v_850 = self._get_data_at_level("v", 850, time_idx) if self.has_u and self.has_v else None
+        # 已缓存的 850hPa 涡度
+        vort_field = self._get_vorticity_850(time_idx) if (self.has_u and self.has_v) else None
         t_500 = self._get_data_at_level("t", 500, time_idx) if self.has_temp else None
         t_850 = self._get_data_at_level("t", 850, time_idx) if self.has_temp else None
         u10 = self.ds.u10.isel(time=time_idx).values if self.has_u10 else None
@@ -240,9 +256,8 @@ class UnifiedTropicalCycloneTracker:
             lat = candidate["lat"]
             if abs(lat) > 40:
                 continue
-            if u_850 is not None and v_850 is not None:
-                vorticity = self._calculate_vorticity(u_850, v_850)
-                vort_mean, _, _ = self._get_region_stats(vorticity, lat_idx, lon_idx, 2.5)
+            if vort_field is not None:
+                vort_mean, _, _ = self._get_region_stats(vort_field, lat_idx, lon_idx, 2.5)
                 vort_ok = (lat >= 0 and vort_mean > self.params["min_vorticity_avg"]) or (
                     lat < 0 and vort_mean < -self.params["min_vorticity_avg"]
                 )
