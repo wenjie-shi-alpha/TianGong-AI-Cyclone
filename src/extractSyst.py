@@ -117,9 +117,12 @@ class WeatherSystemShapeAnalyzer:
     def _select_main_system(self, labeled_mask, num_features, center_lat, center_lon):
         """选择主要的气象系统区域"""
         if center_lat is None or center_lon is None:
-            # 选择最大的连通区域
-            sizes = [np.sum(labeled_mask == i) for i in range(1, num_features + 1)]
-            main_label = np.argmax(sizes) + 1
+            # 选择最大的连通区域 (使用 bincount 等价加速)
+            flat_labels = labeled_mask.ravel()
+            counts = np.bincount(flat_labels)[1: num_features + 1]
+            if counts.size == 0:
+                return None
+            main_label = int(np.argmax(counts) + 1)
         else:
             # 选择离指定中心最近的区域
             center_lat_idx = np.abs(self.lat - center_lat).argmin()
@@ -483,6 +486,28 @@ class TCEnvironmentalSystemsExtractor:
         self.lat_spacing = np.abs(np.diff(self.lat).mean())
         self.lon_spacing = np.abs(np.diff(self.lon).mean())
 
+        # 预计算 cos(lat) 及其安全版本（避免极区除零放大）；不改变数值策略，仅提前计算
+        self._coslat = np.cos(np.deg2rad(self.lat))
+        self._coslat_safe = np.where(np.abs(self._coslat) < 1e-6, np.nan, self._coslat)
+
+        # 梯度缓存：存储 (id(array) -> (grad_y_raw, grad_x_raw))，保持与 np.gradient(axis=0/1) 完全一致
+        self._grad_cache: dict[int, tuple[np.ndarray, np.ndarray]] = {}
+
+        def _raw_gradients(arr: np.ndarray):
+            key = id(arr)
+            if key in self._grad_cache:
+                return self._grad_cache[key]
+            gy = np.gradient(arr, axis=0)
+            gx = np.gradient(arr, axis=1)
+            self._grad_cache[key] = (gy, gx)
+            return gy, gx
+        self._raw_gradients = _raw_gradients  # 绑定实例
+
+        # 经纬度索引辅助：功能等价于原多次 argmin 调用
+        def _loc_idx(lat_val: float, lon_val: float):
+            return (np.abs(self.lat - lat_val).argmin(), np.abs(self.lon - lon_val).argmin())
+        self._loc_idx = _loc_idx
+
         # 初始化形状分析器
         self.shape_analyzer = WeatherSystemShapeAnalyzer(self.lat, self.lon)
 
@@ -737,21 +762,16 @@ class TCEnvironmentalSystemsExtractor:
 
             # 计算散度场 (加入极区防护和有限值过滤)
             with np.errstate(divide="ignore", invalid="ignore"):
-                coslat = np.cos(np.deg2rad(self.lat))
-                coslat = np.where(np.abs(coslat) < 1e-6, np.nan, coslat)
-                du_dx = np.gradient(u200, axis=1) / (
-                    self.lon_spacing * 111000 * coslat[:, np.newaxis]
-                )
-                dv_dy = np.gradient(v200, axis=0) / (self.lat_spacing * 111000)
+                gy_u, gx_u = self._raw_gradients(u200)
+                gy_v, gx_v = self._raw_gradients(v200)
+                du_dx = gx_u / (self.lon_spacing * 111000 * self._coslat_safe[:, np.newaxis])
+                dv_dy = gy_v / (self.lat_spacing * 111000)
                 divergence = du_dx + dv_dy
             if not np.any(np.isfinite(divergence)):
                 return None
             divergence[~np.isfinite(divergence)] = np.nan
 
-            lat_idx, lon_idx = (
-                np.abs(self.lat - tc_lat).argmin(),
-                np.abs(self.lon - tc_lon).argmin(),
-            )
+            lat_idx, lon_idx = self._loc_idx(tc_lat, tc_lon)
             div_val_raw = divergence[lat_idx, lon_idx]
             if not np.isfinite(div_val_raw):
                 # 使用周围 3x3 有限值平均替代
@@ -802,10 +822,10 @@ class TCEnvironmentalSystemsExtractor:
                 return None
 
             # 计算850hPa涡度来识别ITCZ
-            du_dy = np.gradient(u850, axis=0) / (self.lat_spacing * 111000)
-            dv_dx = np.gradient(v850, axis=1) / (
-                self.lon_spacing * 111000 * np.cos(np.deg2rad(self.lat[:, np.newaxis]))
-            )
+            gy_u, gx_u = self._raw_gradients(u850)
+            gy_v, gx_v = self._raw_gradients(v850)
+            du_dy = gy_u / (self.lat_spacing * 111000)
+            dv_dx = gx_v / (self.lon_spacing * 111000 * self._coslat_safe[:, np.newaxis])
             vorticity = dv_dx - du_dy
 
             # ITCZ通常位于5°N-15°N之间，寻找最大涡度带
@@ -932,13 +952,9 @@ class TCEnvironmentalSystemsExtractor:
 
             # 计算温度梯度来识别锋面 (防止极区 cos(latitude)=0 导致除零 -> inf)
             with np.errstate(divide="ignore", invalid="ignore"):
-                coslat = np.cos(np.deg2rad(self.lat))
-                # 将非常小的 cos 值置为 NaN 避免放大
-                coslat = np.where(np.abs(coslat) < 1e-6, np.nan, coslat)
-                dt_dy = np.gradient(t850, axis=0) / (self.lat_spacing * 111000)
-                dt_dx = np.gradient(t850, axis=1) / (
-                    self.lon_spacing * 111000 * coslat[:, np.newaxis]
-                )
+                gy_t, gx_t = self._raw_gradients(t850)
+                dt_dy = gy_t / (self.lat_spacing * 111000)
+                dt_dx = gx_t / (self.lon_spacing * 111000 * self._coslat_safe[:, np.newaxis])
                 temp_gradient = np.sqrt(dt_dx**2 + dt_dy**2)
 
             # 清理异常值
@@ -954,10 +970,7 @@ class TCEnvironmentalSystemsExtractor:
                 return None
 
             # 寻找离台风最近的锋面
-            lat_idx, lon_idx = (
-                np.abs(self.lat - tc_lat).argmin(),
-                np.abs(self.lon - tc_lon).argmin(),
-            )
+            lat_idx, lon_idx = self._loc_idx(tc_lat, tc_lon)
             search_radius = 50  # 搜索半径格点数
 
             lat_start = max(0, lat_idx - search_radius)
@@ -1037,10 +1050,10 @@ class TCEnvironmentalSystemsExtractor:
                 return None
 
             # 计算850hPa相对涡度
-            du_dy = np.gradient(u850, axis=0) / (self.lat_spacing * 111000)
-            dv_dx = np.gradient(v850, axis=1) / (
-                self.lon_spacing * 111000 * np.cos(np.deg2rad(self.lat[:, np.newaxis]))
-            )
+            gy_u, gx_u = self._raw_gradients(u850)
+            gy_v, gx_v = self._raw_gradients(v850)
+            du_dy = gy_u / (self.lat_spacing * 111000)
+            dv_dx = gx_v / (self.lon_spacing * 111000 * self._coslat_safe[:, np.newaxis])
             relative_vorticity = dv_dx - du_dy
 
             # 清理异常数值
@@ -1063,10 +1076,7 @@ class TCEnvironmentalSystemsExtractor:
                 return None
 
             monsoon_mask = relative_vorticity > monsoon_threshold
-            lat_idx, lon_idx = (
-                np.abs(self.lat - tc_lat).argmin(),
-                np.abs(self.lon - tc_lon).argmin(),
-            )
+            lat_idx, lon_idx = self._loc_idx(tc_lat, tc_lon)
 
             # 检查台风附近是否存在季风槽
             search_radius = 30
@@ -1240,11 +1250,10 @@ class TCEnvironmentalSystemsExtractor:
         return None
 
     def _calculate_steering_flow(self, z500, tc_lat, tc_lon):
-        dy = np.gradient(z500, axis=0) / (self.lat_spacing * 111000)
-        dx = np.gradient(z500, axis=1) / (
-            self.lon_spacing * 111000 * np.cos(np.deg2rad(self.lat[:, np.newaxis]))
-        )
-        lat_idx, lon_idx = np.abs(self.lat - tc_lat).argmin(), np.abs(self.lon - tc_lon).argmin()
+        gy, gx = self._raw_gradients(z500)
+        dy = gy / (self.lat_spacing * 111000)
+        dx = gx / (self.lon_spacing * 111000 * self._coslat_safe[:, np.newaxis])
+        lat_idx, lon_idx = self._loc_idx(tc_lat, tc_lon)
         u_steering = -dx[lat_idx, lon_idx] / (9.8 * 1e-5)
         v_steering = dy[lat_idx, lon_idx] / (9.8 * 1e-5)
         speed = np.sqrt(u_steering**2 + v_steering**2)
@@ -1330,8 +1339,11 @@ class TCEnvironmentalSystemsExtractor:
                 return None
 
             # 选择最大的连通区域
-            sizes = [np.sum(labeled_mask == i) for i in range(1, num_features + 1)]
-            main_label = np.argmax(sizes) + 1
+            flat_labels = labeled_mask.ravel()
+            counts = np.bincount(flat_labels)[1: num_features + 1]
+            if counts.size == 0:
+                return None
+            main_label = int(np.argmax(counts) + 1)
             main_region = labeled_mask == main_label
 
             # 提取边界坐标
