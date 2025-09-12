@@ -735,18 +735,35 @@ class TCEnvironmentalSystemsExtractor:
             if u200 is None or v200 is None:
                 return None
 
-            # 计算散度场
-            du_dx = np.gradient(u200, axis=1) / (
-                self.lon_spacing * 111000 * np.cos(np.deg2rad(self.lat[:, np.newaxis]))
-            )
-            dv_dy = np.gradient(v200, axis=0) / (self.lat_spacing * 111000)
-            divergence = du_dx + dv_dy
+            # 计算散度场 (加入极区防护和有限值过滤)
+            with np.errstate(divide="ignore", invalid="ignore"):
+                coslat = np.cos(np.deg2rad(self.lat))
+                coslat = np.where(np.abs(coslat) < 1e-6, np.nan, coslat)
+                du_dx = np.gradient(u200, axis=1) / (
+                    self.lon_spacing * 111000 * coslat[:, np.newaxis]
+                )
+                dv_dy = np.gradient(v200, axis=0) / (self.lat_spacing * 111000)
+                divergence = du_dx + dv_dy
+            if not np.any(np.isfinite(divergence)):
+                return None
+            divergence[~np.isfinite(divergence)] = np.nan
 
             lat_idx, lon_idx = (
                 np.abs(self.lat - tc_lat).argmin(),
                 np.abs(self.lon - tc_lon).argmin(),
             )
-            div_value = divergence[lat_idx, lon_idx] * 1e5  # 转换为10^-5 s^-1单位
+            div_val_raw = divergence[lat_idx, lon_idx]
+            if not np.isfinite(div_val_raw):
+                # 使用周围 3x3 有限值平均替代
+                r = 1
+                sub = divergence[max(0, lat_idx-r):lat_idx+r+1, max(0, lon_idx-r):lon_idx+r+1]
+                finite_sub = sub[np.isfinite(sub)]
+                if finite_sub.size == 0:
+                    return None
+                div_val_raw = float(np.nanmean(finite_sub))
+            # 合理范围裁剪 (典型散度量级 < 2e-4 s^-1)
+            div_val_raw = float(np.clip(div_val_raw, -5e-4, 5e-4))
+            div_value = div_val_raw * 1e5  # 转换为10^-5 s^-1单位
 
             if div_value > 5:
                 level, impact = "强", "极其有利于台风发展和加强"
@@ -913,12 +930,21 @@ class TCEnvironmentalSystemsExtractor:
             if np.nanmean(t850) > 200:
                 t850 = t850 - 273.15
 
-            # 计算温度梯度来识别锋面
-            dt_dy = np.gradient(t850, axis=0) / (self.lat_spacing * 111000)
-            dt_dx = np.gradient(t850, axis=1) / (
-                self.lon_spacing * 111000 * np.cos(np.deg2rad(self.lat[:, np.newaxis]))
-            )
-            temp_gradient = np.sqrt(dt_dx**2 + dt_dy**2)
+            # 计算温度梯度来识别锋面 (防止极区 cos(latitude)=0 导致除零 -> inf)
+            with np.errstate(divide="ignore", invalid="ignore"):
+                coslat = np.cos(np.deg2rad(self.lat))
+                # 将非常小的 cos 值置为 NaN 避免放大
+                coslat = np.where(np.abs(coslat) < 1e-6, np.nan, coslat)
+                dt_dy = np.gradient(t850, axis=0) / (self.lat_spacing * 111000)
+                dt_dx = np.gradient(t850, axis=1) / (
+                    self.lon_spacing * 111000 * coslat[:, np.newaxis]
+                )
+                temp_gradient = np.sqrt(dt_dx**2 + dt_dy**2)
+
+            # 清理异常值
+            if not np.any(np.isfinite(temp_gradient)):
+                return None
+            temp_gradient[~np.isfinite(temp_gradient)] = np.nan
 
             # 寻找强温度梯度区域（锋面特征）
             front_threshold = np.percentile(temp_gradient, 90)  # 前10%的强梯度区域
@@ -943,7 +969,17 @@ class TCEnvironmentalSystemsExtractor:
             if not np.any(local_front):
                 return None
 
-            front_strength = np.max(temp_gradient[front_mask])
+            # 使用有限值的最大值
+            finite_vals = temp_gradient[front_mask][np.isfinite(temp_gradient[front_mask])]
+            if finite_vals.size == 0:
+                return None
+            front_strength = np.max(finite_vals)
+
+            # 数值合理性限制，极端情况裁剪，单位: °C/m
+            if not np.isfinite(front_strength) or front_strength <= 0:
+                return None
+            # 典型锋面水平温度梯度 ~ 1e-5 到 数值模式中少见超过 1e-4
+            front_strength = float(np.clip(front_strength, 0, 5e-4))
 
             if front_strength > 3e-5:
                 level = "强"
@@ -952,8 +988,9 @@ class TCEnvironmentalSystemsExtractor:
             else:
                 level = "弱"
 
+            strength_1e5 = front_strength * 1e5  # 转换为 ×10⁻⁵ °C/m 标度
             desc = (
-                f"台风周围存在强度为'{level}'的锋面系统，温度梯度达到{front_strength*1e5:.1f}×10⁻⁵ °C/m，"
+                f"台风周围存在强度为'{level}'的锋面系统，温度梯度达到{strength_1e5:.1f}×10⁻⁵ °C/m，"
                 f"可能影响台风的移动路径。"
             )
 
@@ -978,7 +1015,7 @@ class TCEnvironmentalSystemsExtractor:
                 "description": desc,
                 "position": {"description": "台风周围的锋面区域", "lat": tc_lat, "lon": tc_lon},
                 "intensity": {
-                    "value": round(front_strength * 1e5, 2),
+                    "value": round(strength_1e5, 2),
                     "unit": "×10⁻⁵ °C/m",
                     "level": level,
                 },
@@ -1005,6 +1042,10 @@ class TCEnvironmentalSystemsExtractor:
                 self.lon_spacing * 111000 * np.cos(np.deg2rad(self.lat[:, np.newaxis]))
             )
             relative_vorticity = dv_dx - du_dy
+
+            # 清理异常数值
+            with np.errstate(invalid="ignore"):
+                relative_vorticity[~np.isfinite(relative_vorticity)] = np.nan
 
             # 季风槽通常在热带地区，寻找正涡度带
             tropical_mask = (self.lat >= -30) & (self.lat <= 30)
@@ -1038,7 +1079,14 @@ class TCEnvironmentalSystemsExtractor:
             if not np.any(local_monsoon):
                 return None
 
-            max_vorticity = np.max(relative_vorticity[monsoon_mask]) * 1e5
+            finite_vort = relative_vorticity[monsoon_mask][
+                np.isfinite(relative_vorticity[monsoon_mask])
+            ]
+            if finite_vort.size == 0:
+                return None
+            max_vorticity = float(np.max(finite_vort))
+            # 裁剪到合理范围 (典型热带涡度 < 2e-3 s^-1)
+            max_vorticity = float(np.clip(max_vorticity, 0, 2e-3)) * 1e5
 
             if max_vorticity > 10:
                 level, impact = "活跃", "为台风发展提供有利环境"
@@ -1139,7 +1187,10 @@ class TCEnvironmentalSystemsExtractor:
                 elif isinstance(obj, np.ndarray):
                     return obj.tolist()
                 elif isinstance(obj, (np.float32, np.float64)):
-                    return float(obj)
+                    val = float(obj)
+                    if not np.isfinite(val):
+                        return None
+                    return val
                 elif isinstance(obj, (np.int32, np.int64)):
                     return int(obj)
                 elif isinstance(obj, np.bool_):
@@ -1147,7 +1198,20 @@ class TCEnvironmentalSystemsExtractor:
                 else:
                     return obj
 
+            # 额外递归处理 Python float 中的 inf / nan
+            def sanitize_inf_nan(o):
+                if isinstance(o, dict):
+                    return {k: sanitize_inf_nan(v) for k, v in o.items()}
+                elif isinstance(o, list):
+                    return [sanitize_inf_nan(v) for v in o]
+                elif isinstance(o, float):
+                    if math.isinf(o) or math.isnan(o):
+                        return None
+                    return o
+                return o
+
             converted_data = convert_numpy_types(data)
+            converted_data = sanitize_inf_nan(converted_data)
 
             with open(json_filename, "w", encoding="utf-8") as f:
                 json.dump(converted_data, f, indent=4, ensure_ascii=False)
