@@ -1132,6 +1132,34 @@ class TCEnvironmentalSystemsExtractor:
         output_path = Path(output_dir)
         output_path.mkdir(exist_ok=True)
 
+        # === 新增: 如果输出已存在则跳过重算 ===
+        # 判定标准: 对当前 NC 文件 (self.nc_stem) 所有粒子(若无粒子列则默认为 TC_01) 的
+        # 目标文件 <ncstem>_TC_Analysis_<particle>.json 均已存在且非空, 则直接跳过
+        existing_outputs = list(output_path.glob(f"{self.nc_stem}_TC_Analysis_*.json"))
+        if existing_outputs:
+            # 确定期望粒子集合
+            if "particle" in self.tc_tracks.columns:
+                expected_particles = sorted(set(str(p) for p in self.tc_tracks["particle"].unique()))
+            else:
+                expected_particles = ["TC_01"]
+            # 已存在并且文件非空的粒子结果
+            existing_particles = []
+            for pfile in existing_outputs:
+                # 文件名格式: <ncstem>_TC_Analysis_<pid>.json -> 提取 <pid>
+                stem = pfile.stem
+                if stem.startswith(f"{self.nc_stem}_TC_Analysis_"):
+                    pid = stem.replace(f"{self.nc_stem}_TC_Analysis_", "")
+                    try:
+                        if pfile.stat().st_size > 10:  # 简单判定非空
+                            existing_particles.append(pid)
+                    except Exception:
+                        pass
+            if set(expected_particles).issubset(existing_particles):
+                print(
+                    f"⏩ 检测到当前NC对应的所有分析结果已存在于 '{output_path}' (共{len(existing_particles)}个)，跳过重算。"
+                )
+                return {pid: None for pid in expected_particles}  # 返回占位, 表示已跳过
+
         if "particle" not in self.tc_tracks.columns:
             print("警告: 路径文件 .csv 中未找到 'particle' 列，将所有路径点视为单个台风事件。")
             self.tc_tracks["particle"] = "TC_01"
