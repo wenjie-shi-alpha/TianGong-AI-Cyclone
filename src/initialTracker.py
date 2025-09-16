@@ -479,6 +479,10 @@ class Tracker:
         self.tracked_msls: list[float] = [np.nan]
         self.tracked_winds: list[float] = [np.nan]
         self.fails: int = 0
+        # 连续低风速(<17 m/s)计数与消散标记
+        self._wind_threshold: float = 17.0
+        self._consecutive_below: int = 0
+        self._dissipated: bool = False
 
     def results(self) -> pd.DataFrame:
         """Assemble the track into a convenient DataFrame."""
@@ -629,8 +633,34 @@ class Tracker:
             lon - 1.5,
             lon + 1.5,
         )
-        self.tracked_msls.append(msl_crop.min())
-        self.tracked_winds.append(wind_crop.max())
+        min_msl = float(np.nanmin(msl_crop))
+        max_wind = float(np.nanmax(wind_crop))
+        self.tracked_msls.append(min_msl)
+        self.tracked_winds.append(max_wind)
+
+        # 基于风速阈值的消散判定: 连续 3 个时间步长风速 < 17 m/s 则认为消散
+        if not np.isnan(max_wind) and max_wind < self._wind_threshold:
+            self._consecutive_below += 1
+        else:
+            # 若在 3 步内恢复(>=17), 则保持此前低风速点为路径点，不做处理
+            self._consecutive_below = 0
+
+        if self._consecutive_below >= 3:
+            # 删除最后连续的 3 个低风速点，使其不计入路径，并标记为消散
+            for _ in range(3):
+                # 保护初始条目(索引0)，此处长度应始终 >= 4 才会触发
+                if len(self.tracked_times) > 1:
+                    self.tracked_times.pop()
+                if len(self.tracked_lats) > 1:
+                    self.tracked_lats.pop()
+                if len(self.tracked_lons) > 1:
+                    self.tracked_lons.pop()
+                if len(self.tracked_msls) > 1:
+                    self.tracked_msls.pop()
+                if len(self.tracked_winds) > 1:
+                    self.tracked_winds.pop()
+            self._dissipated = True
+            return
 
 
 # -----------------------------
@@ -781,6 +811,9 @@ def track_file_with_initials(
             )
             try:
                 tracker.step(batch)
+                # 如果已判定消散，则停止该风暴后续时间步
+                if getattr(tracker, "_dissipated", False):
+                    break
             except NoEyeException as e:
                 # 终止条件与 tracker 保持一致:
                 # - 仅当第一步完全失败时终止该风暴 (tracker.step 也只在首步失败时抛出)
@@ -798,6 +831,30 @@ def track_file_with_initials(
 
         # 保存结果
         out_df = tracker.results()
+    # 过滤规则：仅保留风速>=17 m/s 的点；若风速<17 且在接下来的 3 个时间步内恢复到>=17，则同样保留
+        # 始终保留首个初始点
+        if not out_df.empty:
+            winds = out_df["wind"].to_numpy()
+            keep = np.zeros(len(out_df), dtype=bool)
+            keep[0] = True  # 保留初始点
+            for i in range(1, len(out_df)):
+                w = winds[i]
+                if not np.isnan(w) and w >= 17.0:
+                    keep[i] = True
+                else:
+                    # 检查未来 1-2 步是否恢复
+                    recovered = False
+                    for j in range(i + 1, min(i + 4, len(out_df))):
+                        wj = winds[j]
+                        if not np.isnan(wj) and wj >= 17.0:
+                            recovered = True
+                            break
+                    if recovered:
+                        keep[i] = True
+            out_df = out_df.loc[keep].reset_index(drop=True)
+            # 若仅剩初始点，则视为无有效路径，不保存
+            if len(out_df) <= 1:
+                continue
         output_dir.mkdir(parents=True, exist_ok=True)
         # 推断模型/起报标签
         stem = nc_path.stem
