@@ -73,6 +73,186 @@ def _safe_get(ds: xr.Dataset, names: Iterable[str]) -> Optional[xr.DataArray]:
     return None
 
 
+@dataclass
+class _DsAdapter:
+    """Lightweight adapter that caches common dataset metadata and variable names.
+
+    This avoids repeated xarray introspection and allows selecting only the needed
+    Z level (nearest to 700 hPa) per time step.
+    """
+
+    ds: xr.Dataset
+    lat_name: str
+    lon_name: str
+    lats: np.ndarray
+    lons: np.ndarray
+    times: List[pd.Timestamp]
+    msl_name: str
+    u10_name: Optional[str]
+    v10_name: Optional[str]
+    z_name: Optional[str]
+    z_level_dim: Optional[str]
+    z_levels_hpa: Optional[np.ndarray]
+    z_idx_near_700: Optional[int]
+    z_level_near_700: Optional[int]
+    lsm: np.ndarray
+
+    @staticmethod
+    def build(ds: xr.Dataset) -> "_DsAdapter":
+        # lat/lon
+        lat_da = _safe_get(ds, ["latitude", "lat"])
+        lon_da = _safe_get(ds, ["longitude", "lon"])
+        if lat_da is None or lon_da is None:
+            raise ValueError("Dataset 缺少经纬度坐标 (lat/lon 或 latitude/longitude)")
+        lat_name = str(lat_da.name)
+        lon_name = str(lon_da.name)
+        lats = lat_da.values
+        lons = _to_0360(lon_da.values)
+
+        # time
+        if "time" in ds.coords:
+            times = list(pd.to_datetime(ds.time.values))
+        else:
+            times = [pd.Timestamp.now()]
+
+        # variables
+        msl_da = _safe_get(ds, ["msl", "mslp"])
+        if msl_da is None:
+            raise ValueError("Dataset 缺少海平面气压 (msl/mslp)")
+        msl_name = str(msl_da.name)
+
+        u10_da = _safe_get(ds, ["u10", "10u"])  # 标准多为 u10/v10
+        v10_da = _safe_get(ds, ["v10", "10v"])  # 标准多为 u10/v10
+        u10_name = str(u10_da.name) if u10_da is not None else None
+        v10_name = str(v10_da.name) if v10_da is not None else None
+
+        # geopotential height or geopotential
+        z_da = _safe_get(ds, ["z", "gh", "geopotential", "geopotential_height"])  # 宽松匹配
+        z_name = str(z_da.name) if z_da is not None else None
+        z_level_dim = None
+        z_levels_hpa = None
+        z_idx_near_700 = None
+        z_level_near_700: Optional[int] = None
+        if z_da is not None:
+            for dim in ["level", "isobaricInhPa", "pressure", "isobaricInPa"]:
+                if dim in z_da.dims:
+                    z_level_dim = dim
+                    break
+            if z_level_dim is None:
+                # 无层维; 视作单层, 赋予伪 700hPa 标签
+                z_levels_hpa = np.array([700], dtype=int)
+                z_idx_near_700 = 0
+                z_level_near_700 = 700
+            else:
+                levels_vals = z_da[z_level_dim].values
+                if levels_vals.max() > 2000:  # Pa -> hPa
+                    levels_vals = (levels_vals / 100.0).astype(float)
+                levels_hpa = np.array([int(round(v)) for v in levels_vals.tolist()])
+                z_levels_hpa = levels_hpa
+                # 最近 700 的索引
+                z_idx_near_700 = int(np.argmin(np.abs(levels_hpa.astype(float) - 700.0)))
+                z_level_near_700 = int(levels_hpa[z_idx_near_700])
+
+        # lsm
+        lsm_da = _safe_get(ds, ["lsm", "land_sea_mask", "landmask"])  # 可选
+        if lsm_da is not None:
+            lsm = lsm_da.values
+            if lsm.ndim == 3:
+                lsm = lsm[0]
+        else:
+            # 与 msl 相同形状
+            sample = ds[msl_name].isel(time=0).values
+            if sample.ndim == 3:
+                sample = sample[0]
+            lsm = np.zeros_like(sample)
+
+        return _DsAdapter(
+            ds=ds,
+            lat_name=lat_name,
+            lon_name=lon_name,
+            lats=lats,
+            lons=lons,
+            times=times,
+            msl_name=msl_name,
+            u10_name=u10_name,
+            v10_name=v10_name,
+            z_name=z_name,
+            z_level_dim=z_level_dim,
+            z_levels_hpa=z_levels_hpa,
+            z_idx_near_700=z_idx_near_700,
+            z_level_near_700=z_level_near_700,
+            lsm=lsm,
+        )
+
+    def msl_at(self, ti: int) -> np.ndarray:
+        arr = self.ds[self.msl_name].isel(time=ti).values
+        if arr.ndim == 3:
+            arr = arr[0]
+        return arr
+
+    def u10_at(self, ti: int) -> np.ndarray:
+        if self.u10_name is None:
+            return np.zeros_like(self.msl_at(ti))
+        arr = self.ds[self.u10_name].isel(time=ti).values
+        if arr.ndim == 3:
+            arr = arr[0]
+        return arr
+
+    def v10_at(self, ti: int) -> np.ndarray:
+        if self.v10_name is None:
+            return np.zeros_like(self.msl_at(ti))
+        arr = self.ds[self.v10_name].isel(time=ti).values
+        if arr.ndim == 3:
+            arr = arr[0]
+        return arr
+
+    def z_near700_at(self, ti: int) -> Optional[np.ndarray]:
+        if self.z_name is None:
+            return None
+        # 仅提取最接近 700hPa 的单层
+        if self.z_level_dim is None:
+            z2d = self.ds[self.z_name].isel(time=ti).values
+            if z2d.ndim == 3:
+                z2d = z2d[0]
+        else:
+            assert self.z_idx_near_700 is not None
+            z_sel = self.ds[self.z_name].isel(time=ti, **{self.z_level_dim: self.z_idx_near_700})
+            z2d_da = z_sel.transpose(self.lat_name, self.lon_name)
+            z2d = z2d_da.values
+        return z2d
+
+
+def _build_batch_from_ds_fast(adapter: _DsAdapter, time_idx: int) -> _SimpleBatch:
+    """更高效地从 Dataset 构建 `_SimpleBatch`，仅读取必要变量和单层 Z。
+
+    与 `_build_batch_from_ds` 在输出上保持等价（针对本追踪算法的使用）。
+    """
+    lats = adapter.lats
+    lons = adapter.lons
+    time_val = adapter.times[time_idx]
+
+    msl_2d = adapter.msl_at(time_idx)
+    u10_2d = adapter.u10_at(time_idx)
+    v10_2d = adapter.v10_at(time_idx)
+
+    surf_vars = {
+        "msl": msl_2d[np.newaxis, np.newaxis, ...],
+        "10u": u10_2d[np.newaxis, np.newaxis, ...],
+        "10v": v10_2d[np.newaxis, np.newaxis, ...],
+    }
+
+    atmos_vars: Dict[str, np.ndarray] = {}
+    atmos_levels = [adapter.z_level_near_700 or 700]
+    z2d = adapter.z_near700_at(time_idx)
+    if z2d is not None:
+        atmos_vars["z"] = z2d[np.newaxis, np.newaxis, np.newaxis, ...]  # 1 level only
+
+    static_vars = {"lsm": adapter.lsm}
+
+    metadata = _Metadata(lat=lats, lon=lons, time=[time_val], atmos_levels=atmos_levels)
+    return _SimpleBatch(atmos_vars=atmos_vars, surf_vars=surf_vars, static_vars=static_vars, metadata=metadata)
+
+
 def _build_batch_from_ds(ds: xr.Dataset, time_idx: int) -> _SimpleBatch:
     """从 xarray Dataset 构建一个与原算法兼容的 `_SimpleBatch`.
 
@@ -457,22 +637,59 @@ class Tracker:
 # 追踪驱动: 从 CSV 初始点与 NetCDF 运行
 # -----------------------------
 
-def _load_initial_points(csv_path: Path) -> pd.DataFrame:
-    """读取 CSV, 提取每个 storm_id 的起始点 (首条记录).
+def _load_all_points(csv_path: Path) -> pd.DataFrame:
+    """读取 CSV 全量记录, 并规范时间列。
 
     需要列: storm_id, datetime, latitude, longitude
-    返回列: storm_id, init_time(pd.Timestamp), init_lat, init_lon
+    附加列: dt(pd.Timestamp)
     """
     df = pd.read_csv(csv_path)
     required = {"storm_id", "datetime", "latitude", "longitude"}
     if not required.issubset(df.columns):
         raise ValueError(f"CSV 缺少必要列: {required - set(df.columns)}")
-    # 将 datetime 转为 pandas 时间
-    df["init_time"] = pd.to_datetime(df["datetime"])  # 源列保留
-    firsts = df.sort_values(["storm_id", "init_time"]).groupby("storm_id", as_index=False).first()
-    return firsts[["storm_id", "init_time", "latitude", "longitude"]].rename(
-        columns={"latitude": "init_lat", "longitude": "init_lon"}
-    )
+    # 规范化时间列
+    df["dt"] = pd.to_datetime(df["datetime"], errors="coerce")
+    df = df.dropna(subset=["dt"]).copy()
+    return df
+
+
+# 向后兼容别名: 旧代码可能从 initialTracker 导入 _load_initial_points
+def _load_initial_points(csv_path: Path) -> pd.DataFrame:
+    """保持与旧接口兼容: 等价于 _load_all_points。
+
+    早期版本在 extractSyst.py 中通过
+        from initialTracker import _load_initial_points
+    导入此函数。当前标准名称为 _load_all_points，这里提供别名以避免 ImportError。
+    """
+    return _load_all_points(csv_path)
+
+
+def _select_initials_for_time(
+    df_all: pd.DataFrame,
+    target_time: pd.Timestamp,
+    tol_hours: int = 6,
+) -> pd.DataFrame:
+    """针对给定的预报起报时刻, 从全量最佳路径中筛选接近该时刻的各气旋位置作为初始点。
+
+    规则:
+    - 仅保留 |dt - target_time| <= tol_hours 的记录
+    - 按 storm_id 选取最接近 target_time 的那一条
+
+    返回列: storm_id, init_time, init_lat, init_lon
+    """
+    if df_all.empty:
+        return pd.DataFrame(columns=["storm_id", "init_time", "init_lat", "init_lon"])
+    delta = pd.Timedelta(hours=tol_hours)
+    sub = df_all.loc[(df_all["dt"] >= target_time - delta) & (df_all["dt"] <= target_time + delta)].copy()
+    if sub.empty:
+        return pd.DataFrame(columns=["storm_id", "init_time", "init_lat", "init_lon"])
+    # 选取每个 storm_id 与 target_time 时间差最小的那条记录
+    sub["time_diff"] = (sub["dt"] - target_time).abs()
+    idx = sub.groupby("storm_id")["time_diff"].idxmin()
+    pick = sub.loc[idx].copy()
+    pick = pick.rename(columns={"latitude": "init_lat", "longitude": "init_lon"})
+    pick["init_time"] = pick["dt"].values
+    return pick[["storm_id", "init_time", "init_lat", "init_lon"]].reset_index(drop=True)
 
 
 def _inside_domain(lat: float, lon: float, lats: np.ndarray, lons: np.ndarray) -> bool:
@@ -484,34 +701,42 @@ def _inside_domain(lat: float, lon: float, lats: np.ndarray, lons: np.ndarray) -
 
 def track_file_with_initials(
     nc_path: Path,
-    initials: pd.DataFrame,
+    all_points: pd.DataFrame,
     output_dir: Path,
     max_storms: Optional[int] = None,
+    time_window_hours: int = 6,
 ) -> List[Path]:
-    """使用给定的初始点, 在一个 NetCDF 预报文件上逐步追踪并输出 CSV.
+    """基于 NetCDF 文件首时刻, 从全量路径中筛选对应时刻的初始点, 然后逐步追踪并输出 CSV。
 
-    返回生成的 CSV 路径列表.
+    - 仅针对在 [t0-±time_window_hours] 内存在记录的气旋生成种子, 避免一个文件产出成百上千条路径。
+    - 返回生成的 CSV 路径列表。
     """
     ds = xr.open_dataset(nc_path)
-    lat_da = _safe_get(ds, ["latitude", "lat"])
-    lon_da = _safe_get(ds, ["longitude", "lon"])
-    if lat_da is None or lon_da is None:
-        raise ValueError(f"文件缺少经纬度: {nc_path}")
-    lats = lat_da.values
-    lons = _to_0360(lon_da.values)
-
-    times = pd.to_datetime(ds.time.values) if "time" in ds.coords else [pd.Timestamp.now()]
+    adapter = _DsAdapter.build(ds)
+    lats = adapter.lats
+    lons = adapter.lons
+    times = adapter.times
     if len(times) == 0:
         raise ValueError(f"文件无时间维度: {nc_path}")
 
+    # 针对该文件的首时刻筛选初始点
+    t0 = pd.Timestamp(times[0])
+    initials = _select_initials_for_time(all_points, t0, tol_hours=time_window_hours)
+    if initials.empty:
+        logger.info(f"{nc_path.name}: 在 ±{time_window_hours} 小时内未匹配到任何气旋初始点, 跳过")
+        ds.close()
+        return []
+
     written: List[Path] = []
     count = 0
+    # 简单的按时间步缓存，供多个风暴共享，避免重复 I/O
+    _time_cache: Dict[int, Dict[str, np.ndarray]] = {}
     for _, row in initials.iterrows():
         if max_storms is not None and count >= max_storms:
             break
         storm_id = str(row["storm_id"]) if "storm_id" in row else f"storm_{count}"
-        init_lat = float(row["init_lat"]) if "init_lat" in row else float(row["latitude"])  # type: ignore
-        init_lon = float(row["init_lon"]) if "init_lon" in row else float(row["longitude"])  # type: ignore
+        init_lat = float(row["init_lat"]) if "init_lat" in row else float(row.get("latitude"))  # type: ignore
+        init_lon = float(row["init_lon"]) if "init_lon" in row else float(row.get("longitude"))  # type: ignore
 
         if not _inside_domain(init_lat, init_lon, lats, lons):
             continue
@@ -521,7 +746,39 @@ def track_file_with_initials(
 
         # 顺序遍历每个时间步, 构造 batch 并 step
         for ti in range(len(times)):
-            batch = _build_batch_from_ds(ds, ti)
+            # 使用更高效的单层提取与缓存
+            cache = _time_cache.get(ti)
+            if cache is None:
+                msl_2d = adapter.msl_at(ti)
+                u10_2d = adapter.u10_at(ti)
+                v10_2d = adapter.v10_at(ti)
+                z2d = adapter.z_near700_at(ti)
+                cache = {"msl": msl_2d, "10u": u10_2d, "10v": v10_2d}
+                if z2d is not None:
+                    cache["z"] = z2d
+                _time_cache[ti] = cache
+            # 基于缓存构建 batch（与 _build_batch_from_ds_fast 等价）
+            surf_vars = {
+                "msl": cache["msl"][np.newaxis, np.newaxis, ...],
+                "10u": cache["10u"][np.newaxis, np.newaxis, ...],
+                "10v": cache["10v"][np.newaxis, np.newaxis, ...],
+            }
+            atmos_vars: Dict[str, np.ndarray] = {}
+            if "z" in cache:
+                atmos_vars["z"] = cache["z"][np.newaxis, np.newaxis, np.newaxis, ...]
+            metadata = _Metadata(
+                lat=lats,
+                lon=lons,
+                time=[times[ti]],
+                atmos_levels=[adapter.z_level_near_700 or 700],
+            )
+            static_vars = {"lsm": adapter.lsm}
+            batch = _SimpleBatch(
+                atmos_vars=atmos_vars,
+                surf_vars=surf_vars,
+                static_vars=static_vars,
+                metadata=metadata,
+            )
             try:
                 tracker.step(batch)
             except NoEyeException as e:
@@ -575,24 +832,37 @@ def main():
         help="最多处理的 NetCDF 文件数量",
     )
     parser.add_argument(
+        "--time_window_hours",
+        type=int,
+        default=6,
+        help="匹配气旋初始点的时间窗口(小时), 仅在该窗口内存在记录的气旋会被追踪",
+    )
+    parser.add_argument(
         "--output_dir",
         default=str(Path("track_output")),
         help="输出气旋追踪路径 CSV 目录",
     )
     args = parser.parse_args()
 
-    initials = _load_initial_points(Path(args.initials_csv))
+    # 读取全量路径记录, 按每个文件首时刻筛选初始点
+    all_points = _load_all_points(Path(args.initials_csv))
     nc_dir = Path(args.nc_dir)
     nc_files = sorted([p for p in nc_dir.glob("*.nc") if p.is_file()])
     if args.limit_files is not None:
         nc_files = nc_files[: args.limit_files]
     output_dir = Path(args.output_dir)
 
-    logger.info(f"初始风暴数量: {len(initials)} | NetCDF 文件数: {len(nc_files)}")
+    logger.info(f"CSV 总记录数: {len(all_points)} | NetCDF 文件数: {len(nc_files)}")
     total_written: List[Path] = []
     for nc in nc_files:
         try:
-            written = track_file_with_initials(nc, initials, output_dir, max_storms=args.limit_storms)
+            written = track_file_with_initials(
+                nc,
+                all_points,
+                output_dir,
+                max_storms=args.limit_storms,
+                time_window_hours=args.time_window_hours,
+            )
             total_written.extend(written)
             logger.info(f"{nc.name}: 写入 {len(written)} 条路径")
         except Exception as e:

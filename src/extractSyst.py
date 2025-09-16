@@ -1611,6 +1611,7 @@ def streaming_from_csv(
     search_range: float = 3.0,
     memory: int = 3,
     keep_nc: bool = False,
+    initials_csv: Path | None = None,
 ):
     """逐行读取CSV, 每个NC文件执行: 下载 -> 追踪 -> 环境分析 -> (可选删除)
 
@@ -1620,7 +1621,11 @@ def streaming_from_csv(
         print(f"❌ CSV不存在: {csv_path}")
         return
     import pandas as pd, re, traceback
-    from trackTC import UnifiedTropicalCycloneTracker, sanitize_filename, download_s3_public
+    from trackTC import sanitize_filename, download_s3_public
+    # initialTracker 提供基于初始点的追踪算法
+    from initialTracker import track_file_with_initials as it_track_file_with_initials
+    # 兼容: initialTracker 中提供的是 _load_all_points，这里用同名别名引用
+    from initialTracker import _load_all_points as it_load_initial_points
 
     df = pd.read_csv(csv_path)
     required_cols = {"s3_url", "model_prefix", "init_time"}
@@ -1633,7 +1638,7 @@ def streaming_from_csv(
 
     persist_dir = Path("data/nc_files")  # 仍放入该目录, 便于复用逻辑
     persist_dir.mkdir(parents=True, exist_ok=True)
-    track_dir = Path("track_output"); track_dir.mkdir(exist_ok=True)
+    track_dir = Path("track_test"); track_dir.mkdir(exist_ok=True)
     final_dir = Path("final_output"); final_dir.mkdir(exist_ok=True)
 
     processed = 0
@@ -1673,13 +1678,16 @@ def streaming_from_csv(
         else:
             print("📦 已存在NC文件, 复用")
 
-        # 轨迹: 若不存在则计算
+        # 轨迹: 若不存在则计算 (使用 initialTracker)
         if not track_csv.exists():
             try:
-                print("🧭 执行追踪算法...")
-                tracker = UnifiedTropicalCycloneTracker(str(nc_local))
-                features_df, tracks_df = tracker.track_cyclones(search_range=search_range, memory=memory)
-                if tracks_df.empty:
+                print("🧭 使用 initialTracker 执行追踪...")
+                # 加载初始点
+                initials_path = initials_csv or Path("input/western_pacific_typhoons_superfast.csv")
+                initials_df = it_load_initial_points(initials_path)
+                # 针对当前 NC 运行追踪, initialTracker 会为每个风暴输出一个 CSV
+                per_storm_csvs = it_track_file_with_initials(Path(nc_local), initials_df, track_dir)
+                if not per_storm_csvs:
                     print("⚠️ 无有效轨迹 -> 跳过环境分析")
                     if not keep_nc:
                         try:
@@ -1687,8 +1695,44 @@ def streaming_from_csv(
                         except Exception: pass
                     skipped += 1
                     continue
-                tracks_df.to_csv(track_csv, index=False)
-                print(f"💾 保存轨迹: {track_csv.name}")
+
+                # 合并为单一轨迹文件, 增加 particle 与 time_idx 列，便于后续提取
+                try:
+                    import xarray as _xr
+                    ds_times = []
+                    with _xr.open_dataset(nc_local) as _ds:
+                        ds_times = pd.to_datetime(_ds.time.values) if "time" in _ds.coords else []
+                    def _nearest_time_idx(ts: pd.Timestamp) -> int:
+                        if len(ds_times) == 0:
+                            return 0
+                        # 精确匹配优先
+                        try:
+                            return int(np.argmin(np.abs(ds_times - ts)))
+                        except Exception:
+                            return 0
+                    parts = []
+                    for p in per_storm_csvs:
+                        df_i = pd.read_csv(p)
+                        # 解析 storm_id 自文件名: track_<storm>_<ncstem>.csv
+                        s = Path(p).stem
+                        m_id = re.match(r"track_(.+?)_" + re.escape(Path(nc_local).stem) + r"$", s)
+                        particle_id = m_id.group(1) if m_id else s.replace("track_", "")
+                        df_i["particle"] = particle_id
+                        # 统一时间并生成 time_idx
+                        if "time" in df_i.columns:
+                            df_i["time"] = pd.to_datetime(df_i["time"], errors="coerce")
+                            df_i["time_idx"] = df_i["time"].apply(lambda t: _nearest_time_idx(t) if pd.notnull(t) else 0)
+                        else:
+                            # 若缺少时间, 用顺序索引代替
+                            df_i["time_idx"] = np.arange(len(df_i))
+                            # 合成时间列(可选)
+                        parts.append(df_i)
+                    tracks_df = pd.concat(parts, ignore_index=True)
+                    tracks_df.to_csv(track_csv, index=False)
+                    print(f"💾 合并保存轨迹: {track_csv.name} (含 {tracks_df['particle'].nunique()} 条路径)")
+                except Exception as ce:
+                    print(f"❌ 合并轨迹失败: {ce}")
+                    raise
             except Exception as e:
                 print(f"❌ 追踪失败: {e}")
                 traceback.print_exc()
@@ -1734,6 +1778,7 @@ def main():
     parser.add_argument("--auto", action="store_true", help="无轨迹则自动运行追踪")
     parser.add_argument("--search-range", type=float, default=3.0, help="追踪搜索范围")
     parser.add_argument("--memory", type=int, default=3, help="追踪记忆时间步")
+    parser.add_argument("--initials", default=str(Path("input")/"western_pacific_typhoons_superfast.csv"), help="initialTracker 初始点CSV")
     parser.add_argument("--batch", action="store_true", help="使用旧的批量模式: 先全部下载+追踪, 再统一做环境分析")
     args = parser.parse_args()
 
@@ -1776,6 +1821,7 @@ def main():
                 search_range=args.search_range,
                 memory=args.memory,
                 keep_nc=(args.no_clean or args.keep_nc),
+                initials_csv=Path(args.initials) if args.initials else None,
             )
             print("🎯 流式处理完成 (无需进入批量后处理循环)")
             return
@@ -1819,20 +1865,50 @@ def main():
                     print(f"⚠️ 未精确匹配 forecast_tag, 使用 {track_file.name}")
         if track_file is None:
             if args.auto:
-                from trackTC import UnifiedTropicalCycloneTracker
-                print("🔄 自动追踪当前NC以生成轨迹...")
-                tracker = UnifiedTropicalCycloneTracker(str(nc_file))
-                features_df, tracks_df = tracker.track_cyclones(search_range=args.search_range, memory=args.memory)
-                if tracks_df.empty:
-                    print("⚠️ 无轨迹 -> 跳过该NC")
+                # 使用 initialTracker 自动生成轨迹 (基于初始点)
+                from initialTracker import track_file_with_initials as it_track_file_with_initials
+                # 兼容: initialTracker 中提供的是 _load_all_points，这里用同名别名引用
+                from initialTracker import _load_all_points as it_load_initial_points
+                print("🔄 使用 initialTracker 自动追踪当前NC以生成轨迹...")
+                try:
+                    initials_df = it_load_initial_points(Path(args.initials) if args.initials else Path("input/western_pacific_typhoons_superfast.csv"))
+                    out_dir = Path("track_output"); out_dir.mkdir(exist_ok=True)
+                    per_storm = it_track_file_with_initials(Path(nc_file), initials_df, out_dir)
+                    if not per_storm:
+                        print("⚠️ 无轨迹 -> 跳过该NC")
+                        skipped += 1
+                        continue
+                    # 合并
+                    import xarray as _xr, re as _re
+                    ds_times = []
+                    with _xr.open_dataset(nc_file) as _ds:
+                        ds_times = pd.to_datetime(_ds.time.values) if "time" in _ds.coords else []
+                    def _nearest_idx(ts: pd.Timestamp) -> int:
+                        if len(ds_times) == 0:
+                            return 0
+                        return int(np.argmin(np.abs(ds_times - ts)))
+                    parts = []
+                    for p in per_storm:
+                        dfi = pd.read_csv(p)
+                        s = Path(p).stem
+                        mid = _re.match(r"track_(.+?)_" + _re.escape(nc_stem) + r"$", s)
+                        pid = mid.group(1) if mid else s.replace("track_", "")
+                        dfi["particle"] = pid
+                        if "time" in dfi.columns:
+                            dfi["time"] = pd.to_datetime(dfi["time"], errors="coerce")
+                            dfi["time_idx"] = dfi["time"].apply(lambda t: _nearest_idx(t) if pd.notnull(t) else 0)
+                        else:
+                            dfi["time_idx"] = np.arange(len(dfi))
+                        parts.append(dfi)
+                    tracks_df = pd.concat(parts, ignore_index=True)
+                    ts0 = pd.to_datetime(tracks_df.iloc[0]["time"]).strftime("%Y%m%d%H") if "time" in tracks_df.columns and pd.notnull(tracks_df.iloc[0]["time"]) else "T000"
+                    track_file = out_dir / f"tracks_auto_{nc_stem}_{ts0}.csv"
+                    tracks_df.to_csv(track_file, index=False)
+                    print(f"💾 自动轨迹文件: {track_file.name}")
+                except Exception as e:
+                    print(f"❌ 自动追踪失败: {e}")
                     skipped += 1
                     continue
-                out_dir = Path("track_output")
-                out_dir.mkdir(exist_ok=True)
-                ts0 = pd.to_datetime(tracks_df.iloc[0]["time"]).strftime("%Y%m%d%H") if "time" in tracks_df.columns else "T000"
-                track_file = out_dir / f"tracks_auto_{nc_stem}_{ts0}.csv"
-                tracks_df.to_csv(track_file, index=False)
-                print(f"💾 自动轨迹文件: {track_file.name}")
             else:
                 print("⚠️ 未找到对应轨迹且未启用 --auto, 跳过")
                 skipped += 1
