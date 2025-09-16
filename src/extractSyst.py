@@ -1127,7 +1127,7 @@ class TCEnvironmentalSystemsExtractor:
             return None
 
     # --- 主分析与导出函数 ---
-    def analyze_and_export_as_json(self, output_dir="final_output"):
+    def analyze_and_export_as_json(self, output_dir="final_single_output"):
         # ... (此函数逻辑与上一版基本相同，无需修改) ...
         print("\n🔍 开始进行专家级环境场解译并构建JSON...")
         output_path = Path(output_dir)
@@ -1638,8 +1638,8 @@ def streaming_from_csv(
 
     persist_dir = Path("data/nc_files")  # 仍放入该目录, 便于复用逻辑
     persist_dir.mkdir(parents=True, exist_ok=True)
-    track_dir = Path("track_test"); track_dir.mkdir(exist_ok=True)
-    final_dir = Path("final_output"); final_dir.mkdir(exist_ok=True)
+    track_dir = Path("track_single"); track_dir.mkdir(exist_ok=True)
+    final_dir = Path("final_single_output"); final_dir.mkdir(exist_ok=True)
 
     processed = 0
     skipped = 0
@@ -1748,7 +1748,7 @@ def streaming_from_csv(
         # 环境分析
         try:
             extractor = TCEnvironmentalSystemsExtractor(str(nc_local), str(track_csv))
-            extractor.analyze_and_export_as_json("final_output")
+            extractor.analyze_and_export_as_json("final_single_output")
             processed += 1
         except Exception as e:
             print(f"❌ 环境分析失败: {e}")
@@ -1762,7 +1762,7 @@ def streaming_from_csv(
     print("\n📊 流式处理结果:")
     print(f"  ✅ 完成: {processed}")
     print(f"  ⏭️ 跳过: {skipped}")
-    print(f"  📁 输出目录: final_output")
+    print(f"  📁 输出目录: final_single_output")
 
 
 def main():
@@ -1826,7 +1826,7 @@ def main():
             print("🎯 流式处理完成 (无需进入批量后处理循环)")
             return
 
-    final_output_dir = Path("final_output")
+    final_output_dir = Path("final_single_output")
     final_output_dir.mkdir(exist_ok=True)
 
     processed = 0
@@ -1849,7 +1849,7 @@ def main():
             if t.exists():
                 track_file = t
         if track_file is None:
-            tdir = Path("track_output")
+            tdir = Path("track_single")
             if tdir.exists():
                 forecast_tag_match = re.search(r"(f\d{3}_f\d{3}_\d{2})", nc_stem)
                 potential = []
@@ -1872,7 +1872,7 @@ def main():
                 print("🔄 使用 initialTracker 自动追踪当前NC以生成轨迹...")
                 try:
                     initials_df = it_load_initial_points(Path(args.initials) if args.initials else Path("input/western_pacific_typhoons_superfast.csv"))
-                    out_dir = Path("track_output"); out_dir.mkdir(exist_ok=True)
+                    out_dir = Path("track_single"); out_dir.mkdir(exist_ok=True)
                     per_storm = it_track_file_with_initials(Path(nc_file), initials_df, out_dir)
                     if not per_storm:
                         print("⚠️ 无轨迹 -> 跳过该NC")
@@ -1917,7 +1917,7 @@ def main():
         print(f"✅ 使用轨迹文件: {track_file}")
         try:
             extractor = TCEnvironmentalSystemsExtractor(str(nc_file), str(track_file))
-            extractor.analyze_and_export_as_json("final_output")
+            extractor.analyze_and_export_as_json("final_single_output")
             processed += 1
         except Exception as e:
             print(f"❌ 分析失败 {nc_file.name}: {e}")
@@ -1936,7 +1936,7 @@ def main():
     print(f"  ✅ 已分析: {processed}")
     print(f"  ⏭️ 跳过(已有结果/无轨迹): {skipped}")
     print(f"  📦 总计遍历: {len(target_nc_files)}")
-    print("结果目录: final_output")
+    print("结果目录: final_single_output")
 
 
 if __name__ == "__main__":

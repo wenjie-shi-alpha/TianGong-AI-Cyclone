@@ -782,11 +782,16 @@ def track_file_with_initials(
             try:
                 tracker.step(batch)
             except NoEyeException as e:
-                # 若第一步即失败则放弃该风暴; 非首步失败则停止延伸
+                # 终止条件与 tracker 保持一致:
+                # - 仅当第一步完全失败时终止该风暴 (tracker.step 也只在首步失败时抛出)
+                # - 非首步异常(理论上不应发生)则记录日志并继续后续时间步
                 if ti == 0:
                     logger.info(f"{storm_id}: 首步失败, 跳过 ({e})")
                     tracker = None  # type: ignore
-                break
+                    break
+                else:
+                    logger.info(f"{storm_id}: 非首步出现异常, 忽略该时次并继续 (t={times[ti]}) -> {e}")
+                    continue
 
         if tracker is None:
             continue
