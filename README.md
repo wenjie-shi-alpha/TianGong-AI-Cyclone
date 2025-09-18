@@ -1,6 +1,16 @@
 
 # TianGong AI Cyclone
 
+## src 目录模块说明
+
+- `environment_extractor/`：一体化的热带气旋环境分析流水线，涵盖命令行入口、下载与追踪编排（`cli.py`、`pipeline.py`）、形状分析工具（`shape_analysis.py`）以及对外部依赖的封装（`deps.py`、`workflow_utils.py`）。
+- `initial_tracker/`：重构后的初始点追踪内核，负责数据批处理与坐标换算（`batching.py`、`geo.py`）、异常处理（`exceptions.py`）以及核心的逐时追踪逻辑（`tracker.py`、`workflow.py`）。
+- `extractSyst.py`：兼容历史用法的入口脚本，转调 `environment_extractor` 完成“下载→追踪→环境分析”的批处理流程，并处理缺失依赖提示。
+- `initialTracker.py`：为旧版脚本提供的薄封装，暴露与早期实现一致的命令行接口，内部直接调用 `initial_tracker` 包的组件。
+- `process.py`：对 NOAA OAR MLWP 公共 S3 桶的匿名下载工具，提供 `download_from_noaa` 函数以缓存或临时保存指定 NetCDF 文件。
+- `generate_nc_urls.py`：根据轨迹 CSV 中的时间戳，从多个模式前缀下枚举 S3 目录，生成可下载的 NetCDF 文件列表及元数据（CSV 输出）。
+- `list_all_nc_files.py`：遍历指定模式前缀的全部 NetCDF 对象，支持按年份过滤，并将结果写入 `output/all_nc_files.csv` 供批量分析或审计使用。
+
 ## Env Preparing
 
 Setup `venv`:
@@ -106,4 +116,3 @@ Skipping AURO_v100_GFS_2025061000_f000_f240_06: existing final_output JSON detec
 Processed 37 files (skipped 112 already complete).
 ```
 These confirm the skip logic is functioning.
-
