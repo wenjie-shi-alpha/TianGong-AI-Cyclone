@@ -22,11 +22,13 @@ from scipy import ndimage
 import trackpy as tp
 import warnings
 import tempfile  # 保留但当前不再使用临时目录删除策略
-import boto3
-from botocore import UNSIGNED
-from botocore.config import Config
 import shutil
 import re
+
+from environment_extractor.workflow_utils import (
+    download_s3_public as workflow_download_s3_public,
+    sanitize_filename as workflow_sanitize_filename,
+)
 
 warnings.filterwarnings("ignore")
 
@@ -466,15 +468,11 @@ def process_all_models():
 
 
 def sanitize_filename(text: str) -> str:
-    return re.sub(r"[^A-Za-z0-9_\-]+", "_", text)
+    return workflow_sanitize_filename(text)
 
 
 def download_s3_public(s3_url: str, target_path: Path):
-    if not s3_url.startswith("s3://"):
-        raise ValueError(f"无效S3 URL: {s3_url}")
-    bucket, key = s3_url[5:].split("/", 1)
-    s3 = boto3.client("s3", region_name="us-east-1", config=Config(signature_version=UNSIGNED))
-    s3.download_file(bucket, key, str(target_path))
+    workflow_download_s3_public(s3_url, target_path)
 
 
 def process_single_file(nc_path: Path, model_prefix: str, init_time: str, output_dir: Path):
