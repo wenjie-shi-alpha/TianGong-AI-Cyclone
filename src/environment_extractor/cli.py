@@ -92,8 +92,9 @@ def _prepare_batch_targets(csv_path: Path, limit: int | None, initials_csv: Path
         forecast_tag = extract_forecast_tag(fname)
         safe_prefix = sanitize_filename(model_prefix)
         safe_init = sanitize_filename(init_time.replace(":", "").replace("-", ""))
-        track_csv = track_dir / f"tracks_{safe_prefix}_{safe_init}_{forecast_tag}.csv"
+        combined_track_csv = track_dir / f"tracks_{safe_prefix}_{safe_init}_{forecast_tag}.csv"
         nc_local = persist_dir / fname
+        nc_stem = nc_local.stem
 
         print(f"\n[{idx+1}/{len(df)}] ▶️ 处理: {fname}")
 
@@ -109,8 +110,35 @@ def _prepare_batch_targets(csv_path: Path, limit: int | None, initials_csv: Path
 
         prepared.append(nc_local)
 
-        if track_csv.exists():
+        track_csv: Path | None = None
+
+        if combined_track_csv.exists():
+            track_csv = combined_track_csv
             print("🗺️  已存在轨迹CSV, 跳过追踪")
+        else:
+            single_candidates = sorted(track_dir.glob(f"track_*_{nc_stem}.csv"))
+            if len(single_candidates) == 1:
+                try:
+                    combined = combine_initial_tracker_outputs(single_candidates, nc_local)
+                    if combined is not None and not combined.empty:
+                        combined.to_csv(single_candidates[0], index=False)
+                    track_csv = single_candidates[0]
+                    print("🗺️  发现单条轨迹文件, 已更新后直接使用")
+                except Exception as exc:
+                    print(f"⚠️ 单轨迹文件格式更新失败: {exc}")
+            elif len(single_candidates) > 1:
+                try:
+                    combined = combine_initial_tracker_outputs(single_candidates, nc_local)
+                    if combined is not None and not combined.empty:
+                        combined.to_csv(combined_track_csv, index=False)
+                        track_csv = combined_track_csv
+                        print(
+                            f"🗺️  发现多条单独轨迹文件, 已合并生成 {combined_track_csv.name}"
+                        )
+                except Exception as exc:
+                    print(f"⚠️ 合并已有轨迹失败: {exc}")
+
+        if track_csv is not None:
             continue
 
         try:
@@ -122,10 +150,23 @@ def _prepare_batch_targets(csv_path: Path, limit: int | None, initials_csv: Path
             if combined is None or combined.empty:
                 print("⚠️ 合并轨迹失败 -> 跳过")
                 continue
-            combined.to_csv(track_csv, index=False)
-            print(
-                f"💾 合并保存轨迹: {track_csv.name} (含 {combined['particle'].nunique()} 条路径)"
-            )
+
+            if combined["particle"].nunique() == 1:
+                single_path = Path(per_storm[0])
+                combined.to_csv(single_path, index=False)
+                track_csv = single_path
+                print(f"💾 保存单条轨迹: {single_path.name}")
+                if combined_track_csv.exists():
+                    try:
+                        combined_track_csv.unlink()
+                    except Exception:
+                        pass
+            else:
+                combined.to_csv(combined_track_csv, index=False)
+                track_csv = combined_track_csv
+                print(
+                    f"💾 合并保存轨迹: {combined_track_csv.name} (含 {combined['particle'].nunique()} 条路径)"
+                )
         except Exception as exc:
             print(f"❌ 追踪失败: {exc}")
 

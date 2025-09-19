@@ -59,8 +59,9 @@ def streaming_from_csv(
         forecast_tag = extract_forecast_tag(fname)
         safe_prefix = sanitize_filename(model_prefix)
         safe_init = sanitize_filename(init_time.replace(":", "").replace("-", ""))
-        track_csv = track_dir / f"tracks_{safe_prefix}_{safe_init}_{forecast_tag}.csv"
+        combined_track_csv = track_dir / f"tracks_{safe_prefix}_{safe_init}_{forecast_tag}.csv"
         nc_local = persist_dir / fname
+        nc_stem = nc_local.stem
 
         print(f"\n[{idx+1}/{len(df)}] ▶️ 处理: {fname}")
 
@@ -83,7 +84,35 @@ def streaming_from_csv(
         else:
             print("📦 已存在NC文件, 复用")
 
-        if not track_csv.exists():
+        track_csv: Path | None = None
+
+        if combined_track_csv.exists():
+            track_csv = combined_track_csv
+            print("🗺️  已存在轨迹CSV, 直接环境分析")
+        else:
+            single_candidates = sorted(track_dir.glob(f"track_*_{nc_stem}.csv"))
+            if len(single_candidates) == 1:
+                try:
+                    combined = combine_initial_tracker_outputs(single_candidates, nc_local)
+                    if combined is not None and not combined.empty:
+                        combined.to_csv(single_candidates[0], index=False)
+                    track_csv = single_candidates[0]
+                    print("🗺️  发现单条轨迹文件, 已更新后直接使用")
+                except Exception as e:
+                    print(f"⚠️ 单轨迹文件格式更新失败: {e}")
+            elif len(single_candidates) > 1:
+                try:
+                    combined = combine_initial_tracker_outputs(single_candidates, nc_local)
+                    if combined is not None and not combined.empty:
+                        combined.to_csv(combined_track_csv, index=False)
+                        track_csv = combined_track_csv
+                        print(
+                            f"🗺️  发现多条单独轨迹文件, 已合并生成 {combined_track_csv.name}"
+                        )
+                except Exception as e:
+                    print(f"⚠️ 合并已有轨迹失败: {e}")
+
+        if track_csv is None:
             try:
                 print("🧭 使用 initialTracker 执行追踪...")
                 initials_path = initials_csv or Path("input/western_pacific_typhoons_superfast.csv")
@@ -111,10 +140,23 @@ def streaming_from_csv(
                             pass
                     skipped += 1
                     continue
-                combined.to_csv(track_csv, index=False)
-                print(
-                    f"💾 合并保存轨迹: {track_csv.name} (含 {combined['particle'].nunique()} 条路径)"
-                )
+
+                if combined["particle"].nunique() == 1:
+                    single_path = Path(per_storm_csvs[0])
+                    combined.to_csv(single_path, index=False)
+                    track_csv = single_path
+                    print(f"💾 保存单条轨迹: {single_path.name}")
+                    if combined_track_csv.exists():
+                        try:
+                            combined_track_csv.unlink()
+                        except Exception:
+                            pass
+                else:
+                    combined.to_csv(combined_track_csv, index=False)
+                    track_csv = combined_track_csv
+                    print(
+                        f"💾 合并保存轨迹: {combined_track_csv.name} (含 {combined['particle'].nunique()} 条路径)"
+                    )
             except Exception as e:
                 print(f"❌ 追踪失败: {e}")
                 traceback.print_exc()
@@ -126,8 +168,11 @@ def streaming_from_csv(
                         pass
                 skipped += 1
                 continue
-        else:
-            print("🗺️  已存在轨迹CSV, 直接环境分析")
+
+        if track_csv is None:
+            print("⚠️ 未能生成有效轨迹 -> 跳过环境分析")
+            skipped += 1
+            continue
 
         try:
             extractor = TCEnvironmentalSystemsExtractor(str(nc_local), str(track_csv))
@@ -180,12 +225,19 @@ def process_nc_files(target_nc_files, args):
             if tdir.exists():
                 forecast_tag_match = re.search(r"(f\d{3}_f\d{3}_\d{2})", nc_stem)
                 potential = []
+                single_candidates = sorted(tdir.glob(f"track_*_{nc_stem}.csv"))
                 if forecast_tag_match:
                     tag = forecast_tag_match.group(1)
                     potential = list(tdir.glob(f"tracks_*_{tag}.csv"))
                 tracks_all = sorted(tdir.glob("tracks_*.csv"))
                 if potential:
                     track_file = potential[0]
+                elif len(single_candidates) == 1:
+                    track_file = single_candidates[0]
+                elif len(single_candidates) > 1:
+                    print(
+                        "⚠️ 检测到多个单轨迹文件, 请确认后选择正确文件"
+                    )
                 elif tracks_all:
                     track_file = tracks_all[0]
                     print(f"⚠️ 未精确匹配 forecast_tag, 使用 {track_file.name}")
@@ -222,11 +274,16 @@ def process_nc_files(target_nc_files, args):
                         if pd.notnull(first_time)
                         else "T000"
                     )
-                    track_file = out_dir / f"tracks_auto_{nc_stem}_{ts0}.csv"
-                    combined.to_csv(track_file, index=False)
-                    print(
-                        f"💾 自动轨迹文件: {track_file.name} (含 {combined['particle'].nunique()} 条路径)"
-                    )
+                    if combined["particle"].nunique() == 1:
+                        track_file = Path(per_storm[0])
+                        combined.to_csv(track_file, index=False)
+                        print(f"💾 自动轨迹文件: {track_file.name} (单条路径)")
+                    else:
+                        track_file = out_dir / f"tracks_auto_{nc_stem}_{ts0}.csv"
+                        combined.to_csv(track_file, index=False)
+                        print(
+                            f"💾 自动轨迹文件: {track_file.name} (含 {combined['particle'].nunique()} 条路径)"
+                        )
                 except Exception as e:
                     print(f"❌ 自动追踪失败: {e}")
                     skipped += 1
