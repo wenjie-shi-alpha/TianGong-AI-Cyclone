@@ -19,12 +19,25 @@ logger = logging.getLogger(__name__)
 class Tracker:
     """Simple tropical cyclone tracker based on surface pressure minima."""
 
-    def __init__(self, init_lat: float, init_lon: float, init_time: datetime) -> None:
+    def __init__(
+        self,
+        init_lat: float,
+        init_lon: float,
+        init_time: datetime,
+        init_msl: float | None = None,
+        init_wind: float | None = None,
+    ) -> None:
         self.tracked_times: List[datetime] = [init_time]
         self.tracked_lats: List[float] = [init_lat]
         self.tracked_lons: List[float] = [init_lon]
-        self.tracked_msls: List[float] = [np.nan]
-        self.tracked_winds: List[float] = [np.nan]
+        init_msl_val = float(init_msl) if init_msl is not None else np.nan
+        init_wind_val = float(init_wind) if init_wind is not None else np.nan
+        if not np.isfinite(init_msl_val):
+            init_msl_val = np.nan
+        if not np.isfinite(init_wind_val):
+            init_wind_val = np.nan
+        self.tracked_msls: List[float] = [init_msl_val]
+        self.tracked_winds: List[float] = [init_wind_val]
         self.fails: int = 0
         self.last_success_time: Optional[datetime] = init_time
         self.dissipated: bool = False

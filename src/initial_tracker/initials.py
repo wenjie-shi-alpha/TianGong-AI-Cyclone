@@ -10,10 +10,12 @@ import pandas as pd
 def _load_all_points(csv_path: Path) -> pd.DataFrame:
     """Read the cyclone catalogue and normalise time information."""
     df = pd.read_csv(csv_path)
-    required = {"storm_id", "datetime", "latitude", "longitude"}
+    required = {"storm_id", "datetime", "latitude", "longitude", "max_wind_usa", "min_pressure_usa"}
     if not required.issubset(df.columns):
         raise ValueError(f"CSV 缺少必要列: {required - set(df.columns)}")
     df["dt"] = pd.to_datetime(df["datetime"], errors="coerce")
+    df["max_wind_usa"] = pd.to_numeric(df["max_wind_usa"], errors="coerce")
+    df["min_pressure_usa"] = pd.to_numeric(df["min_pressure_usa"], errors="coerce")
     df = df.dropna(subset=["dt"]).copy()
     return df
 
@@ -40,7 +42,15 @@ def _select_initials_for_time(
     pick = sub.loc[idx].copy()
     pick = pick.rename(columns={"latitude": "init_lat", "longitude": "init_lon"})
     pick["init_time"] = pick["dt"].values
-    return pick[["storm_id", "init_time", "init_lat", "init_lon"]].reset_index(drop=True)
+    cols = [
+        "storm_id",
+        "init_time",
+        "init_lat",
+        "init_lon",
+        "max_wind_usa",
+        "min_pressure_usa",
+    ]
+    return pick[cols].reset_index(drop=True)
 
 
 __all__ = ["_load_all_points", "_load_initial_points", "_select_initials_for_time"]

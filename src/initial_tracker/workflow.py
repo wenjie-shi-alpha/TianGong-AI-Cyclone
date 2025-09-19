@@ -70,7 +70,26 @@ def track_file_with_initials(
             logger.debug("%s: 初始点 (%.2f, %.2f) 超出网格范围, 跳过", storm_id, init_lat, init_lon)
             continue
 
-        tracker = Tracker(init_lat=init_lat, init_lon=init_lon, init_time=times[0])
+        def _safe_float(val: object) -> float | None:
+            if pd.isna(val):
+                return None
+            try:
+                return float(val)
+            except (TypeError, ValueError):
+                return None
+
+        init_wind = _safe_float(row.get("max_wind_usa"))
+        init_msl = _safe_float(row.get("min_pressure_usa"))
+        if init_msl is not None:
+            init_msl *= 100.0  # catalogue provides hPa, tracker persists Pascals
+
+        tracker = Tracker(
+            init_lat=init_lat,
+            init_lon=init_lon,
+            init_time=times[0],
+            init_msl=init_msl,
+            init_wind=init_wind,
+        )
 
         for time_idx in range(len(times)):
             cache = time_cache.get(time_idx)
