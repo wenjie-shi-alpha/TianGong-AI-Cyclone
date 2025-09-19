@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 import logging
-from datetime import datetime
-from typing import List
+from datetime import datetime, timedelta
+from typing import List, Optional
 
 import numpy as np
 import pandas as pd
@@ -26,6 +26,12 @@ class Tracker:
         self.tracked_msls: List[float] = [np.nan]
         self.tracked_winds: List[float] = [np.nan]
         self.fails: int = 0
+        self.last_success_time: Optional[datetime] = init_time
+        self.dissipated: bool = False
+        self.dissipated_time: Optional[datetime] = None
+        self.dissipation_reason: Optional[str] = None
+        self.peak_pressure_drop_hpa: float = 0.0
+        self.peak_wind: float = 0.0
 
     def results(self) -> pd.DataFrame:
         """Assemble the current track as a DataFrame."""
@@ -43,6 +49,10 @@ class Tracker:
         """Advance the tracker by one time step using the provided batch."""
         if len(batch.metadata.time) != 1:
             raise RuntimeError("Predictions don't have batch size one.")
+
+        if self.dissipated:
+            logger.debug("Tracker already dissipated; skipping step at %s", batch.metadata.time[0])
+            return
 
         batch = batch.to("cpu")
 
@@ -121,7 +131,10 @@ class Tracker:
             except NoEyeException:
                 pass
 
-        if not snap:
+        if snap:
+            self.fails = 0
+            self.last_success_time = time
+        else:
             self.fails += 1
             if len(self.tracked_lats) > 1:
                 logger.info("Failed at time %s. Extrapolating in a silly way.", time)
@@ -139,5 +152,97 @@ class Tracker:
         self.tracked_msls.append(min_msl)
         self.tracked_winds.append(max_wind)
 
+        pressure_drop_hpa = self._compute_pressure_drop_hpa(msl, lats, lons, lat, lon, min_msl)
+        if pressure_drop_hpa is not None:
+            self.peak_pressure_drop_hpa = max(self.peak_pressure_drop_hpa, pressure_drop_hpa)
+
+        if np.isfinite(max_wind):
+            self.peak_wind = max(self.peak_wind, max_wind)
+
+        self._check_dissipation(time, snap, pressure_drop_hpa, max_wind)
+
+
+    def _compute_pressure_drop_hpa(
+        self,
+        msl: np.ndarray,
+        lats: np.ndarray,
+        lons: np.ndarray,
+        lat: float,
+        lon: float,
+        center_pressure: float,
+    ) -> Optional[float]:
+        if not np.isfinite(center_pressure):
+            return None
+
+        lat_box, lon_box, msl_box = get_box(msl, lats, lons, lat - 7.0, lat + 7.0, lon - 7.0, lon + 7.0)
+        if msl_box.size == 0:
+            return None
+
+        lat_grid, lon_grid = np.meshgrid(lat_box, lon_box, indexing="ij")
+        lat0 = np.deg2rad(lat)
+        lon0 = np.deg2rad(lon % 360)
+        lat_grid_rad = np.deg2rad(lat_grid)
+        lon_grid_rad = np.deg2rad(lon_grid % 360)
+        dlat = lat_grid_rad - lat0
+        dlon = lon_grid_rad - lon0
+        dlon = (dlon + np.pi) % (2 * np.pi) - np.pi
+        a = np.sin(dlat / 2.0) ** 2 + np.cos(lat0) * np.cos(lat_grid_rad) * np.sin(dlon / 2.0) ** 2
+        a = np.clip(a, 0.0, 1.0)
+        angle = 2.0 * np.arcsin(np.sqrt(a))
+        distance_deg = np.rad2deg(angle)
+
+        annulus_mask = (distance_deg >= 5.0) & (distance_deg <= 7.0)
+        if not np.any(annulus_mask):
+            annulus_mask = distance_deg >= 5.0
+            if not np.any(annulus_mask):
+                return None
+
+        periphery_values = msl_box[annulus_mask]
+        periphery_values = periphery_values[np.isfinite(periphery_values)]
+        if periphery_values.size == 0:
+            return None
+
+        periphery_pressure = float(np.mean(periphery_values))
+        if not np.isfinite(periphery_pressure):
+            return None
+
+        scale = 100.0 if max(abs(periphery_pressure), abs(center_pressure)) > 2000 else 1.0
+        drop = (periphery_pressure - center_pressure) / scale
+        return float(max(drop, 0.0))
+
+    def _check_dissipation(
+        self,
+        time: datetime,
+        snap: bool,
+        pressure_drop_hpa: Optional[float],
+        max_wind: float,
+    ) -> None:
+        if self.dissipated:
+            return
+
+        if not snap and self.fails >= 3 and self.last_success_time is not None:
+            duration = time - self.last_success_time
+            if duration >= timedelta(hours=18):
+                self._mark_dissipated(time, "连续追踪失败18小时")
+                return
+
+        if pressure_drop_hpa is not None:
+            if pressure_drop_hpa < 1.0:
+                self._mark_dissipated(time, "中心-外围压差低于1.0 hPa")
+                return
+            if self.peak_pressure_drop_hpa > 0 and pressure_drop_hpa < 0.25 * self.peak_pressure_drop_hpa:
+                self._mark_dissipated(time, "结构强度降至峰值的25%以下 (压差)")
+                return
+        elif np.isfinite(max_wind) and self.peak_wind > 0:
+            if max_wind < 0.25 * self.peak_wind:
+                self._mark_dissipated(time, "结构强度降至峰值的25%以下 (10米风)")
+
+    def _mark_dissipated(self, time: datetime, reason: str) -> None:
+        if self.dissipated:
+            return
+        self.dissipated = True
+        self.dissipated_time = time
+        self.dissipation_reason = reason
+        logger.info("Cyclone dissipated at %s: %s", time, reason)
 
 __all__ = ["Tracker"]

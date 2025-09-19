@@ -111,6 +111,16 @@ def track_file_with_initials(
                 logger.info("%s: 非首步异常, 忽略该时次并继续 (t=%s) -> %s", storm_id, times[time_idx], exc)
                 continue
 
+            if tracker.dissipated:
+                diss_time = tracker.dissipated_time or times[time_idx]
+                logger.info(
+                    "%s: 在 %s 判定气旋消亡, 原因: %s",
+                    storm_id,
+                    diss_time,
+                    tracker.dissipation_reason or "未提供原因",
+                )
+                break
+
         if tracker is None:
             continue
 
