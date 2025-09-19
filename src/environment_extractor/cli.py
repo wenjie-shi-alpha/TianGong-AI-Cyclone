@@ -35,6 +35,12 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="使用旧的批量模式: 先全部下载+追踪, 再统一做环境分析",
     )
+    parser.add_argument(
+        "--processes",
+        type=int,
+        default=1,
+        help="并行运行的进程数 (>=1)。受限于资源, 实际同时处理的文件数不会超过2",
+    )
     return parser
 
 
@@ -208,6 +214,7 @@ def main(argv: list[str] | None = None) -> None:
                 memory=args.memory,
                 keep_nc=(args.no_clean or args.keep_nc),
                 initials_csv=Path(args.initials) if args.initials else None,
+                processes=max(1, args.processes),
             )
             print("🎯 流式处理完成 (无需进入批量后处理循环)")
             return
