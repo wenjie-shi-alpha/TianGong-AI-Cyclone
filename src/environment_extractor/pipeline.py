@@ -261,6 +261,14 @@ def streaming_from_csv(
 
             if track_csv is None:
                 print("⚠️ 未能生成有效轨迹 -> 跳过环境分析")
+                if not keep_nc:
+                    try:
+                        nc_local.unlink()
+                        print("🧹 已删除NC (无轨迹)")
+                    except FileNotFoundError:
+                        pass
+                    except Exception as exc:
+                        print(f"⚠️ 删除NC失败: {exc}")
                 skipped += 1
                 continue
 
@@ -322,6 +330,17 @@ def process_nc_files(target_nc_files, args):
         executor = ProcessPoolExecutor(max_workers=processes)
 
     keep_nc_flag = bool(getattr(args, "no_clean", False) or getattr(args, "keep_nc", False))
+
+    def remove_nc_file(path: Path, reason: str) -> None:
+        if keep_nc_flag:
+            return
+        try:
+            path.unlink()
+            print(f"🧹 已删除 NC ({reason}): {path.name}")
+        except FileNotFoundError:
+            pass
+        except Exception as exc:
+            print(f"⚠️ 删除NC失败({reason}): {exc}")
 
     def drain_completed(block: bool) -> None:
         nonlocal processed
@@ -418,11 +437,13 @@ def process_nc_files(target_nc_files, args):
                     per_storm = it_track_file_with_initials(Path(nc_file), initials_df, out_dir)
                     if not per_storm:
                         print("⚠️ 无轨迹 -> 跳过该NC")
+                        remove_nc_file(nc_file, "无轨迹")
                         skipped += 1
                         continue
                     combined = combine_initial_tracker_outputs(per_storm, nc_file)
                     if combined is None or combined.empty:
                         print("⚠️ 自动追踪无有效轨迹 -> 跳过该NC")
+                        remove_nc_file(nc_file, "无轨迹")
                         skipped += 1
                         continue
                     first_time = (
@@ -445,10 +466,12 @@ def process_nc_files(target_nc_files, args):
                         )
                 except Exception as e:
                     print(f"❌ 自动追踪失败: {e}")
+                    remove_nc_file(nc_file, "追踪失败")
                     skipped += 1
                     continue
             else:
                 print("⚠️ 未找到对应轨迹且未启用 --auto, 跳过")
+                remove_nc_file(nc_file, "无轨迹")
                 skipped += 1
                 continue
 

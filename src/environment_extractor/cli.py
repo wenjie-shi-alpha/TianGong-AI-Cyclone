@@ -89,6 +89,16 @@ def _prepare_batch_targets(csv_path: Path, limit: int | None, initials_csv: Path
     initials_df = it_load_all_points(initials_path)
 
     prepared: list[Path] = []
+
+    def remove_nc_file(path: Path, reason: str) -> None:
+        """删除无法用于后续分析的 NC 文件。"""
+        try:
+            path.unlink()
+            print(f"🧹 已删除NC ({reason})")
+        except FileNotFoundError:
+            pass
+        except Exception as exc:
+            print(f"⚠️ 删除NC失败({reason}): {exc}")
     print(f"⬇️ [批量模式] 逐项下载与追踪 (limit={limit})")
     for idx, row in df.iterrows():
         s3_url = row["s3_url"]
@@ -113,8 +123,6 @@ def _prepare_batch_targets(csv_path: Path, limit: int | None, initials_csv: Path
                 continue
         else:
             print("📦 已存在NC文件, 复用")
-
-        prepared.append(nc_local)
 
         track_csv: Path | None = None
 
@@ -145,16 +153,19 @@ def _prepare_batch_targets(csv_path: Path, limit: int | None, initials_csv: Path
                     print(f"⚠️ 合并已有轨迹失败: {exc}")
 
         if track_csv is not None:
+            prepared.append(nc_local)
             continue
 
         try:
             per_storm = it_track_file_with_initials(nc_local, initials_df, track_dir)
             if not per_storm:
-                print("⚠️ 无有效轨迹 -> 略过合并")
+                print("⚠️ 无有效轨迹 -> 删除NC")
+                remove_nc_file(nc_local, "无轨迹")
                 continue
             combined = combine_initial_tracker_outputs(per_storm, nc_local)
             if combined is None or combined.empty:
-                print("⚠️ 合并轨迹失败 -> 跳过")
+                print("⚠️ 合并轨迹失败 -> 删除NC")
+                remove_nc_file(nc_local, "无轨迹")
                 continue
 
             if combined["particle"].nunique() == 1:
@@ -175,6 +186,14 @@ def _prepare_batch_targets(csv_path: Path, limit: int | None, initials_csv: Path
                 )
         except Exception as exc:
             print(f"❌ 追踪失败: {exc}")
+            remove_nc_file(nc_local, "追踪失败")
+            continue
+
+        if track_csv is None:
+            remove_nc_file(nc_local, "无轨迹")
+            continue
+
+        prepared.append(nc_local)
 
     if not prepared:
         print("❌ 未成功准备任何NC文件")
