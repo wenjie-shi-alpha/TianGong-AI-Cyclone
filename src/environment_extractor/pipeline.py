@@ -21,6 +21,7 @@ def _run_environment_analysis(
     output_dir: str,
     keep_nc: bool,
     log_file: str | None = None,
+    concise: bool = False,
 ) -> tuple[bool, str | None]:
     """Worker helper executed in a child process for 环境分析."""
 
@@ -31,7 +32,8 @@ def _run_environment_analysis(
     def _execute() -> None:
         nonlocal success, error_message
 
-        print(f"[{datetime.utcnow().isoformat()}] ▶️ 环境分析开始: {nc_name}")
+        if not concise:
+            print(f"[{datetime.utcnow().isoformat()}] ▶️ 环境分析开始: {nc_name}")
         try:
             extractor = TCEnvironmentalSystemsExtractor(nc_path, track_csv)
             extractor.analyze_and_export_as_json(output_dir)
@@ -55,7 +57,7 @@ def _run_environment_analysis(
                         f"[{datetime.utcnow().isoformat()}] ⚠️ 删除NC失败 ({nc_name}): {exc}"
                     )
 
-    if log_file:
+    if log_file and not concise:
         log_path = Path(log_file)
         log_path.parent.mkdir(parents=True, exist_ok=True)
         with log_path.open("w", encoding="utf-8") as fh:
@@ -125,7 +127,11 @@ def streaming_from_csv(
     executor: ProcessPoolExecutor | None = None
     active_futures: dict[Future, dict[str, str]] = {}
     logs_dir: Path | None = None
-    if logs_root is not None and parallel:
+    if logs_root is not None and parallel and not concise_log:
+        logs_dir = logs_root
+        logs_dir.mkdir(parents=True, exist_ok=True)
+    logs_dir: Path | None = None
+    if logs_root is not None and parallel and not concise_log:
         logs_dir = logs_root
         logs_dir.mkdir(parents=True, exist_ok=True)
 
@@ -319,38 +325,40 @@ def streaming_from_csv(
 
             if parallel and executor:
                 detail("🧮 已提交环境分析任务 (并行)")
-                log_file = (
-                    str((logs_dir / f"{nc_local.stem}.log").resolve())
-                    if logs_dir is not None
-                    else None
-                )
-                future = executor.submit(
-                    _run_environment_analysis,
+            log_file = (
+                str((logs_dir / f"{nc_local.stem}.log").resolve())
+                if logs_dir is not None and not concise_log
+                else None
+            )
+            future = executor.submit(
+                _run_environment_analysis,
+                str(nc_local),
+                str(track_csv),
+                "final_single_output",
+                keep_nc,
+                log_file,
+                concise_log,
+            )
+            meta: dict[str, str] = {"label": nc_local.name}
+            if log_file:
+                meta["log"] = log_file
+            active_futures[future] = meta
+        else:
+            try:
+                success, error_msg = _run_environment_analysis(
                     str(nc_local),
                     str(track_csv),
                     "final_single_output",
                     keep_nc,
-                    log_file,
+                    None,
+                    concise_log,
                 )
-                active_futures[future] = {
-                    "label": nc_local.name,
-                    "log": log_file,
-                }
-            else:
-                try:
-                    success, error_msg = _run_environment_analysis(
-                        str(nc_local),
-                        str(track_csv),
-                        "final_single_output",
-                        keep_nc,
-                        None,
-                    )
-                    if success:
-                        processed += 1
-                    elif error_msg:
-                        summary(f"❌ 环境分析失败: {error_msg}")
-                except Exception as e:
-                    summary(f"❌ 环境分析失败: {e}")
+                if success:
+                    processed += 1
+                elif error_msg:
+                    summary(f"❌ 环境分析失败: {error_msg}")
+            except Exception as e:
+                summary(f"❌ 环境分析失败: {e}")
 
     finally:
         if parallel and executor:
@@ -554,7 +562,7 @@ def process_nc_files(
             detail("🧮 已提交环境分析任务 (并行)")
             log_file = (
                 str((logs_dir / f"{nc_file.stem}.log").resolve())
-                if logs_dir is not None
+                if logs_dir is not None and not concise_log
                 else None
             )
             future = executor.submit(
@@ -564,11 +572,12 @@ def process_nc_files(
                 "final_single_output",
                 keep_nc_flag,
                 log_file,
+                concise_log,
             )
-            active_futures[future] = {
-                "label": nc_file.name,
-                "log": log_file,
-            }
+            meta: dict[str, str] = {"label": nc_file.name}
+            if log_file:
+                meta["log"] = log_file
+            active_futures[future] = meta
         else:
             try:
                 success, error_msg = _run_environment_analysis(
@@ -577,6 +586,7 @@ def process_nc_files(
                     "final_single_output",
                     keep_nc_flag,
                     None,
+                    concise_log,
                 )
                 if success:
                     processed += 1
