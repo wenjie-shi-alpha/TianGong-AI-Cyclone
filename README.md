@@ -45,7 +45,7 @@ pip freeze > requirements_freeze.txt
 
 aws s3 ls --no-sign-request --region us-east-1 s3://noaa-oar-mlwp-data/
 
-python3 src/extractSyst.py --csv output/nc_file_urls.csv --limit 1 --processes 3 --auto
+python3 src/extractSyst.py --csv output/nc_file_urls.csv --limit 10 --processes 10 --concise-log --auto > run.log
 python3 src/extractSyst.py --csv output/nc_file_urls.csv --limit 1 --auto --no-clean
 
 nohup python3 src/extractSyst.py --csv output/nc_file_urls.csv --auto --processes 15 > run.log 2>&1 &
@@ -116,3 +116,9 @@ Skipping AURO_v100_GFS_2025061000_f000_f240_06: existing final_output JSON detec
 Processed 37 files (skipped 112 already complete).
 ```
 These confirm the skip logic is functioning.
+
+## Logging Modes
+
+- 默认模式会打印完整的流水线细节，配合 `--processes` 使用时，每个子任务还会在终端输出进度。
+- 传入 `--concise-log` 可切换到精简模式，只保留必要的摘要统计；处理流程仍会在失败时输出错误信息。
+- 当启用多进程(`--processes > 1`)时，每个 NC 文件的详细日志会写入 `final_single_output/logs/<nc文件名>.log`，方便在精简模式下排查问题；终端上只保留成功/失败概览。

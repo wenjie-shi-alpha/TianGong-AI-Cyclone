@@ -41,10 +41,17 @@ def build_parser() -> argparse.ArgumentParser:
         default=1,
         help="并行运行的进程数 (>=1)。最大并行任务数与进程数一致",
     )
+    parser.add_argument(
+        "--concise-log",
+        action="store_true",
+        help="启用精简日志模式，仅输出文件完成情况",
+    )
     return parser
 
 
-def _prepare_batch_targets(csv_path: Path, limit: int | None, initials_csv: Path) -> list[Path]:
+def _prepare_batch_targets(
+    csv_path: Path, limit: int | None, initials_csv: Path, concise_log: bool = False
+) -> list[Path]:
     import pandas as pd
 
     from initialTracker import track_file_with_initials as it_track_file_with_initials
@@ -57,15 +64,22 @@ def _prepare_batch_targets(csv_path: Path, limit: int | None, initials_csv: Path
         sanitize_filename,
     )
 
+    def detail(message: str) -> None:
+        if not concise_log:
+            print(message)
+
+    def summary(message: str) -> None:
+        print(message)
+
     if not csv_path.exists():
-        print(f"❌ CSV不存在: {csv_path}")
+        summary(f"❌ CSV不存在: {csv_path}")
         sys.exit(1)
 
     df = pd.read_csv(csv_path)
     required_cols = {"s3_url", "model_prefix", "init_time"}
     if not required_cols.issubset(df.columns):
         missing = required_cols - set(df.columns)
-        print(f"❌ CSV缺少必要列: {missing}")
+        summary(f"❌ CSV缺少必要列: {missing}")
         sys.exit(1)
 
     if limit is not None:
@@ -81,10 +95,10 @@ def _prepare_batch_targets(csv_path: Path, limit: int | None, initials_csv: Path
     else:
         fallback = Path("input/western_pacific_typhoons_superfast.csv")
         if fallback.exists():
-            print(f"⚠️ 指定初始点文件不存在, 使用默认: {fallback}")
+            summary(f"⚠️ 指定初始点文件不存在, 使用默认: {fallback}")
             initials_path = fallback
         else:
-            print(f"❌ 找不到初始点CSV: {initials_csv}")
+            summary(f"❌ 找不到初始点CSV: {initials_csv}")
             sys.exit(1)
     initials_df = it_load_all_points(initials_path)
 
@@ -94,12 +108,12 @@ def _prepare_batch_targets(csv_path: Path, limit: int | None, initials_csv: Path
         """删除无法用于后续分析的 NC 文件。"""
         try:
             path.unlink()
-            print(f"🧹 已删除NC ({reason})")
+            detail(f"🧹 已删除NC ({reason})")
         except FileNotFoundError:
             pass
         except Exception as exc:
-            print(f"⚠️ 删除NC失败({reason}): {exc}")
-    print(f"⬇️ [批量模式] 逐项下载与追踪 (limit={limit})")
+            summary(f"⚠️ 删除NC失败({reason}): {exc}")
+    detail(f"⬇️ [批量模式] 逐项下载与追踪 (limit={limit})")
     for idx, row in df.iterrows():
         s3_url = row["s3_url"]
         model_prefix = row["model_prefix"]
@@ -112,23 +126,23 @@ def _prepare_batch_targets(csv_path: Path, limit: int | None, initials_csv: Path
         nc_local = persist_dir / fname
         nc_stem = nc_local.stem
 
-        print(f"\n[{idx+1}/{len(df)}] ▶️ 处理: {fname}")
+        detail(f"\n[{idx+1}/{len(df)}] ▶️ 处理: {fname}")
 
         if not nc_local.exists():
             try:
-                print(f"⬇️  下载NC: {s3_url}")
+                detail(f"⬇️  下载NC: {s3_url}")
                 download_s3_public(s3_url, nc_local)
             except Exception as exc:
-                print(f"❌ 下载失败: {exc}")
+                summary(f"❌ 下载失败: {exc}")
                 continue
         else:
-            print("📦 已存在NC文件, 复用")
+            detail("📦 已存在NC文件, 复用")
 
         track_csv: Path | None = None
 
         if combined_track_csv.exists():
             track_csv = combined_track_csv
-            print("🗺️  已存在轨迹CSV, 跳过追踪")
+            detail("🗺️  已存在轨迹CSV, 跳过追踪")
         else:
             single_candidates = sorted(track_dir.glob(f"track_*_{nc_stem}.csv"))
             if len(single_candidates) == 1:
@@ -137,20 +151,20 @@ def _prepare_batch_targets(csv_path: Path, limit: int | None, initials_csv: Path
                     if combined is not None and not combined.empty:
                         combined.to_csv(single_candidates[0], index=False)
                     track_csv = single_candidates[0]
-                    print("🗺️  发现单条轨迹文件, 已更新后直接使用")
+                    detail("🗺️  发现单条轨迹文件, 已更新后直接使用")
                 except Exception as exc:
-                    print(f"⚠️ 单轨迹文件格式更新失败: {exc}")
+                    summary(f"⚠️ 单轨迹文件格式更新失败: {exc}")
             elif len(single_candidates) > 1:
                 try:
                     combined = combine_initial_tracker_outputs(single_candidates, nc_local)
                     if combined is not None and not combined.empty:
                         combined.to_csv(combined_track_csv, index=False)
                         track_csv = combined_track_csv
-                        print(
+                        detail(
                             f"🗺️  发现多条单独轨迹文件, 已合并生成 {combined_track_csv.name}"
                         )
                 except Exception as exc:
-                    print(f"⚠️ 合并已有轨迹失败: {exc}")
+                    summary(f"⚠️ 合并已有轨迹失败: {exc}")
 
         if track_csv is not None:
             prepared.append(nc_local)
@@ -159,12 +173,12 @@ def _prepare_batch_targets(csv_path: Path, limit: int | None, initials_csv: Path
         try:
             per_storm = it_track_file_with_initials(nc_local, initials_df, track_dir)
             if not per_storm:
-                print("⚠️ 无有效轨迹 -> 删除NC")
+                detail("⚠️ 无有效轨迹 -> 删除NC")
                 remove_nc_file(nc_local, "无轨迹")
                 continue
             combined = combine_initial_tracker_outputs(per_storm, nc_local)
             if combined is None or combined.empty:
-                print("⚠️ 合并轨迹失败 -> 删除NC")
+                detail("⚠️ 合并轨迹失败 -> 删除NC")
                 remove_nc_file(nc_local, "无轨迹")
                 continue
 
@@ -172,7 +186,7 @@ def _prepare_batch_targets(csv_path: Path, limit: int | None, initials_csv: Path
                 single_path = Path(per_storm[0])
                 combined.to_csv(single_path, index=False)
                 track_csv = single_path
-                print(f"💾 保存单条轨迹: {single_path.name}")
+                detail(f"💾 保存单条轨迹: {single_path.name}")
                 if combined_track_csv.exists():
                     try:
                         combined_track_csv.unlink()
@@ -181,11 +195,11 @@ def _prepare_batch_targets(csv_path: Path, limit: int | None, initials_csv: Path
             else:
                 combined.to_csv(combined_track_csv, index=False)
                 track_csv = combined_track_csv
-                print(
+                detail(
                     f"💾 合并保存轨迹: {combined_track_csv.name} (含 {combined['particle'].nunique()} 条路径)"
                 )
         except Exception as exc:
-            print(f"❌ 追踪失败: {exc}")
+            summary(f"❌ 追踪失败: {exc}")
             remove_nc_file(nc_local, "追踪失败")
             continue
 
@@ -196,7 +210,7 @@ def _prepare_batch_targets(csv_path: Path, limit: int | None, initials_csv: Path
         prepared.append(nc_local)
 
     if not prepared:
-        print("❌ 未成功准备任何NC文件")
+        summary("❌ 未成功准备任何NC文件")
         sys.exit(1)
 
     return prepared
@@ -208,24 +222,33 @@ def main(argv: list[str] | None = None) -> None:
 
     ensure_available()
 
-    print("🌀 一体化热带气旋分析流程启动")
-    print("=" * 60)
+    def detail(message: str) -> None:
+        if not args.concise_log:
+            print(message)
+
+    def summary(message: str) -> None:
+        print(message)
+
+    logs_root = Path("final_single_output") / "logs"
+
+    detail("🌀 一体化热带气旋分析流程启动")
+    detail("=" * 60)
 
     if args.nc:
         nc_path = Path(args.nc)
         if not nc_path.exists():
-            print(f"❌ 指定NC不存在: {nc_path}")
+            summary(f"❌ 指定NC不存在: {nc_path}")
             sys.exit(1)
         target_nc_files = [nc_path]
-        print("📦 单文件分析模式")
+        detail("📦 单文件分析模式")
     else:
         if args.batch:
             target_nc_files = _prepare_batch_targets(
-                Path(args.csv), args.limit, Path(args.initials)
+                Path(args.csv), args.limit, Path(args.initials), args.concise_log
             )
-            print(f"📦 待环境分析NC数量: {len(target_nc_files)}")
+            detail(f"📦 待环境分析NC数量: {len(target_nc_files)}")
         else:
-            print("🚚 启用流式顺序处理: 每个NC独立完成(下载->追踪->环境分析->清理)")
+            detail("🚚 启用流式顺序处理: 每个NC独立完成(下载->追踪->环境分析->清理)")
             streaming_from_csv(
                 csv_path=Path(args.csv),
                 limit=args.limit,
@@ -234,11 +257,18 @@ def main(argv: list[str] | None = None) -> None:
                 keep_nc=(args.no_clean or args.keep_nc),
                 initials_csv=Path(args.initials) if args.initials else None,
                 processes=max(1, args.processes),
+                concise_log=args.concise_log,
+                logs_root=logs_root,
             )
-            print("🎯 流式处理完成 (无需进入批量后处理循环)")
+            detail("🎯 流式处理完成 (无需进入批量后处理循环)")
             return
 
-    process_nc_files(target_nc_files, args)
+    process_nc_files(
+        target_nc_files,
+        args,
+        concise_log=args.concise_log,
+        logs_root=logs_root,
+    )
 
 
 __all__ = ["main", "build_parser"]
