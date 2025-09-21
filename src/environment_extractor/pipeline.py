@@ -72,12 +72,7 @@ def streaming_from_csv(
         df = df.head(limit)
 
     processes = max(1, int(processes))
-    max_in_flight = max(1, int(max_in_flight))
-    max_in_flight = min(max_in_flight, 2)
-    if processes == 1:
-        max_in_flight = 1
-    elif max_in_flight > processes:
-        max_in_flight = processes
+    max_in_flight = processes
 
     print(f"📄 流式待处理数量: {len(df)} (limit={limit})")
 
@@ -318,7 +313,7 @@ def process_nc_files(target_nc_files, args):
     final_output_dir.mkdir(exist_ok=True)
 
     processes = max(1, int(getattr(args, "processes", 1)))
-    max_in_flight = 1 if processes == 1 else min(2, processes)
+    max_in_flight = processes
     parallel = processes > 1
     executor: ProcessPoolExecutor | None = None
     active_futures: dict[Future, dict[str, str]] = {}

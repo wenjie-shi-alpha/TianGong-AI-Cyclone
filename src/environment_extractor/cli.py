@@ -39,7 +39,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--processes",
         type=int,
         default=1,
-        help="并行运行的进程数 (>=1)。受限于资源, 实际同时处理的文件数不会超过2",
+        help="并行运行的进程数 (>=1)。最大并行任务数与进程数一致",
     )
     return parser
 
