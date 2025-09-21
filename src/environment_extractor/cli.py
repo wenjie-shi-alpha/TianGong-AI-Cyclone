@@ -13,7 +13,12 @@ from .pipeline import process_nc_files, streaming_from_csv
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="一体化: 下载->追踪->环境分析")
     parser.add_argument("--csv", default="output/nc_file_urls.csv", help="含s3_url的列表CSV")
-    parser.add_argument("--limit", type=int, default=1, help="限制处理前N个NC文件")
+    parser.add_argument(
+        "--limit",
+        type=int,
+        default=None,
+        help="限制处理前N个NC文件 (默认处理全部)",
+    )
     parser.add_argument("--nc", default=None, help="直接指定单个NC文件 (跳过下载与追踪)")
     parser.add_argument(
         "--tracks",
