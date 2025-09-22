@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections import defaultdict
 from contextlib import redirect_stderr, redirect_stdout
 from datetime import datetime
 from pathlib import Path
@@ -13,6 +14,49 @@ from .workflow_utils import (
     extract_forecast_tag,
     sanitize_filename,
 )
+
+
+def _index_existing_json(output_dir: Path) -> dict[str, set[str]]:
+    """Scan the output directory once and map NC stems to non-empty JSON results."""
+
+    index: dict[str, set[str]] = defaultdict(set)
+    pattern = "*_TC_Analysis_*.json"
+    for json_path in output_dir.glob(pattern):
+        try:
+            if json_path.stat().st_size <= 10:
+                continue
+        except OSError:
+            continue
+        stem = json_path.stem
+        if "_TC_Analysis_" not in stem:
+            continue
+        nc_stem, particle = stem.split("_TC_Analysis_", 1)
+        if particle:
+            index[nc_stem].add(particle)
+    return {k: set(v) for k, v in index.items()}
+
+
+def _refresh_existing_entry(
+    index: dict[str, set[str]], output_dir: Path, nc_stem: str
+) -> None:
+    """Refresh cached metadata for one NC stem after new JSON files land."""
+
+    particles: set[str] = set()
+    for json_path in output_dir.glob(f"{nc_stem}_TC_Analysis_*.json"):
+        try:
+            if json_path.stat().st_size <= 10:
+                continue
+        except OSError:
+            continue
+        stem = json_path.stem
+        if stem.startswith(f"{nc_stem}_TC_Analysis_"):
+            particle = stem.replace(f"{nc_stem}_TC_Analysis_", "", 1)
+            if particle:
+                particles.add(particle)
+    if particles:
+        index[nc_stem] = particles
+    else:
+        index.pop(nc_stem, None)
 
 
 def _run_environment_analysis(
@@ -114,14 +158,37 @@ def streaming_from_csv(
     processes = max(1, int(processes))
     max_in_flight = processes
 
-    detail(f"📄 流式待处理数量: {len(df)} (limit={limit})")
-
     persist_dir = Path("data/nc_files")
     persist_dir.mkdir(parents=True, exist_ok=True)
     track_dir = Path("track_single")
     track_dir.mkdir(exist_ok=True)
     final_dir = Path("final_single_output")
     final_dir.mkdir(exist_ok=True)
+
+    existing_index = _index_existing_json(final_dir)
+    original_total = len(df)
+    pre_skipped = 0
+    if original_total:
+        df = df.assign(_nc_stem=df["s3_url"].map(lambda url: Path(url).stem))
+        if existing_index:
+            pre_mask = df["_nc_stem"].map(lambda stem: bool(existing_index.get(stem)))
+            pre_skipped = int(pre_mask.sum())
+            if pre_skipped:
+                summary(f"⏭️ 预检跳过 {pre_skipped} 个已有 JSON 的条目")
+            df = df.loc[~pre_mask].copy()
+        else:
+            df = df.copy()
+    else:
+        df = df.copy()
+
+    if df.empty:
+        summary("⏹️ 所有条目已有 JSON 结果，流程提前结束。")
+        summary(f"📁 输出目录: {final_dir}")
+        return
+
+    detail(
+        f"📄 流式待处理数量: {len(df)} (limit={limit}, 原始={original_total})"
+    )
 
     parallel = processes > 1
     executor: ProcessPoolExecutor | None = None
@@ -130,13 +197,9 @@ def streaming_from_csv(
     if logs_root is not None and parallel and not concise_log:
         logs_dir = logs_root
         logs_dir.mkdir(parents=True, exist_ok=True)
-    logs_dir: Path | None = None
-    if logs_root is not None and parallel and not concise_log:
-        logs_dir = logs_root
-        logs_dir.mkdir(parents=True, exist_ok=True)
 
     processed = 0
-    skipped = 0
+    skipped = pre_skipped
 
     if parallel:
         detail(
@@ -168,6 +231,9 @@ def streaming_from_csv(
             if success:
                 processed += 1
                 summary(f"✅ 环境分析完成: {label}")
+                stem = meta.get("stem")
+                if stem:
+                    _refresh_existing_entry(existing_index, final_dir, stem)
             else:
                 log_hint = meta.get("log")
                 extra = f" -> {error_msg}" if error_msg else ""
@@ -199,17 +265,16 @@ def streaming_from_csv(
             safe_init = sanitize_filename(init_time.replace(":", "").replace("-", ""))
             combined_track_csv = track_dir / f"tracks_{safe_prefix}_{safe_init}_{forecast_tag}.csv"
             nc_local = persist_dir / fname
-            nc_stem = nc_local.stem
+            nc_stem = row.get("_nc_stem", nc_local.stem)
 
             detail(f"\n[{idx+1}/{len(df)}] ▶️ 处理: {fname}")
 
-            existing_json = list(final_dir.glob(f"{Path(fname).stem}_TC_Analysis_*.json"))
-            if existing_json:
-                non_empty = [p for p in existing_json if p.stat().st_size > 10]
-                if non_empty:
-                    detail(f"⏭️  已存在最终JSON({len(non_empty)}) -> 跳过")
-                    skipped += 1
-                    continue
+            _refresh_existing_entry(existing_index, final_dir, nc_stem)
+            existing_particles = existing_index.get(nc_stem, set())
+            if existing_particles:
+                detail(f"⏭️  已存在最终JSON({len(existing_particles)}) -> 跳过")
+                skipped += 1
+                continue
 
             if not nc_local.exists():
                 try:
@@ -339,7 +404,7 @@ def streaming_from_csv(
                 log_file,
                 concise_log,
             )
-            meta: dict[str, str] = {"label": nc_local.name}
+            meta: dict[str, str] = {"label": nc_local.name, "stem": nc_stem}
             if log_file:
                 meta["log"] = log_file
             active_futures[future] = meta
@@ -355,6 +420,7 @@ def streaming_from_csv(
                 )
                 if success:
                     processed += 1
+                    _refresh_existing_entry(existing_index, final_dir, nc_stem)
                 elif error_msg:
                     summary(f"❌ 环境分析失败: {error_msg}")
             except Exception as e:
@@ -389,8 +455,29 @@ def process_nc_files(
     def summary(message: str) -> None:
         print(message)
 
+    target_nc_files = list(target_nc_files)
     final_output_dir = Path("final_single_output")
     final_output_dir.mkdir(exist_ok=True)
+
+    existing_index = _index_existing_json(final_output_dir)
+    original_total = len(target_nc_files)
+    pre_skipped = 0
+    if target_nc_files:
+        filtered: list[Path] = []
+        for nc_path in target_nc_files:
+            stem = nc_path.stem
+            if existing_index.get(stem):
+                pre_skipped += 1
+            else:
+                filtered.append(nc_path)
+        if pre_skipped:
+            summary(f"⏭️ 预检跳过 {pre_skipped} 个已有 JSON 的 NC 文件")
+        target_nc_files = filtered
+
+    if not target_nc_files:
+        summary("⏹️ 所有 NC 已存在分析结果，跳过批量处理。")
+        summary(f"📁 输出目录: {final_output_dir}")
+        return 0, pre_skipped
 
     processes = max(1, int(getattr(args, "processes", 1)))
     max_in_flight = processes
@@ -441,6 +528,9 @@ def process_nc_files(
             if success:
                 processed += 1
                 summary(f"✅ 环境分析完成: {label}")
+                stem = meta.get("stem")
+                if stem:
+                    _refresh_existing_entry(existing_index, final_output_dir, stem)
             else:
                 log_hint = meta.get("log")
                 extra = f" -> {error_msg}" if error_msg else ""
@@ -458,7 +548,7 @@ def process_nc_files(
             drain_completed(block=True)
 
     processed = 0
-    skipped = 0
+    skipped = pre_skipped
     for idx, nc_file in enumerate(target_nc_files, start=1):
         import re
 
@@ -468,10 +558,10 @@ def process_nc_files(
 
         nc_stem = nc_file.stem
         detail(f"\n[{idx}/{len(target_nc_files)}] ▶️ 处理 NC: {nc_file.name}")
-        existing = list(final_output_dir.glob(f"{nc_stem}_TC_Analysis_*.json"))
-        non_empty = [p for p in existing if p.stat().st_size > 10]
-        if non_empty:
-            detail(f"⏭️  已存在分析结果 ({len(non_empty)}) -> 跳过 {nc_stem}")
+        _refresh_existing_entry(existing_index, final_output_dir, nc_stem)
+        existing_particles = existing_index.get(nc_stem, set())
+        if existing_particles:
+            detail(f"⏭️  已存在分析结果 ({len(existing_particles)}) -> 跳过 {nc_stem}")
             skipped += 1
             continue
 
@@ -574,7 +664,7 @@ def process_nc_files(
                 log_file,
                 concise_log,
             )
-            meta: dict[str, str] = {"label": nc_file.name}
+            meta: dict[str, str] = {"label": nc_file.name, "stem": nc_stem}
             if log_file:
                 meta["log"] = log_file
             active_futures[future] = meta
@@ -590,6 +680,7 @@ def process_nc_files(
                 )
                 if success:
                     processed += 1
+                    _refresh_existing_entry(existing_index, final_output_dir, nc_stem)
                 elif error_msg:
                     summary(f"❌ 分析失败 {nc_file.name}: {error_msg}")
             except Exception as e:
@@ -604,7 +695,7 @@ def process_nc_files(
     summary("\n🎉 多文件环境分析完成. 统计:")
     summary(f"  ✅ 已分析: {processed}")
     summary(f"  ⏭️ 跳过(已有结果/无轨迹): {skipped}")
-    summary(f"  📦 总计遍历: {len(target_nc_files)}")
+    summary(f"  📦 实际遍历: {len(target_nc_files)} / 原始 {original_total}")
     summary("结果目录: final_single_output")
 
     return processed, skipped
