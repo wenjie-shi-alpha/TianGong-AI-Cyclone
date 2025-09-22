@@ -78,6 +78,24 @@ class TCEnvironmentalSystemsExtractor:
         )
         print(f"🔍 增强形状分析功能已启用")
 
+    def close(self) -> None:
+        """Release the underlying dataset handle so NC files can be deleted promptly."""
+
+        dataset = getattr(self, "ds", None)
+        if dataset is not None:
+            try:
+                dataset.close()
+            except Exception:
+                pass
+            finally:
+                self.ds = None
+
+    def __enter__(self) -> "TCEnvironmentalSystemsExtractor":
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback) -> None:
+        self.close()
+
     # --- 核心系统提取函数 (深度重构) ---
 
     def extract_steering_system(self, time_idx, tc_lat, tc_lon):
@@ -685,6 +703,14 @@ class TCEnvironmentalSystemsExtractor:
 
     # --- 主分析与导出函数 ---
     def analyze_and_export_as_json(self, output_dir="final_single_output"):
+        """Public entry point that always releases file handles."""
+
+        try:
+            return self._analyze_and_export_as_json(output_dir)
+        finally:
+            self.close()
+
+    def _analyze_and_export_as_json(self, output_dir="final_single_output"):
         # ... (此函数逻辑与上一版基本相同，无需修改) ...
         print("\n🔍 开始进行专家级环境场解译并构建JSON...")
         output_path = Path(output_dir)

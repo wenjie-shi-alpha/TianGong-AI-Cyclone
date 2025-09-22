@@ -2,10 +2,82 @@
 
 from __future__ import annotations
 
+import json
 from collections import defaultdict
 from contextlib import redirect_stderr, redirect_stdout
 from datetime import datetime
 from pathlib import Path
+from typing import Iterable
+
+_MANIFEST_FILENAME = "_analysis_manifest.json"
+
+
+def _manifest_path(output_dir: Path) -> Path:
+    return output_dir / _MANIFEST_FILENAME
+
+
+def _load_manifest_index(output_dir: Path) -> dict[str, set[str]] | None:
+    manifest = _manifest_path(output_dir)
+    if not manifest.exists():
+        return None
+    try:
+        dir_mtime = output_dir.stat().st_mtime
+        manifest_mtime = manifest.stat().st_mtime
+        if dir_mtime - manifest_mtime > 1e-6:
+            return None
+        with manifest.open("r", encoding="utf-8") as fh:
+            payload = json.load(fh)
+    except (OSError, json.JSONDecodeError, TypeError, ValueError):
+        return None
+
+    entries = payload.get("entries")
+    if not isinstance(entries, dict):
+        return None
+
+    index: dict[str, set[str]] = {}
+    for stem, particles in entries.items():
+        if not isinstance(particles, list):
+            continue
+        normalized = {str(p) for p in particles if p}
+        if normalized:
+            index[str(stem)] = normalized
+    return index
+
+
+def _persist_manifest_index(output_dir: Path, index: dict[str, set[str]]) -> None:
+    manifest = _manifest_path(output_dir)
+    payload = {
+        "generated_at": datetime.utcnow().isoformat(),
+        "entries": {stem: sorted(particles) for stem, particles in sorted(index.items())},
+    }
+    try:
+        manifest.parent.mkdir(parents=True, exist_ok=True)
+        with manifest.open("w", encoding="utf-8") as fh:
+            json.dump(payload, fh, ensure_ascii=False, indent=2)
+    except OSError:
+        pass
+
+
+def _register_manifest_entries(
+    index: dict[str, set[str]],
+    output_dir: Path,
+    nc_stem: str,
+    particles: Iterable[str],
+) -> None:
+    incoming = {str(p) for p in particles if p}
+    if not incoming:
+        return
+
+    current = index.get(nc_stem)
+    if current is None:
+        index[nc_stem] = incoming
+        _persist_manifest_index(output_dir, index)
+        return
+
+    before = len(current)
+    current.update(incoming)
+    if len(current) != before:
+        _persist_manifest_index(output_dir, index)
 
 from .extractor import TCEnvironmentalSystemsExtractor
 from .workflow_utils import (
@@ -17,7 +89,11 @@ from .workflow_utils import (
 
 
 def _index_existing_json(output_dir: Path) -> dict[str, set[str]]:
-    """Scan the output directory once and map NC stems to non-empty JSON results."""
+    """Load cached index of existing JSON outputs, falling back to a directory scan."""
+
+    manifest_index = _load_manifest_index(output_dir)
+    if manifest_index is not None:
+        return manifest_index
 
     index: dict[str, set[str]] = defaultdict(set)
     pattern = "*_TC_Analysis_*.json"
@@ -33,32 +109,10 @@ def _index_existing_json(output_dir: Path) -> dict[str, set[str]]:
         nc_stem, particle = stem.split("_TC_Analysis_", 1)
         if particle:
             index[nc_stem].add(particle)
-    return {k: set(v) for k, v in index.items()}
 
-
-def _refresh_existing_entry(
-    index: dict[str, set[str]], output_dir: Path, nc_stem: str
-) -> None:
-    """Refresh cached metadata for one NC stem after new JSON files land."""
-
-    particles: set[str] = set()
-    for json_path in output_dir.glob(f"{nc_stem}_TC_Analysis_*.json"):
-        try:
-            if json_path.stat().st_size <= 10:
-                continue
-        except OSError:
-            continue
-        stem = json_path.stem
-        if stem.startswith(f"{nc_stem}_TC_Analysis_"):
-            particle = stem.replace(f"{nc_stem}_TC_Analysis_", "", 1)
-            if particle:
-                particles.add(particle)
-    if particles:
-        index[nc_stem] = particles
-    else:
-        index.pop(nc_stem, None)
-
-
+    dense_index = {k: set(v) for k, v in index.items() if v}
+    _persist_manifest_index(output_dir, dense_index)
+    return dense_index
 def _run_environment_analysis(
     nc_path: str,
     track_csv: str,
@@ -66,23 +120,26 @@ def _run_environment_analysis(
     keep_nc: bool,
     log_file: str | None = None,
     concise: bool = False,
-) -> tuple[bool, str | None]:
+) -> tuple[bool, str | None, set[str]]:
     """Worker helper executed in a child process for 环境分析."""
 
     success = False
     error_message: str | None = None
+    completed_particles: set[str] = set()
     nc_name = Path(nc_path).name
 
     def _execute() -> None:
-        nonlocal success, error_message
+        nonlocal success, error_message, completed_particles
 
         if not concise:
             print(f"[{datetime.utcnow().isoformat()}] ▶️ 环境分析开始: {nc_name}")
         try:
-            extractor = TCEnvironmentalSystemsExtractor(nc_path, track_csv)
-            extractor.analyze_and_export_as_json(output_dir)
-            success = True
-            print(f"[{datetime.utcnow().isoformat()}] ✅ 环境分析完成: {nc_name}")
+            with TCEnvironmentalSystemsExtractor(nc_path, track_csv) as extractor:
+                result = extractor.analyze_and_export_as_json(output_dir)
+                success = True
+                if isinstance(result, dict):
+                    completed_particles = {str(key) for key in result.keys()}
+                print(f"[{datetime.utcnow().isoformat()}] ✅ 环境分析完成: {nc_name}")
         except Exception as exc:  # pragma: no cover - worker side error path
             error_message = str(exc)
             print(f"[{datetime.utcnow().isoformat()}] ❌ 环境分析失败: {nc_name} -> {error_message}")
@@ -112,7 +169,7 @@ def _run_environment_analysis(
     else:
         _execute()
 
-    return success, error_message
+    return success, error_message, completed_particles
 
 
 # ================= 新增: 流式顺序处理函数 =================
@@ -224,16 +281,17 @@ def streaming_from_csv(
             meta = active_futures.pop(fut, {})
             label = meta.get("label", "未知文件")
             try:
-                success, error_msg = fut.result()
+                success, error_msg, produced = fut.result()
             except Exception as exc:  # pragma: no cover - defensive guard
                 success = False
                 error_msg = str(exc)
+                produced = set()
             if success:
                 processed += 1
                 summary(f"✅ 环境分析完成: {label}")
                 stem = meta.get("stem")
                 if stem:
-                    _refresh_existing_entry(existing_index, final_dir, stem)
+                    _register_manifest_entries(existing_index, final_dir, stem, produced)
             else:
                 log_hint = meta.get("log")
                 extra = f" -> {error_msg}" if error_msg else ""
@@ -269,7 +327,6 @@ def streaming_from_csv(
 
             detail(f"\n[{idx+1}/{len(df)}] ▶️ 处理: {fname}")
 
-            _refresh_existing_entry(existing_index, final_dir, nc_stem)
             existing_particles = existing_index.get(nc_stem, set())
             if existing_particles:
                 detail(f"⏭️  已存在最终JSON({len(existing_particles)}) -> 跳过")
@@ -410,7 +467,7 @@ def streaming_from_csv(
             active_futures[future] = meta
         else:
             try:
-                success, error_msg = _run_environment_analysis(
+                success, error_msg, produced = _run_environment_analysis(
                     str(nc_local),
                     str(track_csv),
                     "final_single_output",
@@ -420,7 +477,7 @@ def streaming_from_csv(
                 )
                 if success:
                     processed += 1
-                    _refresh_existing_entry(existing_index, final_dir, nc_stem)
+                    _register_manifest_entries(existing_index, final_dir, nc_stem, produced)
                 elif error_msg:
                     summary(f"❌ 环境分析失败: {error_msg}")
             except Exception as e:
@@ -521,16 +578,19 @@ def process_nc_files(
             meta = active_futures.pop(fut, {})
             label = meta.get("label", "未知文件")
             try:
-                success, error_msg = fut.result()
+                success, error_msg, produced = fut.result()
             except Exception as exc:  # pragma: no cover - defensive
                 success = False
                 error_msg = str(exc)
+                produced = set()
             if success:
                 processed += 1
                 summary(f"✅ 环境分析完成: {label}")
                 stem = meta.get("stem")
                 if stem:
-                    _refresh_existing_entry(existing_index, final_output_dir, stem)
+                    _register_manifest_entries(
+                        existing_index, final_output_dir, stem, produced
+                    )
             else:
                 log_hint = meta.get("log")
                 extra = f" -> {error_msg}" if error_msg else ""
@@ -558,7 +618,6 @@ def process_nc_files(
 
         nc_stem = nc_file.stem
         detail(f"\n[{idx}/{len(target_nc_files)}] ▶️ 处理 NC: {nc_file.name}")
-        _refresh_existing_entry(existing_index, final_output_dir, nc_stem)
         existing_particles = existing_index.get(nc_stem, set())
         if existing_particles:
             detail(f"⏭️  已存在分析结果 ({len(existing_particles)}) -> 跳过 {nc_stem}")
@@ -670,7 +729,7 @@ def process_nc_files(
             active_futures[future] = meta
         else:
             try:
-                success, error_msg = _run_environment_analysis(
+                success, error_msg, produced = _run_environment_analysis(
                     str(nc_file),
                     str(track_file),
                     "final_single_output",
@@ -680,7 +739,9 @@ def process_nc_files(
                 )
                 if success:
                     processed += 1
-                    _refresh_existing_entry(existing_index, final_output_dir, nc_stem)
+                    _register_manifest_entries(
+                        existing_index, final_output_dir, nc_stem, produced
+                    )
                 elif error_msg:
                     summary(f"❌ 分析失败 {nc_file.name}: {error_msg}")
             except Exception as e:
