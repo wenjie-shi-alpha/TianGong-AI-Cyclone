@@ -8,7 +8,7 @@ CDS服务器环境气象系统提取器
 import xarray as xr
 import numpy as np
 import pandas as pd
-from datetime import datetime, timedelta
+from datetime import datetime
 import json
 import cdsapi
 import os
@@ -17,6 +17,7 @@ from pathlib import Path
 import warnings
 import concurrent.futures
 import gc
+import math
 
 warnings.filterwarnings('ignore')
 
@@ -226,215 +227,578 @@ class CDSEnvironmentExtractor:
                 self.ds = xr.merge([ds_single, ds_pressure])
             else:
                 self.ds = ds_single
-            
+
             print(f"📊 ERA5数据加载完成: {dict(self.ds.dims)}")
             if 'latitude' in self.ds and 'longitude' in self.ds:
                 print(f"🌍 坐标范围: lat {self.ds.latitude.min().values:.1f}°-{self.ds.latitude.max().values:.1f}°, "
                       f"lon {self.ds.longitude.min().values:.1f}°-{self.ds.longitude.max().values:.1f}°")
+            self._initialize_coordinate_metadata()
             return True
         except Exception as e:
             print(f"❌ 加载ERA5数据失败: {e}")
             return False
 
-    def extract_environmental_systems(self, time_point, tc_lat, tc_lon):
-        """提取指定时间点的环境系统"""
-        systems = {}
-        try:
-            # *** FIX: 使用 'valid_time' 坐标 ***
-            era5_time = pd.to_datetime(self.ds.valid_time.sel(valid_time=time_point, method='nearest').values)
-            print(f"🔍 处理时间点: {time_point} (使用ERA5时间: {era5_time})")
-            
-            # *** FIX: 使用 'valid_time' 坐标进行切片 ***
-            ds_at_time = self.ds.sel(valid_time=time_point, method='nearest')
+    def _initialize_coordinate_metadata(self):
+        """初始化经纬度、时间等元数据，便于后续与高级提取逻辑保持一致"""
+        # 纬度坐标
+        lat_coord = next((name for name in ("latitude", "lat") if name in self.ds.coords), None)
+        lon_coord = next((name for name in ("longitude", "lon") if name in self.ds.coords), None)
+        if lat_coord is None or lon_coord is None:
+            raise ValueError("数据集中缺少纬度或经度坐标")
 
-            systems['subtropical_high'] = self.extract_subtropical_high(ds_at_time, tc_lat, tc_lon)
-            systems['ocean_heat'] = self.extract_ocean_heat(ds_at_time, tc_lat, tc_lon)
-            systems['low_level_flow'] = self.extract_low_level_flow(ds_at_time, tc_lat, tc_lon)
-            systems['atmospheric_stability'] = self.extract_atmospheric_stability(ds_at_time, tc_lat, tc_lon)
-            systems['vertical_shear'] = self.extract_vertical_shear(ds_at_time, tc_lat, tc_lon)
+        self._lat_name = lat_coord
+        self._lon_name = lon_coord
+        self.latitudes = np.asarray(self.ds[self._lat_name].values)
+        self.longitudes = np.asarray(self.ds[self._lon_name].values)
+
+        # 处理经度到 [0, 360) 区间的标准化形式，便于距离判断
+        self._lon_normalized = self._normalize_lon(self.longitudes)
+
+        # 维度间距（度），如只有单点则使用1避免除零
+        if self.latitudes.size > 1:
+            self.lat_spacing = float(np.abs(np.diff(self.latitudes).mean()))
+        else:
+            self.lat_spacing = 1.0
+
+        if self.longitudes.size > 1:
+            sorted_unique_lon = np.sort(np.unique(self.longitudes))
+            diffs = np.abs(np.diff(sorted_unique_lon))
+            self.lon_spacing = float(diffs[diffs > 0].mean()) if np.any(diffs > 0) else 1.0
+        else:
+            self.lon_spacing = 1.0
+
+        cos_lat = np.cos(np.deg2rad(self.latitudes))
+        self._coslat = cos_lat
+        self._coslat_safe = np.where(np.abs(cos_lat) < 1e-6, np.nan, cos_lat)
+
+        # 时间轴
+        time_dim = None
+        time_coord_name = None
+        if 'time' in self.ds.dims:
+            time_dim = 'time'
+        elif 'valid_time' in self.ds.dims:
+            time_dim = 'valid_time'
+
+        if time_dim is None:
+            for candidate in ("time", "valid_time"):
+                if candidate in self.ds.coords:
+                    dims = self.ds[candidate].dims
+                    if dims:
+                        time_dim = dims[0]
+                        time_coord_name = candidate
+                        break
+
+        if time_dim is None:
+            raise ValueError("数据集中缺少时间维度")
+
+        if time_coord_name is None:
+            time_coord_name = time_dim
+
+        self._time_dim = time_dim
+        self._time_coord_name = time_coord_name
+        time_coord = self.ds[time_coord_name]
+        time_values = pd.to_datetime(time_coord.values)
+        self._time_values = np.asarray(time_values)
+
+        # 保留辅助索引函数
+        def _loc_idx(lat_val: float, lon_val: float):
+            lat_idx = int(np.abs(self.latitudes - lat_val).argmin())
+            lon_idx = int(np.abs(self.longitudes - lon_val).argmin())
+            return lat_idx, lon_idx
+
+        self._loc_idx = _loc_idx
+
+    def extract_environmental_systems(self, time_point, tc_lat, tc_lon):
+        """提取指定时间点的环境系统，输出格式与environment_extractor保持一致"""
+        systems = []
+        try:
+            time_idx, era5_time = self._get_time_index(time_point)
+            print(f"🔍 处理时间点: {time_point} (ERA5时间: {era5_time})")
+
+            ds_at_time = self._dataset_at_index(time_idx)
+
+            system_extractors = [
+                lambda: self.extract_subtropical_high(time_idx, ds_at_time, tc_lat, tc_lon),
+                lambda: self.extract_vertical_shear(time_idx, tc_lat, tc_lon),
+                lambda: self.extract_ocean_heat(time_idx, tc_lat, tc_lon),
+                lambda: self.extract_low_level_flow(ds_at_time, tc_lat, tc_lon),
+                lambda: self.extract_atmospheric_stability(ds_at_time, tc_lat, tc_lon),
+            ]
+
+            for extractor in system_extractors:
+                system_obj = extractor()
+                if system_obj:
+                    systems.append(system_obj)
 
         except Exception as e:
             print(f"⚠️ 提取环境系统失败: {e}")
-            systems['error'] = str(e)
+            systems.append({"system_name": "ExtractionError", "description": str(e)})
         return systems
 
-    def extract_subtropical_high(self, ds_at_time, tc_lat, tc_lon):
-        """提取副热带高压系统"""
-        try:
-            if 'z' in ds_at_time.data_vars and 'level' in ds_at_time.dims and 500 in ds_at_time.level.values:
-                z500 = ds_at_time.sel(level=500)['z'] / 9.80665
-                field = z500
-                field_name = 'z500 (m)'
-                high_by_height = True
+    def _normalize_lon(self, lon_values):
+        arr = np.asarray(lon_values, dtype=np.float64)
+        return np.mod(arr + 360.0, 360.0)
+
+    def _lon_distance(self, lon_values, center_lon):
+        lon_norm = self._normalize_lon(lon_values)
+        center = float(self._normalize_lon(center_lon))
+        diff = np.abs(lon_norm - center)
+        return np.minimum(diff, 360.0 - diff)
+
+    def _get_time_index(self, target_time):
+        if not hasattr(self, "_time_values"):
+            raise ValueError("尚未初始化时间轴信息")
+        target_ts = pd.Timestamp(target_time)
+        target_np = np.datetime64(target_ts.to_datetime64())
+        diffs = np.abs(self._time_values - target_np).astype('timedelta64[s]').astype(np.int64)
+        idx = int(diffs.argmin())
+        era5_time = pd.Timestamp(self._time_values[idx]).to_pydatetime()
+        return idx, era5_time
+
+    def _dataset_at_index(self, time_idx):
+        selector = {self._time_dim: time_idx} if self._time_dim in self.ds.dims else {}
+        ds_at_time = self.ds.isel(**selector)
+        if 'expver' in ds_at_time.dims:
+            ds_at_time = ds_at_time.isel(expver=0)
+        return ds_at_time.squeeze()
+
+    def _get_field_at_time(self, var_name, time_idx):
+        if var_name not in self.ds.data_vars:
+            return None
+        data = self.ds[var_name]
+        indexers = {}
+        if self._time_dim in data.dims:
+            indexers[self._time_dim] = time_idx
+        field = data.isel(**indexers)
+        if 'expver' in field.dims:
+            field = field.isel(expver=0)
+        return field.squeeze()
+
+    def _get_data_at_level(self, var_name, level_hpa, time_idx):
+        if var_name not in self.ds.data_vars:
+            return None
+        data = self.ds[var_name]
+        indexers = {}
+        if self._time_dim in data.dims:
+            indexers[self._time_dim] = time_idx
+        level_dim = next((dim for dim in ("level", "isobaricInhPa", "pressure") if dim in data.dims), None)
+        if level_dim is None:
+            field = data.isel(**indexers)
+        else:
+            if level_dim in data.coords:
+                level_values = data[level_dim].values
+            elif level_dim in self.ds.coords:
+                level_values = self.ds[level_dim].values
             else:
-                field = ds_at_time.msl / 100
-                field_name = 'MSLP (hPa)'
-                high_by_height = False
+                level_values = np.arange(data.sizes[level_dim])
+            level_idx = int(np.abs(level_values - level_hpa).argmin())
+            indexers[level_dim] = level_idx
+            field = data.isel(**indexers)
+        if 'expver' in field.dims:
+            field = field.isel(expver=0)
+        result = field.squeeze()
+        return result.values if hasattr(result, 'values') else np.asarray(result)
 
-            # 在台风周围搜索高压系统
-            # 搜索范围扩大到整个数据域，以确保捕捉到远距离的高压
-            if high_by_height: # 位势高度找最大值
-                max_val_idx = np.unravel_index(np.argmax(field.values), field.shape)
-            else: # 海平面气压找最大值
-                max_val_idx = np.unravel_index(np.argmax(field.values), field.shape)
-            
-            max_val = field.values[max_val_idx]
-            high_lat = field.latitude.values[max_val_idx[0]]
-            high_lon = field.longitude.values[max_val_idx[1]]
+    def _get_sst_field(self, time_idx):
+        for var_name in ("sst", "ts"):
+            field = self._get_field_at_time(var_name, time_idx)
+            if field is not None:
+                values = field.values if hasattr(field, 'values') else np.asarray(field)
+                if np.nanmean(values) > 200:
+                    values = values - 273.15
+                return values
+        for var_name in ("t2m", "t2"):
+            field = self._get_field_at_time(var_name, time_idx)
+            if field is not None:
+                values = field.values if hasattr(field, 'values') else np.asarray(field)
+                if np.nanmean(values) > 200:
+                    values = values - 273.15
+                return values
+        return None
 
-            bearing, distance = self._calculate_bearing_distance(tc_lat, tc_lon, high_lat, high_lon)
+    def _create_region_mask(self, center_lat, center_lon, radius_deg):
+        lat_mask = (self.latitudes >= center_lat - radius_deg) & (self.latitudes <= center_lat + radius_deg)
+        lon_mask = self._lon_distance(self.longitudes, center_lon) <= radius_deg
+        return np.outer(lat_mask, lon_mask)
 
-            if (not high_by_height) and max_val >= 1025: intensity_level = "强"
-            elif (not high_by_height) and max_val >= 1020: intensity_level = "中等"
-            else: intensity_level = "弱"
+    def _haversine_distance(self, lat1, lon1, lat2, lon2):
+        lat1_rad = np.radians(lat1)
+        lon1_rad = np.radians(lon1)
+        lat2_rad = np.radians(lat2)
+        lon2_rad = np.radians(lon2)
+        dlat = lat2_rad - lat1_rad
+        dlon = lon2_rad - lon1_rad
+        a = np.sin(dlat / 2.0) ** 2 + np.cos(lat1_rad) * np.cos(lat2_rad) * np.sin(dlon / 2.0) ** 2
+        c = 2.0 * np.arcsin(np.sqrt(a))
+        return 6371.0 * c
+
+    def _calculate_distance(self, lat1, lon1, lat2, lon2):
+        return float(self._haversine_distance(lat1, lon1, lat2, lon2))
+
+    def _calculate_bearing(self, lat1, lon1, lat2, lon2):
+        lat1_rad = math.radians(lat1)
+        lat2_rad = math.radians(lat2)
+        dlon = math.radians(lon2 - lon1)
+        y = math.sin(dlon) * math.cos(lat2_rad)
+        x = math.cos(lat1_rad) * math.sin(lat2_rad) - math.sin(lat1_rad) * math.cos(lat2_rad) * math.cos(dlon)
+        bearing = (math.degrees(math.atan2(y, x)) + 360.0) % 360.0
+        return bearing
+
+    def _bearing_to_desc(self, bearing):
+        dirs = [
+            "北",
+            "东北偏北",
+            "东北",
+            "东北偏东",
+            "东",
+            "东南偏东",
+            "东南",
+            "东南偏南",
+            "南",
+            "西南偏南",
+            "西南",
+            "西南偏西",
+            "西",
+            "西北偏西",
+            "西北",
+            "西北偏北",
+        ]
+        wind_dirs = [
+            "偏北风",
+            "东北偏北风",
+            "东北风",
+            "东北偏东风",
+            "偏东风",
+            "东南偏东风",
+            "东南风",
+            "东南偏南风",
+            "偏南风",
+            "西南偏南风",
+            "西南风",
+            "西南偏西风",
+            "偏西风",
+            "西北偏西风",
+            "西北风",
+            "西北偏北风",
+        ]
+        index = int(round(bearing / 22.5)) % 16
+        return wind_dirs[index], f"{dirs[index]}方向"
+
+    def _get_vector_coords(self, lat, lon, u, v, scale=0.1):
+        factor = scale * 0.009
+        end_lat = lat + v * factor
+        cos_lat = math.cos(math.radians(lat))
+        if abs(cos_lat) < 1e-6:
+            cos_lat = 1e-6
+        end_lon = lon + u * factor / cos_lat
+        return {
+            "start": {"lat": round(lat, 2), "lon": round(lon, 2)},
+            "end": {"lat": round(end_lat, 2), "lon": round(end_lon, 2)},
+        }
+
+    def extract_subtropical_high(self, time_idx, ds_at_time, tc_lat, tc_lon):
+        """提取副热带高压系统，与environment_extractor输出语义保持一致"""
+        try:
+            z500 = self._get_data_at_level("z", 500, time_idx)
+            field_source = "z500"
+            if z500 is not None:
+                field_values = np.asarray(z500, dtype=float)
+                if np.nanmean(field_values) > 10000:
+                    field_values = field_values / 9.80665  # 转换为gpm
+                threshold = 5880
+                unit = "gpm"
+            else:
+                field_source = "msl"
+                msl = self._get_field_at_time("msl", time_idx)
+                if msl is None:
+                    return None
+                field_values = (msl.values if hasattr(msl, "values") else np.asarray(msl)) / 100.0
+                threshold = 1020
+                unit = "hPa"
+
+            if not np.any(np.isfinite(field_values)):
+                return None
+
+            mask = np.isfinite(field_values)
+            if field_source == "z500":
+                mask &= field_values >= threshold
+            else:
+                mask &= field_values >= threshold
+
+            if np.any(mask):
+                candidate_idx = np.argwhere(mask)
+                candidate_lats = self.latitudes[candidate_idx[:, 0]]
+                candidate_lons = self.longitudes[candidate_idx[:, 1]]
+                distances = self._haversine_distance(candidate_lats, candidate_lons, tc_lat, tc_lon)
+                if np.all(np.isnan(distances)):
+                    target_idx = np.unravel_index(np.nanargmax(field_values), field_values.shape)
+                else:
+                    best = int(np.nanargmin(distances))
+                    target_idx = tuple(candidate_idx[best])
+            else:
+                target_idx = np.unravel_index(np.nanargmax(field_values), field_values.shape)
+
+            high_lat = float(self.latitudes[target_idx[0]])
+            high_lon = float(self.longitudes[target_idx[1]])
+            intensity_val = float(field_values[target_idx])
+
+            if field_source == "z500":
+                if intensity_val > 5900:
+                    level = "强"
+                elif intensity_val > 5880:
+                    level = "中等"
+                else:
+                    level = "弱"
+            else:
+                if intensity_val >= 1025:
+                    level = "强"
+                elif intensity_val >= 1020:
+                    level = "中等"
+                else:
+                    level = "弱"
+
+            bearing = self._calculate_bearing(tc_lat, tc_lon, high_lat, high_lon)
+            _, rel_dir_text = self._bearing_to_desc(bearing)
+            distance = self._calculate_distance(tc_lat, tc_lon, high_lat, high_lon)
+
+            # 引导气流估算
+            gy, gx = np.gradient(field_values)
+            denom_lat = self.lat_spacing * 111000.0 if self.lat_spacing else 1.0
+            denom_lon = self.lon_spacing * 111000.0 if self.lon_spacing else 1.0
+            lat_idx, lon_idx = self._loc_idx(tc_lat, tc_lon)
+            coslat_val = self._coslat_safe[lat_idx] if np.isfinite(self._coslat_safe[lat_idx]) else math.cos(math.radians(tc_lat))
+            dx_val = gx[lat_idx, lon_idx] / (denom_lon * coslat_val if coslat_val else denom_lon)
+            dy_val = gy[lat_idx, lon_idx] / denom_lat
+            u_steering = -dx_val / (9.8 * 1e-5)
+            v_steering = dy_val / (9.8 * 1e-5)
+            steering_speed = float(np.sqrt(u_steering**2 + v_steering**2))
+            steering_direction = (np.degrees(np.arctan2(u_steering, v_steering)) + 180.0) % 360.0
+            wind_desc, steering_dir_text = self._bearing_to_desc(steering_direction)
+
+            description = (
+                f"一个强度为“{level}”的副热带高压系统位于台风的{rel_dir_text}，"
+                f"核心强度约为{intensity_val:.0f}{unit}，为台风提供来自{wind_desc}、方向"
+                f"约{steering_direction:.0f}°、速度{steering_speed:.1f}m/s的引导气流。"
+            )
+
+            shape_info = {
+                "description": "基于阈值识别的高压控制区",
+                "field": field_source,
+                "threshold": threshold,
+            }
 
             return {
-                "system_type": "SubtropicalHigh", "position": {"lat": float(high_lat), "lon": float(high_lon)},
-                "intensity": {"value": float(max_val), "unit": "m" if high_by_height else "hPa", "level": intensity_level, "field": field_name},
-                "relative_to_tc": {"bearing_deg": float(bearing), "distance_km": float(distance), "direction": self._bearing_to_direction(bearing)},
-                "description": f"{intensity_level}副热带高压系统位于台风{self._bearing_to_direction(bearing)}方向{int(distance)}km处",
-                "influence": self._assess_high_influence(distance, max_val if not high_by_height else 1020, bearing)
+                "system_name": "SubtropicalHigh",
+                "description": description,
+                "position": {
+                    "description": "副热带高压中心",
+                    "center_of_mass": {"lat": round(high_lat, 2), "lon": round(high_lon, 2)},
+                    "relative_to_tc": {
+                        "direction": rel_dir_text,
+                        "bearing_deg": round(bearing, 1),
+                        "distance_km": round(distance, 1),
+                    },
+                },
+                "intensity": {"value": round(intensity_val, 1), "unit": unit, "level": level},
+                "shape": shape_info,
+                "properties": {
+                    "influence": "主导台风未来路径",
+                    "steering_flow": {
+                        "speed_mps": round(steering_speed, 2),
+                        "direction_deg": round(steering_direction, 1),
+                        "vector_mps": {"u": round(float(u_steering), 2), "v": round(float(v_steering), 2)},
+                        "wind_desc": wind_desc,
+                    },
+                },
             }
         except Exception as e:
             print(f"⚠️ 提取副热带高压失败: {e}")
-            return {"error": str(e)}
+            return None
 
-    def extract_ocean_heat(self, ds_at_time, tc_lat, tc_lon):
-        """提取海洋热含量"""
+    def extract_ocean_heat(self, time_idx, tc_lat, tc_lon, radius_deg=2.0):
+        """提取海洋热含量，与environment_extractor的热力判断保持一致"""
         try:
-            if 'sst' in ds_at_time.data_vars:
-                temp_field = ds_at_time.sst
-            elif 't2m' in ds_at_time.data_vars:
-                temp_field = ds_at_time.t2m
-            else:
-                return {"error": "无温度数据"}
-            
-            if np.nanmean(temp_field.values) > 200:
-                temp_field = temp_field - 273.15
+            sst_values = self._get_sst_field(time_idx)
+            if sst_values is None:
+                return None
 
-            # 在台风位置插值获取温度
-            point_temp = temp_field.interp(latitude=tc_lat, longitude=tc_lon, method="linear").values
-            
-            if point_temp >= 29: heat_level, energy_support = "极高", "超级有利"
-            elif point_temp >= 28: heat_level, energy_support = "高", "非常有利"
-            elif point_temp >= 26.5: heat_level, energy_support = "中等", "基本有利"
-            else: heat_level, energy_support = "低", "能量不足"
+            region_mask = self._create_region_mask(tc_lat, tc_lon, radius_deg)
+            if not np.any(region_mask):
+                return None
+
+            warm_region = np.where(region_mask, sst_values, np.nan)
+            mean_temp = float(np.nanmean(warm_region))
+            if not np.isfinite(mean_temp):
+                return None
+
+            if mean_temp > 29:
+                level, impact = "极高", "为爆发性增强提供顶级能量"
+            elif mean_temp > 28:
+                level, impact = "高", "非常有利于加强"
+            elif mean_temp > 26.5:
+                level, impact = "中等", "足以维持强度"
+            else:
+                level, impact = "低", "能量供应不足"
+
+            desc = (
+                f"台风下方半径约{radius_deg}°的海域平均海表温度为{mean_temp:.1f}°C，"
+                f"海洋热含量等级为“{level}”，{impact}。"
+            )
+
+            cell_lat_km = self.lat_spacing * 111.0 if self.lat_spacing else 0.0
+            cell_lon_km = (self.lon_spacing * 111.0 * math.cos(math.radians(tc_lat))) if self.lon_spacing else 0.0
+            approx_area = float(region_mask.astype(float).sum() * abs(cell_lat_km) * abs(cell_lon_km))
+
+            shape_info = {
+                "description": "台风附近暖水覆盖区",
+                "radius_deg": radius_deg,
+            }
+            if approx_area > 0:
+                shape_info["approx_area_km2"] = round(approx_area, 0)
 
             return {
-                "system_type": "OceanHeatContent", "position": {"lat": tc_lat, "lon": tc_lon},
-                "intensity": {"value": float(point_temp), "unit": "°C", "level": heat_level},
-                "properties": {"energy_support": energy_support, "suitable_for_development": bool(point_temp >= 26.5)},
-                "description": f"海域温度{point_temp:.1f}°C，热含量等级{heat_level}，{energy_support}台风发展"
+                "system_name": "OceanHeatContent",
+                "description": desc,
+                "position": {
+                    "description": f"台风中心周围{radius_deg}°半径内的海域",
+                    "lat": round(tc_lat, 2),
+                    "lon": round(tc_lon, 2),
+                },
+                "intensity": {"value": round(mean_temp, 2), "unit": "°C", "level": level},
+                "shape": shape_info,
+                "properties": {"impact": impact, "warm_water_support": mean_temp > 26.5},
             }
         except Exception as e:
             print(f"⚠️ 提取海洋热含量失败: {e}")
-            return {"error": str(e)}
+            return None
 
     def extract_low_level_flow(self, ds_at_time, tc_lat, tc_lon):
-        """提取低层风场"""
+        """提取低层(10m)风场，保持与主流程相同的结构"""
         try:
-            u10 = ds_at_time.u10.interp(latitude=tc_lat, longitude=tc_lon, method="linear").values
-            v10 = ds_at_time.v10.interp(latitude=tc_lat, longitude=tc_lon, method="linear").values
+            if "u10" not in ds_at_time.data_vars or "v10" not in ds_at_time.data_vars:
+                return None
 
-            mean_speed = np.sqrt(u10**2 + v10**2)
-            mean_direction = (np.degrees(np.arctan2(u10, v10)) + 360) % 360
-            
-            if mean_speed >= 15: wind_level = "强"
-            elif mean_speed >= 10: wind_level = "中等"
-            else: wind_level = "弱"
+            u10 = float(ds_at_time.u10.interp(latitude=tc_lat, longitude=tc_lon, method="linear").values)
+            v10 = float(ds_at_time.v10.interp(latitude=tc_lat, longitude=tc_lon, method="linear").values)
+
+            mean_speed = float(np.sqrt(u10**2 + v10**2))
+            mean_direction = (np.degrees(np.arctan2(u10, v10)) + 360.0) % 360.0
+
+            if mean_speed >= 15:
+                wind_level = "强"
+            elif mean_speed >= 10:
+                wind_level = "中等"
+            else:
+                wind_level = "弱"
+
+            wind_desc, dir_text = self._bearing_to_desc(mean_direction)
+            desc = (
+                f"近地层存在{wind_level}低层风场，风速约{mean_speed:.1f}m/s，"
+                f"主导风向为{wind_desc} (约{mean_direction:.0f}°)。"
+            )
 
             return {
-                "system_type": "LowLevelFlow", "position": {"lat": tc_lat, "lon": tc_lon},
-                "intensity": {"speed": float(mean_speed), "direction": float(mean_direction), "unit": "m/s", "level": wind_level, "vector": {"u": float(u10), "v": float(v10)}},
-                "description": f"{wind_level}低层风场，风速{mean_speed:.1f}m/s，风向{mean_direction:.0f}°"
+                "system_name": "LowLevelFlow",
+                "description": desc,
+                "position": {"lat": round(tc_lat, 2), "lon": round(tc_lon, 2)},
+                "intensity": {
+                    "speed": round(mean_speed, 2),
+                    "direction_deg": round(mean_direction, 1),
+                    "unit": "m/s",
+                    "level": wind_level,
+                    "vector": {"u": round(u10, 2), "v": round(v10, 2)},
+                },
+                "properties": {"direction_text": dir_text},
             }
         except Exception as e:
             print(f"⚠️ 提取低层风场失败: {e}")
-            return {"error": str(e)}
+            return None
 
     def extract_atmospheric_stability(self, ds_at_time, tc_lat, tc_lon):
-        """提取大气稳定性"""
+        """提取大气稳定性，提供与其他系统一致的数据结构"""
         try:
-            if 't2m' in ds_at_time.data_vars:
-                t2m = ds_at_time.t2m
-                if np.nanmean(t2m.values) > 200:
-                    t2m = t2m - 273.15
-                
-                point_t2m = t2m.interp(latitude=tc_lat, longitude=tc_lon, method="linear").values
-                stability = "中等" # 简化评估
+            if "t2m" not in ds_at_time.data_vars:
+                return None
 
-                return {
-                    "system_type": "AtmosphericStability", "position": {"lat": tc_lat, "lon": tc_lon},
-                    "intensity": {"surface_temp": float(point_t2m), "unit": "°C"},
-                    "properties": {"stability_level": stability},
-                    "description": f"近地表温度{point_t2m:.1f}°C，大气稳定性{stability}"
-                }
+            t2m = ds_at_time.t2m
+            if np.nanmean(t2m.values) > 200:
+                t2m = t2m - 273.15
+            point_t2m = float(t2m.interp(latitude=tc_lat, longitude=tc_lon, method="linear").values)
+            if point_t2m > 28:
+                stability = "不稳定"
+            elif point_t2m > 24:
+                stability = "中等"
             else:
-                return {"error": "无近地表温度数据"}
+                stability = "较稳定"
+
+            desc = f"近地表温度约{point_t2m:.1f}°C，低层大气{stability}。"
+
+            return {
+                "system_name": "AtmosphericStability",
+                "description": desc,
+                "position": {"lat": round(tc_lat, 2), "lon": round(tc_lon, 2)},
+                "intensity": {"surface_temp": round(point_t2m, 2), "unit": "°C"},
+                "properties": {"stability_level": stability},
+            }
         except Exception as e:
             print(f"⚠️ 提取大气稳定性失败: {e}")
-            return {"error": str(e)}
+            return None
 
-    def extract_vertical_shear(self, ds_at_time, tc_lat, tc_lon):
-        """提取垂直风切变"""
+    def extract_vertical_shear(self, time_idx, tc_lat, tc_lon):
+        """提取垂直风切变，复用与environment_extractor一致的阈值和描述"""
         try:
-            if 'u' in ds_at_time.data_vars and 'level' in ds_at_time.dims and 200 in ds_at_time.level.values and 850 in ds_at_time.level.values:
-                u200 = ds_at_time.sel(level=200).u.interp(latitude=tc_lat, longitude=tc_lon, method="linear").values
-                v200 = ds_at_time.sel(level=200).v.interp(latitude=tc_lat, longitude=tc_lon, method="linear").values
-                u850 = ds_at_time.sel(level=850).u.interp(latitude=tc_lat, longitude=tc_lon, method="linear").values
-                v850 = ds_at_time.sel(level=850).v.interp(latitude=tc_lat, longitude=tc_lon, method="linear").values
+            u200 = self._get_data_at_level("u", 200, time_idx)
+            v200 = self._get_data_at_level("v", 200, time_idx)
+            u850 = self._get_data_at_level("u", 850, time_idx)
+            v850 = self._get_data_at_level("v", 850, time_idx)
+            if any(x is None for x in (u200, v200, u850, v850)):
+                return None
 
-                du, dv = u200 - u850, v200 - v850
-                shear = float(np.sqrt(du**2 + dv**2))
-                shear_dir = float((np.degrees(np.arctan2(du, dv)) + 360) % 360)
+            lat_idx, lon_idx = self._loc_idx(tc_lat, tc_lon)
+            shear_u = float(u200[lat_idx, lon_idx] - u850[lat_idx, lon_idx])
+            shear_v = float(v200[lat_idx, lon_idx] - v850[lat_idx, lon_idx])
+            shear_mag = float(np.sqrt(shear_u**2 + shear_v**2))
 
-                if shear >= 20: level = "强"
-                elif shear >= 12.5: level = "中等"
-                else: level = "弱"
-
-                return {
-                    "system_type": "VerticalWindShear", "position": {"lat": tc_lat, "lon": tc_lon},
-                    "intensity": {"magnitude": shear, "direction": shear_dir, "unit": "m/s", "level": level},
-                    "description": f"垂直风切变 {shear:.1f} m/s ({level})，方向 {shear_dir:.0f}°"
-                }
+            if shear_mag < 5:
+                level, impact = "弱", "非常有利于发展"
+            elif shear_mag < 10:
+                level, impact = "中等", "基本有利发展"
             else:
-                return {"error": "未加载等压面风场，无法计算垂直风切变"}
+                level, impact = "强", "显著抑制发展"
+
+            direction_from = (np.degrees(np.arctan2(shear_u, shear_v)) + 180.0) % 360.0
+            wind_desc, dir_text = self._bearing_to_desc(direction_from)
+
+            desc = (
+                f"台风核心区正受到来自{wind_desc}方向、强度为“{level}”的垂直风切变影响，"
+                f"当前风切变环境对台风的发展{impact.split(' ')[-1]}。"
+            )
+
+            vector_coords = self._get_vector_coords(tc_lat, tc_lon, shear_u, shear_v)
+
+            return {
+                "system_name": "VerticalWindShear",
+                "description": desc,
+                "position": {
+                    "description": "在台风中心点计算的200-850hPa风矢量差",
+                    "lat": round(tc_lat, 2),
+                    "lon": round(tc_lon, 2),
+                },
+                "intensity": {"value": round(shear_mag, 2), "unit": "m/s", "level": level},
+                "shape": {"description": f"来自{wind_desc}的切变矢量", "vector_coordinates": vector_coords},
+                "properties": {
+                    "direction_from_deg": round(direction_from, 1),
+                    "impact": impact,
+                    "shear_vector_mps": {"u": round(shear_u, 2), "v": round(shear_v, 2)},
+                },
+            }
         except Exception as e:
             print(f"⚠️ 提取垂直风切变失败: {e}")
-            return {"error": str(e)}
+            return None
             
+    # 兼容旧接口的占位符，保留名称以避免潜在外部调用
     def _find_nearest_grid(self, lat, lon):
-        lat_idx = np.abs(self.ds.latitude.values - lat).argmin()
-        lon_idx = np.abs(self.ds.longitude.values - lon).argmin()
-        return lat_idx, lon_idx
-
-    def _calculate_bearing_distance(self, lat1, lon1, lat2, lon2):
-        R = 6371.0
-        lat1, lon1, lat2, lon2 = map(np.radians, [lat1, lon1, lat2, lon2])
-        dlat, dlon = lat2 - lat1, lon2 - lon1
-        a = np.sin(dlat/2)**2 + np.cos(lat1) * np.cos(lat2) * np.sin(dlon/2)**2
-        c = 2 * np.arcsin(np.sqrt(a))
-        distance = R * c
-        bearing = np.degrees(np.arctan2(np.sin(dlon) * np.cos(lat2), np.cos(lat1) * np.sin(lat2) - np.sin(lat1) * np.cos(lat2) * np.cos(dlon)))
-        return (bearing + 360) % 360, distance
-
-    def _bearing_to_direction(self, bearing):
-        directions = [ (22.5, "北"), (67.5, "东北"), (112.5, "东"), (157.5, "东南"), (202.5, "南"), (247.5, "西南"), (292.5, "西"), (337.5, "西北"), (360, "北")]
-        for limit, direction in directions:
-            if bearing < limit: return direction
-        return "北"
-
-    def _assess_high_influence(self, distance, pressure, bearing):
-        score = 0
-        if distance < 500: score += 3
-        elif distance < 1000: score += 2
-        elif distance < 1500: score += 1
-        if pressure >= 1025: score += 2
-        elif pressure >= 1020: score += 1
-        if 225 <= bearing <= 315: score += 1
-        if score >= 4: return "强影响"
-        elif score >= 2: return "中等影响"
-        else: return "弱影响"
+        return self._loc_idx(lat, lon)
 
     def process_all_tracks(self):
         """
