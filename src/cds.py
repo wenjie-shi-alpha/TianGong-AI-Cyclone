@@ -381,7 +381,16 @@ class CDSEnvironmentExtractor:
         indexers = {}
         if self._time_dim in data.dims:
             indexers[self._time_dim] = time_idx
-        level_dim = next((dim for dim in ("level", "isobaricInhPa", "pressure") if dim in data.dims), None)
+        # ERA5 pressure层在不同产品中的维度命名不尽相同，这里做一次统一识别
+        level_dim_candidates = (
+            "level",
+            "isobaricInhPa",
+            "pressure",
+            "pressure_level",
+            "plev",
+            "lev",
+        )
+        level_dim = next((dim for dim in level_dim_candidates if dim in data.dims), None)
         if level_dim is None:
             field = data.isel(**indexers)
         else:
@@ -391,7 +400,11 @@ class CDSEnvironmentExtractor:
                 level_values = self.ds[level_dim].values
             else:
                 level_values = np.arange(data.sizes[level_dim])
-            level_idx = int(np.abs(level_values - level_hpa).argmin())
+            try:
+                numeric_levels = np.asarray(level_values, dtype=float)
+            except (TypeError, ValueError):
+                numeric_levels = np.asarray([float(str(v)) for v in level_values])
+            level_idx = int(np.abs(numeric_levels - float(level_hpa)).argmin())
             indexers[level_dim] = level_idx
             field = data.isel(**indexers)
         if 'expver' in field.dims:
