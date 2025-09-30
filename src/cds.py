@@ -19,7 +19,380 @@ import concurrent.futures
 import gc
 import math
 
+_OPTIONAL_DEPS_ERROR = "错误：需要scipy和scikit-image库。请运行 'pip install scipy scikit-image' 进行安装。"
+
+try:  # noqa: SIM105 - dependency guard mirrors original environment_extractor behaviour
+    from scipy.ndimage import center_of_mass, find_objects, label
+    from skimage.measure import approximate_polygon, find_contours, regionprops
+    from skimage.morphology import convex_hull_image
+except ImportError as exc:  # pragma: no cover - import-time guard
+    raise ImportError(_OPTIONAL_DEPS_ERROR) from exc
+
 warnings.filterwarnings('ignore')
+
+
+def _running_in_notebook() -> bool:
+    """Return True when executed inside a Jupyter/IPython kernel."""
+    return 'ipykernel' in sys.modules
+
+
+class WeatherSystemShapeAnalyzer:
+    """本地实现的气象系统形状分析器。"""
+
+    def __init__(self, lat_grid, lon_grid):
+        self.lat = np.asarray(lat_grid)
+        self.lon = np.asarray(lon_grid)
+        self.lat_spacing = float(np.abs(np.diff(self.lat).mean())) if self.lat.size > 1 else 1.0
+        self.lon_spacing = float(np.abs(np.diff(self.lon).mean())) if self.lon.size > 1 else 1.0
+
+    def analyze_system_shape(
+        self, data_field, threshold, system_type="high", center_lat=None, center_lon=None
+    ):
+        """全面分析气象系统的形状特征."""
+        try:
+            mask = data_field >= threshold if system_type == "high" else data_field <= threshold
+            if not np.any(mask):
+                return None
+
+            labeled_mask, num_features = label(mask)
+            if num_features == 0:
+                return None
+
+            main_region = self._select_main_system(
+                labeled_mask, num_features, center_lat, center_lon
+            )
+            if main_region is None:
+                return None
+
+            basic_features = self._calculate_basic_features(
+                main_region, data_field, threshold, system_type
+            )
+            complexity_features = self._calculate_complexity_features(main_region)
+            orientation_features = self._calculate_orientation_features(main_region)
+            contour_features = self._extract_contour_features(data_field, threshold, system_type)
+            multiscale_features = self._calculate_multiscale_features(
+                data_field, threshold, system_type
+            )
+
+            return {
+                "basic_geometry": basic_features,
+                "shape_complexity": complexity_features,
+                "orientation": orientation_features,
+                "contour_analysis": contour_features,
+                "multiscale_features": multiscale_features,
+            }
+
+        except Exception as exc:  # pragma: no cover - defensive parity with legacy
+            print(f"形状分析失败: {exc}")
+            return None
+
+    def _select_main_system(self, labeled_mask, num_features, center_lat, center_lon):
+        if center_lat is None or center_lon is None:
+            flat_labels = labeled_mask.ravel()
+            counts = np.bincount(flat_labels)[1 : num_features + 1]
+            if counts.size == 0:
+                return None
+            main_label = int(np.argmax(counts) + 1)
+        else:
+            center_lat_idx = np.abs(self.lat - center_lat).argmin()
+            center_lon_idx = np.abs(self.lon - center_lon).argmin()
+
+            min_dist = float("inf")
+            main_label = 1
+
+            for i in range(1, num_features + 1):
+                region_mask = labeled_mask == i
+                com_y, com_x = center_of_mass(region_mask)
+                dist = np.sqrt((com_y - center_lat_idx) ** 2 + (com_x - center_lon_idx) ** 2)
+                if dist < min_dist:
+                    min_dist = dist
+                    main_label = i
+
+        return labeled_mask == main_label
+
+    def _calculate_basic_features(self, region_mask, data_field, threshold, system_type):
+        props_list = regionprops(region_mask.astype(int), intensity_image=data_field)
+        if not props_list:
+            return None
+        props = props_list[0]
+
+        area_pixels = props.area
+        lat_factor = self.lat_spacing * 111
+        lon_factor = self.lon_spacing * 111 * np.cos(np.deg2rad(np.mean(self.lat)))
+        area_km2 = area_pixels * lat_factor * lon_factor
+
+        perimeter_pixels = props.perimeter
+        perimeter_km = perimeter_pixels * np.sqrt(lat_factor**2 + lon_factor**2)
+
+        compactness = 4 * np.pi * area_km2 / (perimeter_km**2) if perimeter_km > 0 else 0
+        shape_index = perimeter_km / (2 * np.sqrt(np.pi * area_km2)) if area_km2 > 0 else 0
+
+        major_axis_length = props.major_axis_length * lat_factor
+        minor_axis_length = props.minor_axis_length * lat_factor
+        aspect_ratio = major_axis_length / minor_axis_length if minor_axis_length > 0 else 1
+        eccentricity = props.eccentricity
+
+        intensity_values = data_field[region_mask]
+        if system_type == "high":
+            max_intensity = np.max(intensity_values)
+            intensity_range = max_intensity - threshold
+        else:
+            min_intensity = np.min(intensity_values)
+            intensity_range = threshold - min_intensity
+
+        return {
+            "area_km2": round(area_km2, 1),
+            "perimeter_km": round(perimeter_km, 1),
+            "compactness": round(compactness, 3),
+            "shape_index": round(shape_index, 3),
+            "aspect_ratio": round(aspect_ratio, 2),
+            "eccentricity": round(eccentricity, 3),
+            "major_axis_km": round(major_axis_length, 1),
+            "minor_axis_km": round(minor_axis_length, 1),
+            "intensity_range": round(intensity_range, 1),
+            "description": self._describe_basic_shape(compactness, aspect_ratio, eccentricity),
+        }
+
+    def _calculate_complexity_features(self, region_mask):
+        convex_hull = convex_hull_image(region_mask)
+        convex_area = np.sum(convex_hull)
+        actual_area = np.sum(region_mask)
+
+        solidity = actual_area / convex_area if convex_area > 0 else 0
+
+        contours = find_contours(region_mask.astype(float), 0.5)
+        if contours:
+            main_contour = max(contours, key=len)
+            epsilon = 0.02 * len(main_contour)
+            approx_contour = approximate_polygon(main_contour, tolerance=epsilon)
+            boundary_complexity = (
+                len(main_contour) / len(approx_contour) if len(approx_contour) > 0 else 1
+            )
+        else:
+            boundary_complexity = 1
+
+        fractal_dimension = self._estimate_fractal_dimension(region_mask)
+
+        return {
+            "solidity": round(solidity, 3),
+            "boundary_complexity": round(boundary_complexity, 2),
+            "fractal_dimension": round(fractal_dimension, 3),
+            "description": self._describe_complexity(solidity, boundary_complexity),
+        }
+
+    def _calculate_orientation_features(self, region_mask):
+        props_list = regionprops(region_mask.astype(int))
+        if not props_list:
+            return {
+                "orientation_deg": 0.0,
+                "direction_type": "方向不明确",
+                "description": "区域形状不足以确定主轴方向",
+            }
+
+        props = props_list[0]
+        orientation_rad = props.orientation
+        orientation_deg = float(np.degrees(orientation_rad))
+
+        if orientation_deg < 0:
+            orientation_deg += 180
+
+        if 0 <= orientation_deg < 22.5 or 157.5 <= orientation_deg <= 180:
+            direction_desc = "南北向延伸"
+        elif 22.5 <= orientation_deg < 67.5:
+            direction_desc = "东北-西南向延伸"
+        elif 67.5 <= orientation_deg < 112.5:
+            direction_desc = "东西向延伸"
+        else:
+            direction_desc = "西北-东南向延伸"
+
+        return {
+            "orientation_deg": round(orientation_deg, 1),
+            "direction_type": direction_desc,
+            "description": f"系统主轴呈{direction_desc}，方向角为{orientation_deg:.1f}°",
+        }
+
+    def _extract_contour_features(self, data_field, threshold, system_type):
+        try:
+            contours = find_contours(data_field, threshold)
+            if not contours:
+                return None
+
+            main_contour = max(contours, key=len)
+
+            contour_lats = self.lat[main_contour[:, 0].astype(int)]
+            contour_lons = self.lon[main_contour[:, 1].astype(int)]
+
+            contour_length_km = 0
+            for i in range(1, len(contour_lats)):
+                dist = self._haversine_distance(
+                    contour_lats[i - 1], contour_lons[i - 1], contour_lats[i], contour_lons[i]
+                )
+                contour_length_km += dist
+
+            step = max(1, len(main_contour) // 50)
+            simplified_contour = [
+                [round(lon, 2), round(lat, 2)]
+                for lat, lon in zip(contour_lats[::step], contour_lons[::step])
+            ]
+
+            polygon_features = self._extract_polygon_coordinates(main_contour)
+
+            return {
+                "contour_length_km": round(contour_length_km, 1),
+                "contour_points": len(main_contour),
+                "simplified_coordinates": simplified_contour,
+                "polygon_features": polygon_features,
+                "description": f"主等值线长度{contour_length_km:.0f}km，包含{len(main_contour)}个数据点",
+            }
+        except Exception:  # pragma: no cover - parity with legacy fallback
+            return None
+
+    def _extract_polygon_coordinates(self, contour):
+        try:
+            epsilon = 0.02 * len(contour)
+            approx_polygon = approximate_polygon(contour, tolerance=epsilon)
+
+            polygon_coords = []
+            for point in approx_polygon:
+                lat_idx = int(np.clip(point[0], 0, len(self.lat) - 1))
+                lon_idx = int(np.clip(point[1], 0, len(self.lon) - 1))
+                polygon_coords.append([round(float(self.lon[lon_idx]), 2), round(float(self.lat[lat_idx]), 2)])
+
+            if polygon_coords:
+                lons = [coord[0] for coord in polygon_coords]
+                lats = [coord[1] for coord in polygon_coords]
+                bbox = [
+                    round(float(min(lons)), 2),
+                    round(float(min(lats)), 2),
+                    round(float(max(lons)), 2),
+                    round(float(max(lats)), 2),
+                ]
+
+                center = [round(float(np.mean(lons)), 2), round(float(np.mean(lats)), 2)]
+
+                cardinal_points = {
+                    "N": [lons[lats.index(max(lats))], max(lats)],
+                    "S": [lons[lats.index(min(lats))], min(lats)],
+                    "E": [max(lons), lats[lons.index(max(lons))]],
+                    "W": [min(lons), lats[lons.index(min(lons))]],
+                }
+
+                return {
+                    "polygon": polygon_coords,
+                    "vertices": len(polygon_coords),
+                    "bbox": bbox,
+                    "center": center,
+                    "cardinal_points": cardinal_points,
+                    "span": [
+                        round(bbox[2] - bbox[0], 2),
+                        round(bbox[3] - bbox[1], 2),
+                    ],
+                }
+
+            return None
+        except Exception:  # pragma: no cover - parity
+            return None
+
+    def _calculate_multiscale_features(self, data_field, threshold, system_type):
+        features = {}
+
+        if system_type == "high":
+            thresholds = [threshold, threshold + 20, threshold + 40]
+            threshold_names = ["外边界", "中等强度", "强中心"]
+        else:
+            thresholds = [threshold, threshold - 20, threshold - 40]
+            threshold_names = ["外边界", "中等强度", "强中心"]
+
+        for thresh, name in zip(thresholds, threshold_names):
+            mask = data_field >= thresh if system_type == "high" else data_field <= thresh
+
+            if np.any(mask):
+                area_pixels = np.sum(mask)
+                lat_factor = self.lat_spacing * 111
+                lon_factor = self.lon_spacing * 111 * np.cos(np.deg2rad(np.mean(self.lat)))
+                area_km2 = area_pixels * lat_factor * lon_factor
+                features[f"area_{name}_km2"] = round(area_km2, 1)
+            else:
+                features[f"area_{name}_km2"] = 0
+
+        outer_area = features.get("area_外边界_km2", 0)
+        if outer_area > 0:
+            features["core_ratio"] = round(
+                features.get("area_强中心_km2", 0) / outer_area, 3
+            )
+            features["middle_ratio"] = round(
+                features.get("area_中等强度_km2", 0) / outer_area, 3
+            )
+
+        return features
+
+    def _describe_basic_shape(self, compactness, aspect_ratio, eccentricity):
+        if compactness > 0.7:
+            shape_desc = "近圆形"
+        elif compactness > 0.4:
+            shape_desc = "较规则"
+        else:
+            shape_desc = "不规则"
+
+        if aspect_ratio > 3:
+            elongation_desc = "高度拉长"
+        elif aspect_ratio > 2:
+            elongation_desc = "明显拉长"
+        elif aspect_ratio > 1.5:
+            elongation_desc = "略微拉长"
+        else:
+            elongation_desc = "较为圆润"
+
+        return f"{shape_desc}的{elongation_desc}系统"
+
+    def _describe_complexity(self, solidity, boundary_complexity):
+        if solidity > 0.9:
+            complexity_desc = "边界平滑"
+        elif solidity > 0.7:
+            complexity_desc = "边界较规则"
+        else:
+            complexity_desc = "边界复杂"
+
+        if boundary_complexity > 2:
+            detail_desc = "具有精细结构"
+        elif boundary_complexity > 1.5:
+            detail_desc = "具有一定细节"
+        else:
+            detail_desc = "结构相对简单"
+
+        return f"{complexity_desc}，{detail_desc}"
+
+    def _estimate_fractal_dimension(self, region_mask):
+        try:
+            sizes = [2, 4, 8, 16]
+            counts = []
+
+            for size in sizes:
+                h, w = region_mask.shape
+                count = 0
+                for i in range(0, h, size):
+                    for j in range(0, w, size):
+                        box = region_mask[i : min(i + size, h), j : min(j + size, w)]
+                        if np.any(box):
+                            count += 1
+                counts.append(count)
+
+            if len(counts) > 1 and all(c > 0 for c in counts):
+                coeffs = np.polyfit(np.log(sizes), np.log(counts), 1)
+                fractal_dim = -coeffs[0]
+                return max(1.0, min(2.0, float(fractal_dim)))
+            return 1.5
+        except Exception:  # pragma: no cover - parity
+            return 1.5
+
+    def _haversine_distance(self, lat1, lon1, lat2, lon2):
+        R = 6371.0
+        lat1, lon1, lat2, lon2 = map(np.radians, [lat1, lon1, lat2, lon2])
+        dlat = lat2 - lat1
+        dlon = lon2 - lon1
+        a = np.sin(dlat / 2) ** 2 + np.cos(lat1) * np.cos(lat2) * np.sin(dlon / 2) ** 2
+        c = 2 * np.arcsin(np.sqrt(a))
+        return R * c
 
 class CDSEnvironmentExtractor:
     """
@@ -53,6 +426,7 @@ class CDSEnvironmentExtractor:
 
         # 下载文件记录，便于后续清理
         self._downloaded_files = []
+        self._grad_cache = {}
 
         print("✅ CDS环境提取器初始化完成")
 
@@ -90,26 +464,18 @@ class CDSEnvironmentExtractor:
             print(f"🌀 台风ID: {self.tracks_df['particle'].unique()}")
 
         except Exception as e:
-            print(f"❌ 加载路径数据失败: {e}")
-            sys.exit(1)
+            message = f"❌ 加载路径数据失败: {e}"
+            print(message)
+            raise RuntimeError(message) from e
 
-    def download_era5_data(self, start_date, end_date, area=None):
+    def download_era5_data(self, start_date, end_date):
         """
-        从CDS下载ERA5数据
+        从CDS下载ERA5数据（无区域裁剪，默认全局范围）
 
         Args:
             start_date: 开始日期 (YYYY-MM-DD)
             end_date: 结束日期 (YYYY-MM-DD)
-            area: 区域 [north, west, south, east]
         """
-        if area is None:
-            # 基于路径数据确定区域
-            lat_min = self.tracks_df['lat'].min() - 10
-            lat_max = self.tracks_df['lat'].max() + 10
-            lon_min = self.tracks_df['lon'].min() - 10
-            lon_max = self.tracks_df['lon'].max() + 10
-            area = [lat_max, lon_min, lat_min, lon_max]
-
         output_file = self.output_dir / f"era5_single_{start_date.replace('-', '')}_{end_date.replace('-', '')}.nc"
 
         if output_file.exists():
@@ -138,7 +504,6 @@ class CDSEnvironmentExtractor:
                     'time': [
                         '00:00', '06:00', '12:00', '18:00'
                     ],
-                    'area': area,
                 },
                 str(output_file)
             )
@@ -151,15 +516,8 @@ class CDSEnvironmentExtractor:
             print(f"❌ ERA5数据下载失败: {e}")
             return None
 
-    def download_era5_pressure_data(self, start_date, end_date, area=None, levels=("850","500","200")):
-        """从CDS下载ERA5等压面数据"""
-        if area is None:
-            lat_min = self.tracks_df['lat'].min() - 10
-            lat_max = self.tracks_df['lat'].max() + 10
-            lon_min = self.tracks_df['lon'].min() - 10
-            lon_max = self.tracks_df['lon'].max() + 10
-            area = [lat_max, lon_min, lat_min, lon_max]
-
+    def download_era5_pressure_data(self, start_date, end_date, levels=("850","500","200")):
+        """从CDS下载ERA5等压面数据（无区域裁剪，默认全局范围）"""
         output_file = self.output_dir / f"era5_pressure_{start_date.replace('-', '')}_{end_date.replace('-', '')}.nc"
 
         if output_file.exists():
@@ -186,7 +544,6 @@ class CDSEnvironmentExtractor:
                     'month': sorted(list(set(date_range.month))),
                     'day': sorted(list(set(date_range.day))),
                     'time': ['00:00', '06:00', '12:00', '18:00'],
-                    'area': area,
                 },
                 str(output_file)
             )
@@ -300,13 +657,12 @@ class CDSEnvironmentExtractor:
         time_values = pd.to_datetime(time_coord.values)
         self._time_values = np.asarray(time_values)
 
-        # 保留辅助索引函数
-        def _loc_idx(lat_val: float, lon_val: float):
-            lat_idx = int(np.abs(self.latitudes - lat_val).argmin())
-            lon_idx = int(np.abs(self.longitudes - lon_val).argmin())
-            return lat_idx, lon_idx
+        # 建立与高级形状分析一致的辅助属性
+        self.lat = self.latitudes
+        self.lon = self.longitudes
+        self._grad_cache = {}
 
-        self._loc_idx = _loc_idx
+        self.shape_analyzer = WeatherSystemShapeAnalyzer(self.lat, self.lon)
 
     def extract_environmental_systems(self, time_point, tc_lat, tc_lon):
         """提取指定时间点的环境系统，输出格式与environment_extractor保持一致"""
@@ -318,9 +674,14 @@ class CDSEnvironmentExtractor:
             ds_at_time = self._dataset_at_index(time_idx)
 
             system_extractors = [
-                lambda: self.extract_subtropical_high(time_idx, ds_at_time, tc_lat, tc_lon),
-                lambda: self.extract_vertical_shear(time_idx, tc_lat, tc_lon),
-                lambda: self.extract_ocean_heat(time_idx, tc_lat, tc_lon),
+                lambda: self.extract_steering_system(time_idx, tc_lat, tc_lon),
+                lambda: self.extract_vertical_wind_shear(time_idx, tc_lat, tc_lon),
+                lambda: self.extract_ocean_heat_content(time_idx, tc_lat, tc_lon),
+                lambda: self.extract_upper_level_divergence(time_idx, tc_lat, tc_lon),
+                lambda: self.extract_intertropical_convergence_zone(time_idx, tc_lat, tc_lon),
+                lambda: self.extract_westerly_trough(time_idx, tc_lat, tc_lon),
+                lambda: self.extract_frontal_system(time_idx, tc_lat, tc_lon),
+                lambda: self.extract_monsoon_trough(time_idx, tc_lat, tc_lon),
                 lambda: self.extract_low_level_flow(ds_at_time, tc_lat, tc_lon),
                 lambda: self.extract_atmospheric_stability(ds_at_time, tc_lat, tc_lon),
             ]
@@ -338,6 +699,27 @@ class CDSEnvironmentExtractor:
     def _normalize_lon(self, lon_values):
         arr = np.asarray(lon_values, dtype=np.float64)
         return np.mod(arr + 360.0, 360.0)
+
+    def _loc_idx(self, lat_val: float, lon_val: float):
+        if not hasattr(self, "latitudes") or not hasattr(self, "longitudes"):
+            raise RuntimeError("坐标元数据尚未初始化，无法定位网格索引")
+        lat_idx = int(np.abs(self.latitudes - lat_val).argmin())
+        lon_idx = int(np.abs(self.longitudes - lon_val).argmin())
+        return lat_idx, lon_idx
+
+    def _raw_gradients(self, arr: np.ndarray):
+        cache = getattr(self, "_grad_cache", None)
+        if cache is None:
+            cache = {}
+            self._grad_cache = cache
+        key = id(arr)
+        if key in cache:
+            return cache[key]
+
+        gy = np.gradient(arr, axis=0)
+        gx = np.gradient(arr, axis=1)
+        cache[key] = (gy, gx)
+        return gy, gx
 
     def _lon_distance(self, lon_values, center_lon):
         lon_norm = self._normalize_lon(lon_values)
@@ -413,25 +795,28 @@ class CDSEnvironmentExtractor:
         return result.values if hasattr(result, 'values') else np.asarray(result)
 
     def _get_sst_field(self, time_idx):
+        # 优先使用海表温度，如无则使用地表温度近似
         for var_name in ("sst", "ts"):
             field = self._get_field_at_time(var_name, time_idx)
             if field is not None:
-                values = field.values if hasattr(field, 'values') else np.asarray(field)
+                values = field.values if hasattr(field, "values") else np.asarray(field)
                 if np.nanmean(values) > 200:
                     values = values - 273.15
                 return values
-        for var_name in ("t2m", "t2"):
+
+        for var_name in ("t2", "t2m"):
             field = self._get_field_at_time(var_name, time_idx)
             if field is not None:
-                values = field.values if hasattr(field, 'values') else np.asarray(field)
+                values = field.values if hasattr(field, "values") else np.asarray(field)
                 if np.nanmean(values) > 200:
                     values = values - 273.15
+                print(f"⚠️ 使用{var_name}作为海表温度近似")
                 return values
         return None
 
     def _create_region_mask(self, center_lat, center_lon, radius_deg):
-        lat_mask = (self.latitudes >= center_lat - radius_deg) & (self.latitudes <= center_lat + radius_deg)
-        lon_mask = self._lon_distance(self.longitudes, center_lon) <= radius_deg
+        lat_mask = (self.lat >= center_lat - radius_deg) & (self.lat <= center_lat + radius_deg)
+        lon_mask = (self.lon >= center_lon - radius_deg) & (self.lon <= center_lon + radius_deg)
         return np.outer(lat_mask, lon_mask)
 
     def _haversine_distance(self, lat1, lon1, lat2, lon2):
@@ -449,13 +834,12 @@ class CDSEnvironmentExtractor:
         return float(self._haversine_distance(lat1, lon1, lat2, lon2))
 
     def _calculate_bearing(self, lat1, lon1, lat2, lon2):
-        lat1_rad = math.radians(lat1)
-        lat2_rad = math.radians(lat2)
         dlon = math.radians(lon2 - lon1)
-        y = math.sin(dlon) * math.cos(lat2_rad)
-        x = math.cos(lat1_rad) * math.sin(lat2_rad) - math.sin(lat1_rad) * math.cos(lat2_rad) * math.cos(dlon)
+        lat1, lat2 = math.radians(lat1), math.radians(lat2)
+        y = math.sin(dlon) * math.cos(lat2)
+        x = math.cos(lat1) * math.sin(lat2) - math.sin(lat1) * math.cos(lat2) * math.cos(dlon)
         bearing = (math.degrees(math.atan2(y, x)) + 360.0) % 360.0
-        return bearing
+        return bearing, self._bearing_to_desc(bearing)[1]
 
     def _bearing_to_desc(self, bearing):
         dirs = [
@@ -494,153 +878,331 @@ class CDSEnvironmentExtractor:
             "西北风",
             "西北偏北风",
         ]
-        index = int(round(bearing / 22.5)) % 16
+        index = round(bearing / 22.5) % 16
         return wind_dirs[index], f"{dirs[index]}方向"
 
     def _get_vector_coords(self, lat, lon, u, v, scale=0.1):
-        factor = scale * 0.009
-        end_lat = lat + v * factor
-        cos_lat = math.cos(math.radians(lat))
-        if abs(cos_lat) < 1e-6:
-            cos_lat = 1e-6
-        end_lon = lon + u * factor / cos_lat
+        end_lat = lat + v * scale * 0.009
+        end_lon = lon + u * scale * 0.009 / max(math.cos(math.radians(lat)), 1e-6)
         return {
             "start": {"lat": round(lat, 2), "lon": round(lon, 2)},
             "end": {"lat": round(end_lat, 2), "lon": round(end_lon, 2)},
         }
 
-    def extract_subtropical_high(self, time_idx, ds_at_time, tc_lat, tc_lon):
-        """提取副热带高压系统，与environment_extractor输出语义保持一致"""
-        try:
-            z500 = self._get_data_at_level("z", 500, time_idx)
-            field_source = "z500"
-            if z500 is not None:
-                field_values = np.asarray(z500, dtype=float)
-                if np.nanmean(field_values) > 10000:
-                    field_values = field_values / 9.80665  # 转换为gpm
-                threshold = 5880
-                unit = "gpm"
-            else:
-                field_source = "msl"
-                msl = self._get_field_at_time("msl", time_idx)
-                if msl is None:
-                    return None
-                field_values = (msl.values if hasattr(msl, "values") else np.asarray(msl)) / 100.0
-                threshold = 1020
-                unit = "hPa"
+    def _calculate_steering_flow(self, z500, tc_lat, tc_lon):
+        gy, gx = self._raw_gradients(z500)
+        dy = gy / (self.lat_spacing * 111000.0)
+        dx = gx / (self.lon_spacing * 111000.0 * self._coslat_safe[:, np.newaxis])
+        lat_idx, lon_idx = self._loc_idx(tc_lat, tc_lon)
+        u_steering = -dx[lat_idx, lon_idx] / (9.8 * 1e-5)
+        v_steering = dy[lat_idx, lon_idx] / (9.8 * 1e-5)
+        speed = float(np.sqrt(u_steering**2 + v_steering**2))
+        direction = (float(np.degrees(np.arctan2(u_steering, v_steering))) + 180.0) % 360.0
+        return speed, direction, float(u_steering), float(v_steering)
 
-            if not np.any(np.isfinite(field_values)):
+    def _get_contour_coords(self, data_field, level, max_points=100):
+        try:
+            contours = find_contours(data_field, level)
+            if not contours:
+                return None
+            main_contour = sorted(contours, key=len, reverse=True)[0]
+            contour_lon = self.lon[main_contour[:, 1].astype(int)]
+            contour_lat = self.lat[main_contour[:, 0].astype(int)]
+            step = max(1, len(main_contour) // max_points)
+            return [
+                [round(float(lon), 2), round(float(lat), 2)]
+                for lon, lat in zip(contour_lon[::step], contour_lat[::step])
+            ]
+        except Exception:
+            return None
+
+    def _get_enhanced_shape_info(self, data_field, threshold, system_type, center_lat, center_lon):
+        try:
+            shape_analysis = self.shape_analyzer.analyze_system_shape(
+                data_field, threshold, system_type, center_lat, center_lon
+            )
+            if not shape_analysis:
                 return None
 
-            mask = np.isfinite(field_values)
-            if field_source == "z500":
-                mask &= field_values >= threshold
-            else:
-                mask &= field_values >= threshold
+            basic_info = {
+                "area_km2": shape_analysis["basic_geometry"]["area_km2"],
+                "shape_type": shape_analysis["basic_geometry"]["description"],
+                "orientation": shape_analysis["orientation"]["direction_type"],
+                "complexity": shape_analysis["shape_complexity"]["description"],
+                "detailed_analysis": shape_analysis,
+            }
 
-            if np.any(mask):
-                candidate_idx = np.argwhere(mask)
-                candidate_lats = self.latitudes[candidate_idx[:, 0]]
-                candidate_lons = self.longitudes[candidate_idx[:, 1]]
-                distances = self._haversine_distance(candidate_lats, candidate_lons, tc_lat, tc_lon)
-                if np.all(np.isnan(distances)):
-                    target_idx = np.unravel_index(np.nanargmax(field_values), field_values.shape)
-                else:
-                    best = int(np.nanargmin(distances))
-                    target_idx = tuple(candidate_idx[best])
-            else:
-                target_idx = np.unravel_index(np.nanargmax(field_values), field_values.shape)
+            contour_data = shape_analysis.get("contour_analysis")
+            if contour_data:
+                basic_info["coordinate_info"] = {
+                    "main_contour_coords": contour_data.get("simplified_coordinates", []),
+                    "polygon_features": contour_data.get("polygon_features", {}),
+                    "contour_length_km": contour_data.get("contour_length_km", 0),
+                }
+            return basic_info
+        except Exception as exc:
+            print(f"形状分析失败: {exc}")
+            return None
 
-            high_lat = float(self.latitudes[target_idx[0]])
-            high_lon = float(self.longitudes[target_idx[1]])
-            intensity_val = float(field_values[target_idx])
+    def _get_system_coordinates(self, data_field, threshold, system_type, max_points=20):
+        try:
+            mask = data_field >= threshold if system_type == "high" else data_field <= threshold
+            if not np.any(mask):
+                return None
 
-            if field_source == "z500":
-                if intensity_val > 5900:
-                    level = "强"
-                elif intensity_val > 5880:
-                    level = "中等"
-                else:
-                    level = "弱"
-            else:
-                if intensity_val >= 1025:
-                    level = "强"
-                elif intensity_val >= 1020:
-                    level = "中等"
-                else:
-                    level = "弱"
+            labeled_mask, num_features = label(mask)
+            if num_features == 0:
+                return None
 
-            bearing = self._calculate_bearing(tc_lat, tc_lon, high_lat, high_lon)
-            _, rel_dir_text = self._bearing_to_desc(bearing)
-            distance = self._calculate_distance(tc_lat, tc_lon, high_lat, high_lon)
+            counts = np.bincount(labeled_mask.ravel())[1 : num_features + 1]
+            if counts.size == 0:
+                return None
+            main_label = int(np.argmax(counts) + 1)
+            main_region = labeled_mask == main_label
 
-            # 引导气流估算
-            gy, gx = np.gradient(field_values)
-            denom_lat = self.lat_spacing * 111000.0 if self.lat_spacing else 1.0
-            denom_lon = self.lon_spacing * 111000.0 if self.lon_spacing else 1.0
-            lat_idx, lon_idx = self._loc_idx(tc_lat, tc_lon)
-            coslat_val = self._coslat_safe[lat_idx] if np.isfinite(self._coslat_safe[lat_idx]) else math.cos(math.radians(tc_lat))
-            dx_val = gx[lat_idx, lon_idx] / (denom_lon * coslat_val if coslat_val else denom_lon)
-            dy_val = gy[lat_idx, lon_idx] / denom_lat
-            u_steering = -dx_val / (9.8 * 1e-5)
-            v_steering = dy_val / (9.8 * 1e-5)
-            steering_speed = float(np.sqrt(u_steering**2 + v_steering**2))
-            steering_direction = (np.degrees(np.arctan2(u_steering, v_steering)) + 180.0) % 360.0
-            wind_desc, steering_dir_text = self._bearing_to_desc(steering_direction)
+            contours = find_contours(main_region.astype(float), 0.5)
+            if not contours:
+                return None
+            main_contour = max(contours, key=len)
 
-            description = (
-                f"一个强度为“{level}”的副热带高压系统位于台风的{rel_dir_text}，"
-                f"核心强度约为{intensity_val:.0f}{unit}，为台风提供来自{wind_desc}、方向"
-                f"约{steering_direction:.0f}°、速度{steering_speed:.1f}m/s的引导气流。"
-            )
+            epsilon = len(main_contour) * 0.01
+            simplified = approximate_polygon(main_contour, tolerance=epsilon)
+            if len(simplified) > max_points:
+                step = max(1, len(simplified) // max_points)
+                simplified = simplified[::step]
 
-            shape_info = {
-                "description": "基于阈值识别的高压控制区",
-                "field": field_source,
-                "threshold": threshold,
+            geo_coords = []
+            for point in simplified:
+                lat_idx = int(np.clip(point[0], 0, len(self.lat) - 1))
+                lon_idx = int(np.clip(point[1], 0, len(self.lon) - 1))
+                geo_coords.append([
+                    round(float(self.lon[lon_idx]), 3),
+                    round(float(self.lat[lat_idx]), 3),
+                ])
+
+            if not geo_coords:
+                return None
+
+            lons = [coord[0] for coord in geo_coords]
+            lats = [coord[1] for coord in geo_coords]
+            extent = {
+                "boundaries": [
+                    round(float(min(lons)), 3),
+                    round(float(min(lats)), 3),
+                    round(float(max(lons)), 3),
+                    round(float(max(lats)), 3),
+                ],
+                "center": [
+                    round(float(np.mean(lons)), 3),
+                    round(float(np.mean(lats)), 3),
+                ],
+                "span": [
+                    round(float(max(lons) - min(lons)), 3),
+                    round(float(max(lats) - min(lats)), 3),
+                ],
             }
 
             return {
-                "system_name": "SubtropicalHigh",
-                "description": description,
-                "position": {
-                    "description": "副热带高压中心",
-                    "center_of_mass": {"lat": round(high_lat, 2), "lon": round(high_lon, 2)},
-                    "relative_to_tc": {
-                        "direction": rel_dir_text,
-                        "bearing_deg": round(bearing, 1),
-                        "distance_km": round(distance, 1),
-                    },
-                },
-                "intensity": {"value": round(intensity_val, 1), "unit": unit, "level": level},
-                "shape": shape_info,
-                "properties": {
-                    "influence": "主导台风未来路径",
-                    "steering_flow": {
-                        "speed_mps": round(steering_speed, 2),
-                        "direction_deg": round(steering_direction, 1),
-                        "vector_mps": {"u": round(float(u_steering), 2), "v": round(float(v_steering), 2)},
-                        "wind_desc": wind_desc,
-                    },
-                },
+                "vertices": geo_coords,
+                "vertex_count": len(geo_coords),
+                "extent": extent,
+                "span_deg": [extent["span"][0], extent["span"][1]],
             }
-        except Exception as e:
-            print(f"⚠️ 提取副热带高压失败: {e}")
+        except Exception as exc:
+            print(f"坐标提取失败: {exc}")
             return None
 
-    def extract_ocean_heat(self, time_idx, tc_lat, tc_lon, radius_deg=2.0):
-        """提取海洋热含量，与environment_extractor的热力判断保持一致"""
+    def _generate_coordinate_description(self, coords_info, system_name="系统"):
+        if not coords_info:
+            return ""
+
         try:
-            sst_values = self._get_sst_field(time_idx)
-            if sst_values is None:
+            parts = []
+            extent = coords_info.get("extent")
+            if extent and "boundaries" in extent:
+                west, south, east, north = extent["boundaries"]
+                parts.append(
+                    f"{system_name}主体位于{west:.1f}°E-{east:.1f}°E，{south:.1f}°N-{north:.1f}°N"
+                )
+
+            if coords_info.get("vertex_count"):
+                parts.append(f"由{coords_info['vertex_count']}个关键顶点构成的多边形形状")
+
+            if "span_deg" in coords_info:
+                lon_span, lat_span = coords_info["span_deg"]
+                center_lat = extent.get("center", [0, 30])[1] if extent else 30
+                lat_km = lat_span * 111.0
+                lon_km = lon_span * 111.0 * math.cos(math.radians(center_lat))
+                parts.append(f"纬向跨度约{lat_km:.0f}km，经向跨度约{lon_km:.0f}km")
+
+            return "，".join(parts) + "。" if parts else ""
+        except Exception:
+            return ""
+
+    def _identify_pressure_system(self, data_field, tc_lat, tc_lon, system_type, threshold):
+        mask = data_field > threshold if system_type == "high" else data_field < threshold
+        if not np.any(mask):
+            return None
+
+        labeled_array, num_features = label(mask)
+        if num_features == 0:
+            return None
+
+        objects_slices = find_objects(labeled_array)
+        tc_lat_idx, tc_lon_idx = self._loc_idx(tc_lat, tc_lon)
+        min_dist = float("inf")
+        closest_idx = -1
+        for i, slc in enumerate(objects_slices):
+            center_y = (slc[0].start + slc[0].stop) / 2
+            center_x = (slc[1].start + slc[1].stop) / 2
+            dist = math.hypot(center_y - tc_lat_idx, center_x - tc_lon_idx)
+            if dist < min_dist:
+                min_dist, closest_idx = dist, i
+
+        if closest_idx == -1:
+            return None
+
+        target_mask = labeled_array == (closest_idx + 1)
+        com_y, com_x = center_of_mass(target_mask)
+        pos_lat = float(self.lat[int(com_y)])
+        pos_lon = float(self.lon[int(com_x)])
+        intensity_val = (
+            float(np.max(data_field[target_mask]))
+            if system_type == "high"
+            else float(np.min(data_field[target_mask]))
+        )
+
+        return {
+            "position": {
+                "center_of_mass": {
+                    "lat": round(pos_lat, 2),
+                    "lon": round(pos_lon, 2),
+                }
+            },
+            "intensity": {"value": round(intensity_val, 1), "unit": "gpm"},
+            "shape": {},
+        }
+
+    def extract_steering_system(self, time_idx, tc_lat, tc_lon):
+        """提取副热带高压及引导气流，匹配extractSyst结构"""
+        try:
+            z500 = self._get_data_at_level("z", 500, time_idx)
+            if z500 is None:
+                return None
+
+            field_values = np.asarray(z500, dtype=float)
+            if np.nanmean(field_values) > 10000:
+                field_values = field_values / 9.80665
+
+            threshold = 5880
+            subtropical_high = self._identify_pressure_system(
+                field_values, tc_lat, tc_lon, "high", threshold
+            )
+            if not subtropical_high:
+                return None
+
+            enhanced_shape = self._get_enhanced_shape_info(
+                field_values, threshold, "high", tc_lat, tc_lon
+            )
+
+            steering_speed, steering_direction, u_steering, v_steering = self._calculate_steering_flow(
+                field_values, tc_lat, tc_lon
+            )
+
+            intensity_val = subtropical_high["intensity"]["value"]
+            if intensity_val > 5900:
+                level = "强"
+            elif intensity_val > 5880:
+                level = "中等"
+            else:
+                level = "弱"
+            subtropical_high["intensity"]["level"] = level
+
+            if enhanced_shape:
+                subtropical_high.setdefault("shape", {}).update(
+                    {
+                        "detailed_analysis": enhanced_shape["detailed_analysis"],
+                        "area_km2": enhanced_shape["area_km2"],
+                        "shape_type": enhanced_shape["shape_type"],
+                        "orientation": enhanced_shape["orientation"],
+                        "complexity": enhanced_shape["complexity"],
+                    }
+                )
+                coord_info = enhanced_shape.get("coordinate_info")
+                if coord_info:
+                    subtropical_high["shape"]["coordinate_details"] = coord_info
+                else:
+                    subtropical_high.setdefault("shape", {})
+
+            system_coords = self._get_system_coordinates(field_values, threshold, "high", max_points=15)
+            if system_coords:
+                subtropical_high["shape"]["coordinates"] = system_coords
+                subtropical_high["shape"]["coordinate_description"] = self._generate_coordinate_description(
+                    system_coords, "副热带高压"
+                )
+
+            contour_coords = self._get_contour_coords(field_values, threshold, max_points=120)
+            if contour_coords:
+                subtropical_high["shape"]["contour_5880gpm"] = contour_coords
+
+            center = subtropical_high["position"].get("center_of_mass", {})
+            bearing, rel_dir_text = self._calculate_bearing(
+                tc_lat, tc_lon, center.get("lat", tc_lat), center.get("lon", tc_lon)
+            )
+            distance = self._calculate_distance(
+                tc_lat, tc_lon, center.get("lat", tc_lat), center.get("lon", tc_lon)
+            )
+
+            desc = (
+                f"一个强度为“{level}”的副热带高压系统位于台风的{rel_dir_text}，其主体形态稳定，"
+                f"为台风提供了稳定的{steering_direction:.0f}°方向、速度为{steering_speed:.1f} m/s的引导气流。"
+            )
+
+            subtropical_high.update(
+                {
+                    "system_name": "SubtropicalHigh",
+                    "description": desc,
+                    "position": {
+                        "description": "副热带高压中心",
+                        "center_of_mass": {
+                            "lat": round(center.get("lat", tc_lat), 2),
+                            "lon": round(center.get("lon", tc_lon), 2),
+                        },
+                        "relative_to_tc": rel_dir_text,
+                        "distance_km": round(distance, 1),
+                        "bearing_deg": round(bearing, 1),
+                    },
+                    "properties": {
+                        "influence": "主导台风未来路径",
+                        "steering_flow": {
+                            "speed_mps": round(steering_speed, 2),
+                            "direction_deg": round(steering_direction, 1),
+                            "vector_mps": {"u": round(u_steering, 2), "v": round(v_steering, 2)},
+                        },
+                    },
+                }
+            )
+            return subtropical_high
+        except Exception as exc:
+            print(f"⚠️ 引导系统提取失败: {exc}")
+            return None
+
+    # 兼容旧名称
+    def extract_subtropical_high(self, time_idx, ds_at_time, tc_lat, tc_lon):
+        return self.extract_steering_system(time_idx, tc_lat, tc_lon)
+
+    def extract_ocean_heat_content(self, time_idx, tc_lat, tc_lon, radius_deg=2.0):
+        """提取海洋热含量及暖水边界信息"""
+        try:
+            sst = self._get_sst_field(time_idx)
+            if sst is None:
                 return None
 
             region_mask = self._create_region_mask(tc_lat, tc_lon, radius_deg)
             if not np.any(region_mask):
                 return None
 
-            warm_region = np.where(region_mask, sst_values, np.nan)
-            mean_temp = float(np.nanmean(warm_region))
+            mean_temp = float(np.nanmean(np.where(region_mask, sst, np.nan)))
             if not np.isfinite(mean_temp):
                 return None
 
@@ -651,38 +1213,328 @@ class CDSEnvironmentExtractor:
             elif mean_temp > 26.5:
                 level, impact = "中等", "足以维持强度"
             else:
-                level, impact = "低", "能量供应不足"
+                level, impact = "低", "能量供应不足，将导致减弱"
+
+            contour_26_5 = self._get_contour_coords(sst, 26.5)
+            enhanced_shape = self._get_enhanced_shape_info(sst, 26.5, "high", tc_lat, tc_lon)
 
             desc = (
-                f"台风下方半径约{radius_deg}°的海域平均海表温度为{mean_temp:.1f}°C，"
-                f"海洋热含量等级为“{level}”，{impact}。"
+                f"台风下方海域的平均海表温度为{mean_temp:.1f}°C，海洋热含量等级为“{level}”，{impact}。"
             )
 
-            cell_lat_km = self.lat_spacing * 111.0 if self.lat_spacing else 0.0
-            cell_lon_km = (self.lon_spacing * 111.0 * math.cos(math.radians(tc_lat))) if self.lon_spacing else 0.0
-            approx_area = float(region_mask.astype(float).sum() * abs(cell_lat_km) * abs(cell_lon_km))
-
             shape_info = {
-                "description": "台风附近暖水覆盖区",
-                "radius_deg": radius_deg,
+                "description": "26.5°C是台风发展的最低海温门槛，此线是生命线",
+                "warm_water_boundary_26.5C": contour_26_5,
             }
-            if approx_area > 0:
-                shape_info["approx_area_km2"] = round(approx_area, 0)
+
+            if enhanced_shape:
+                shape_info.update(
+                    {
+                        "warm_water_area_km2": enhanced_shape["area_km2"],
+                        "warm_region_shape": enhanced_shape["shape_type"],
+                        "warm_region_orientation": enhanced_shape["orientation"],
+                        "detailed_analysis": enhanced_shape["detailed_analysis"],
+                    }
+                )
+                desc += (
+                    f" 暖水区域面积约{enhanced_shape['area_km2']:.0f}km²，呈{enhanced_shape['shape_type']}，"
+                    f"{enhanced_shape['orientation']}。"
+                )
 
             return {
                 "system_name": "OceanHeatContent",
                 "description": desc,
                 "position": {
-                    "description": f"台风中心周围{radius_deg}°半径内的海域",
+                    "description": f"台风中心周围{radius_deg}度半径内的海域",
                     "lat": round(tc_lat, 2),
                     "lon": round(tc_lon, 2),
                 },
                 "intensity": {"value": round(mean_temp, 2), "unit": "°C", "level": level},
                 "shape": shape_info,
-                "properties": {"impact": impact, "warm_water_support": mean_temp > 26.5},
+                "properties": {"impact": impact},
             }
-        except Exception as e:
-            print(f"⚠️ 提取海洋热含量失败: {e}")
+        except Exception as exc:
+            print(f"⚠️ 海洋热含量提取失败: {exc}")
+            return None
+
+    # 兼容旧名称
+    def extract_ocean_heat(self, time_idx, tc_lat, tc_lon, radius_deg=2.0):
+        return self.extract_ocean_heat_content(time_idx, tc_lat, tc_lon, radius_deg)
+
+    def extract_upper_level_divergence(self, time_idx, tc_lat, tc_lon):
+        try:
+            u200 = self._get_data_at_level("u", 200, time_idx)
+            v200 = self._get_data_at_level("v", 200, time_idx)
+            if u200 is None or v200 is None:
+                return None
+
+            with np.errstate(divide="ignore", invalid="ignore"):
+                gy_u, gx_u = self._raw_gradients(u200)
+                gy_v, gx_v = self._raw_gradients(v200)
+                du_dx = gx_u / (self.lon_spacing * 111000.0 * self._coslat_safe[:, np.newaxis])
+                dv_dy = gy_v / (self.lat_spacing * 111000.0)
+                divergence = du_dx + dv_dy
+
+            if not np.any(np.isfinite(divergence)):
+                return None
+
+            lat_idx, lon_idx = self._loc_idx(tc_lat, tc_lon)
+            div_val = divergence[lat_idx, lon_idx]
+            if not np.isfinite(div_val):
+                sub = divergence[max(0, lat_idx - 1) : lat_idx + 2, max(0, lon_idx - 1) : lon_idx + 2]
+                finite = sub[np.isfinite(sub)]
+                if finite.size == 0:
+                    return None
+                div_val = float(np.nanmean(finite))
+            div_val = float(np.clip(div_val, -5e-4, 5e-4))
+            div_scaled = div_val * 1e5
+
+            if div_scaled > 5:
+                level, impact = "强", "极其有利于台风发展和加强"
+            elif div_scaled > 2:
+                level, impact = "中等", "有利于台风维持和发展"
+            elif div_scaled > -2:
+                level, impact = "弱", "对台风发展影响较小"
+            else:
+                level, impact = "负值", "不利于台风发展"
+
+            desc = (
+                f"台风上方200hPa高度的散度值为{div_scaled:.1f}×10⁻⁵ s⁻¹，"
+                f"高空辐散强度为'{level}'，{impact}。"
+            )
+
+            return {
+                "system_name": "UpperLevelDivergence",
+                "description": desc,
+                "position": {
+                    "description": "台风中心上方200hPa高度",
+                    "lat": round(tc_lat, 2),
+                    "lon": round(tc_lon, 2),
+                },
+                "intensity": {"value": round(div_scaled, 2), "unit": "×10⁻⁵ s⁻¹", "level": level},
+                "shape": {"description": "高空辐散中心的空间分布"},
+                "properties": {"impact": impact, "favorable_development": div_scaled > 0},
+            }
+        except Exception as exc:
+            print(f"⚠️ 高空辐散提取失败: {exc}")
+            return None
+
+    def extract_intertropical_convergence_zone(self, time_idx, tc_lat, tc_lon):
+        try:
+            u850 = self._get_data_at_level("u", 850, time_idx)
+            v850 = self._get_data_at_level("v", 850, time_idx)
+            if u850 is None or v850 is None:
+                return None
+
+            gy_u, gx_u = self._raw_gradients(u850)
+            gy_v, gx_v = self._raw_gradients(v850)
+            du_dy = gy_u / (self.lat_spacing * 111000.0)
+            dv_dx = gx_v / (self.lon_spacing * 111000.0 * self._coslat_safe[:, np.newaxis])
+            vorticity = dv_dx - du_dy
+
+            tropical_mask = (self.lat >= 0) & (self.lat <= 20)
+            if not np.any(tropical_mask):
+                return None
+
+            tropical_vort = vorticity[tropical_mask, :]
+            rel_idx = np.nanargmax(tropical_vort)
+            lat_idx = rel_idx // tropical_vort.shape[1]
+            itcz_lat = float(self.lat[tropical_mask][lat_idx])
+
+            distance_deg = abs(tc_lat - itcz_lat)
+            if distance_deg < 5:
+                influence = "直接影响台风发展"
+            elif distance_deg < 10:
+                influence = "对台风路径有显著影响"
+            else:
+                influence = "对台风影响较小"
+
+            desc = (
+                f"热带辐合带当前位于约{itcz_lat:.1f}°N附近，与台风中心距离{distance_deg:.1f}度，{influence}。"
+            )
+
+            return {
+                "system_name": "InterTropicalConvergenceZone",
+                "description": desc,
+                "position": {"description": "热带辐合带位置", "lat": round(itcz_lat, 1), "lon": "跨经度带"},
+                "intensity": {"description": "基于850hPa涡度确定的活跃程度"},
+                "shape": {"description": "东西向延伸的辐合带"},
+                "properties": {
+                    "distance_to_tc_deg": round(distance_deg, 1),
+                    "influence": influence,
+                },
+            }
+        except Exception as exc:
+            print(f"⚠️ ITCZ 提取失败: {exc}")
+            return None
+
+    def extract_westerly_trough(self, time_idx, tc_lat, tc_lon):
+        try:
+            z500 = self._get_data_at_level("z", 500, time_idx)
+            if z500 is None:
+                return None
+
+            field_values = np.asarray(z500, dtype=float)
+            if np.nanmean(field_values) > 10000:
+                field_values = field_values / 9.80665
+
+            mid_lat_mask = (self.lat >= 20) & (self.lat <= 60)
+            if not np.any(mid_lat_mask):
+                return None
+
+            z500_mid = field_values[mid_lat_mask, :]
+            trough_threshold = np.percentile(z500_mid, 25)
+            trough = self._identify_pressure_system(
+                field_values, tc_lat, tc_lon, "low", trough_threshold
+            )
+            if not trough:
+                return None
+
+            center = trough["position"]["center_of_mass"]
+            bearing, rel_desc = self._calculate_bearing(tc_lat, tc_lon, center["lat"], center["lon"])
+            distance = self._calculate_distance(tc_lat, tc_lon, center["lat"], center["lon"])
+
+            if distance < 1000:
+                influence = "直接影响台风路径和强度"
+            elif distance < 2000:
+                influence = "对台风有间接影响"
+            else:
+                influence = "影响较小"
+
+            coords = self._get_system_coordinates(field_values, trough_threshold, "low", max_points=12)
+            shape_info = {"description": "南北向延伸的槽线系统"}
+            if coords:
+                shape_info.update(
+                    {
+                        "coordinates": coords,
+                        "extent_desc": f"纬度跨度{coords['span_deg'][1]:.1f}°，经度跨度{coords['span_deg'][0]:.1f}°",
+                    }
+                )
+
+            desc = (
+                f"在台风{rel_desc}约{distance:.0f}公里处存在西风槽系统，{influence}。"
+            )
+            if coords:
+                desc += (
+                    f" 槽线主体跨越纬度{coords['span_deg'][1]:.1f}°，经度{coords['span_deg'][0]:.1f}°。"
+                )
+
+            return {
+                "system_name": "WesterlyTrough",
+                "description": desc,
+                "position": trough["position"],
+                "intensity": trough["intensity"],
+                "shape": shape_info,
+                "properties": {
+                    "distance_to_tc_km": round(distance, 0),
+                    "bearing_from_tc": round(bearing, 1),
+                    "influence": influence,
+                },
+            }
+        except Exception as exc:
+            print(f"⚠️ 西风槽提取失败: {exc}")
+            return None
+
+    def extract_frontal_system(self, time_idx, tc_lat, tc_lon):
+        try:
+            t850 = self._get_data_at_level("t", 850, time_idx)
+            t700 = self._get_data_at_level("t", 700, time_idx)
+            if t850 is None or t700 is None:
+                return None
+
+            if np.nanmean(t850) > 200:
+                t850 = t850 - 273.15
+            if np.nanmean(t700) > 200:
+                t700 = t700 - 273.15
+
+            temp_gradient = np.sqrt(
+                (np.gradient(t850, axis=0) / self.lat_spacing) ** 2
+                + (np.gradient(t850, axis=1) / self.lon_spacing) ** 2
+            )
+
+            threshold = np.percentile(temp_gradient, 75)
+            frontal_mask = temp_gradient > threshold
+            if not np.any(frontal_mask):
+                return None
+
+            coords = self._get_system_coordinates(temp_gradient, threshold, "high", max_points=20)
+            coord_desc = self._generate_coordinate_description(coords, "锋面系统") if coords else ""
+
+            desc = (
+                f"在台风附近存在显著温度梯度的锋面系统，沿锋区温差明显，可能影响台风路径。{coord_desc}"
+            )
+
+            return {
+                "system_name": "FrontalSystem",
+                "description": desc,
+                "position": {"description": "锋面大致位置", "lat": tc_lat, "lon": tc_lon},
+                "intensity": {"description": "基于温度梯度的锋面强度"},
+                "shape": {"description": "沿温度梯度形成的锋区", "coordinates": coords},
+                "properties": {"temperature_gradient": round(float(threshold), 2)},
+            }
+        except Exception as exc:
+            print(f"⚠️ 锋面系统提取失败: {exc}")
+            return None
+
+    def extract_monsoon_trough(self, time_idx, tc_lat, tc_lon):
+        try:
+            u850 = self._get_data_at_level("u", 850, time_idx)
+            v850 = self._get_data_at_level("v", 850, time_idx)
+            if u850 is None or v850 is None:
+                return None
+
+            gy_u, gx_u = self._raw_gradients(u850)
+            gy_v, gx_v = self._raw_gradients(v850)
+            du_dy = gy_u / (self.lat_spacing * 111000.0)
+            dv_dx = gx_v / (self.lon_spacing * 111000.0 * self._coslat_safe[:, np.newaxis])
+            relative_vorticity = dv_dx - du_dy
+
+            monsoon_threshold = np.nanpercentile(relative_vorticity, 85)
+            if monsoon_threshold <= 0:
+                return None
+
+            monsoon_mask = relative_vorticity > monsoon_threshold
+            lat_idx, lon_idx = self._loc_idx(tc_lat, tc_lon)
+            search_radius = 30
+            sub = monsoon_mask[
+                max(0, lat_idx - search_radius) : lat_idx + search_radius,
+                max(0, lon_idx - search_radius) : lon_idx + search_radius,
+            ]
+            if not np.any(sub):
+                return None
+
+            finite_vort = relative_vorticity[monsoon_mask]
+            finite_vort = finite_vort[np.isfinite(finite_vort)]
+            if finite_vort.size == 0:
+                return None
+            max_vorticity = float(np.clip(np.max(finite_vort), 0, 2e-3)) * 1e5
+
+            if max_vorticity > 10:
+                level, impact = "活跃", "为台风发展提供有利环境"
+            elif max_vorticity > 5:
+                level, impact = "中等", "对台风发展有一定支持"
+            else:
+                level, impact = "弱", "对台风影响有限"
+
+            desc = (
+                f"台风周围存在活跃程度为'{level}'的季风槽系统，最大相对涡度为{max_vorticity:.1f}×10⁻⁵ s⁻¹，"
+                f"{impact}。"
+            )
+
+            return {
+                "system_name": "MonsoonTrough",
+                "description": desc,
+                "position": {"description": "台风周围的季风槽区域", "lat": tc_lat, "lon": tc_lon},
+                "intensity": {
+                    "value": round(max_vorticity, 1),
+                    "unit": "×10⁻⁵ s⁻¹",
+                    "level": level,
+                },
+                "shape": {"description": "东西向延伸的低压槽"},
+                "properties": {"impact": impact, "vorticity_support": max_vorticity > 5},
+            }
+        except Exception as exc:
+            print(f"⚠️ 季风槽提取失败: {exc}")
             return None
 
     def extract_low_level_flow(self, ds_at_time, tc_lat, tc_lon):
@@ -757,8 +1609,8 @@ class CDSEnvironmentExtractor:
             print(f"⚠️ 提取大气稳定性失败: {e}")
             return None
 
-    def extract_vertical_shear(self, time_idx, tc_lat, tc_lon):
-        """提取垂直风切变，复用与environment_extractor一致的阈值和描述"""
+    def extract_vertical_wind_shear(self, time_idx, tc_lat, tc_lon):
+        """提取垂直风切变，复用extractSyst语义"""
         try:
             u200 = self._get_data_at_level("u", 200, time_idx)
             v200 = self._get_data_at_level("v", 200, time_idx)
@@ -808,10 +1660,108 @@ class CDSEnvironmentExtractor:
         except Exception as e:
             print(f"⚠️ 提取垂直风切变失败: {e}")
             return None
+
+    # 兼容旧名称
+    def extract_vertical_shear(self, time_idx, tc_lat, tc_lon):
+        return self.extract_vertical_wind_shear(time_idx, tc_lat, tc_lon)
             
     # 兼容旧接口的占位符，保留名称以避免潜在外部调用
     def _find_nearest_grid(self, lat, lon):
         return self._loc_idx(lat, lon)
+
+    def _detect_completed_months(self):
+        """扫描输出目录，返回已经生成结果的月份集合"""
+        completed_months = set()
+        if not self.output_dir.exists():
+            return completed_months
+
+        prefix = "cds_environment_analysis_"
+
+        def _parse_month(candidate):
+            if not candidate:
+                return None
+            try:
+                return pd.Period(candidate, freq='M')
+            except Exception:
+                pass
+            try:
+                ts = pd.to_datetime(candidate)
+                return pd.Period(ts, freq='M')
+            except Exception:
+                return None
+
+        for json_path in sorted(self.output_dir.glob("*.json")):
+            month_candidates = []
+            try:
+                with open(json_path, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                metadata = data.get("metadata", {})
+                month_meta = metadata.get("month_processed")
+                if month_meta:
+                    month_candidates.append(month_meta)
+            except Exception as exc:
+                print(f"⚠️ 无法解析已有结果 {json_path}: {exc}")
+
+            stem = json_path.stem
+            if stem.startswith(prefix):
+                month_candidates.append(stem[len(prefix):])
+
+            for candidate in month_candidates:
+                period = _parse_month(candidate)
+                if period is not None:
+                    completed_months.add(str(period))
+                    break
+
+        if completed_months:
+            print(f"📁 检测到已有 {len(completed_months)} 个已完成的月份: {sorted(completed_months)}")
+        else:
+            print("📁 未检测到已完成的月份，开始全量处理。")
+        return completed_months
+
+    def _process_track_point(self, args):
+        """Process a single track row. Extracted as a top-level method for multiprocessing pickling support."""
+        idx, track_point = args
+
+        try:
+            time_point = track_point['time']
+            tc_lat = float(track_point['lat'])
+            tc_lon = float(track_point['lon'])
+
+            total_points = getattr(self, "_current_month_total_points", None)
+            if total_points is None:
+                total_points = len(self.tracks_df)
+
+            point_idx = track_point.get('time_idx', idx)
+            if point_idx is None or (isinstance(point_idx, float) and math.isnan(point_idx)):
+                point_idx = idx
+            try:
+                point_idx = int(point_idx)
+            except (TypeError, ValueError):
+                point_idx = int(idx) if isinstance(idx, (int, np.integer)) else 0
+
+            print(
+                "🔄 处理路径点 {}/{}: {}".format(
+                    point_idx + 1,
+                    total_points,
+                    time_point.strftime('%Y-%m-%d %H:%M') if hasattr(time_point, 'strftime') else str(time_point),
+                )
+            )
+
+            systems = self.extract_environmental_systems(time_point, tc_lat, tc_lon)
+
+            return {
+                "time": time_point.isoformat() if hasattr(time_point, 'isoformat') else str(time_point),
+                "time_idx": point_idx,
+                "tc_position": {"lat": tc_lat, "lon": tc_lon},
+                "tc_intensity": {
+                    "max_wind": track_point.get('max_wind_wmo', None),
+                    "min_pressure": track_point.get('min_pressure_wmo', None),
+                },
+                "environmental_systems": systems,
+            }
+        except Exception as exc:
+            print(f"⚠️ 处理单个路径点失败: {exc}")
+            raise
 
     def process_all_tracks(self):
         """
@@ -823,8 +1773,14 @@ class CDSEnvironmentExtractor:
         print(f"🗓️ 找到 {len(unique_months)} 个需要处理的月份: {[str(m) for m in unique_months]}")
 
         saved_files = []
+        completed_months = self._detect_completed_months()
         
         for month in unique_months:
+            month_key = str(month)
+            if month_key in completed_months:
+                print(f"⏭️ {month_key} 的结果已存在，跳过该月份。")
+                continue
+
             print(f"\n{'='*25} 开始处理月份: {month} {'='*25}")
             month_tracks_df = self.tracks_df[self.tracks_df['year_month'] == month]
             start_date = month_tracks_df['time'].min().strftime('%Y-%m-%d')
@@ -843,31 +1799,20 @@ class CDSEnvironmentExtractor:
                 if self.cleanup_intermediate: self._cleanup_intermediate_files([single_file, pressure_file])
                 continue
 
-            # 定义用于并行处理的单点处理函数
-            def _process_row(args):
-                idx, track_point = args
-                time_point = track_point['time']
-                tc_lat, tc_lon = track_point['lat'], track_point['lon']
-                print(f"🔄 处理路径点 {track_point['time_idx']+1}/{len(self.tracks_df)}: {time_point.strftime('%Y-%m-%d %H:%M')}")
-                systems = self.extract_environmental_systems(time_point, tc_lat, tc_lon)
-                return {
-                    "time": time_point.isoformat(), "time_idx": int(track_point['time_idx']),
-                    "tc_position": {"lat": tc_lat, "lon": tc_lon},
-                    "tc_intensity": {"max_wind": track_point.get('max_wind_wmo', None), "min_pressure": track_point.get('min_pressure_wmo', None)},
-                    "environmental_systems": systems
-                }
-
             # 并行或串行处理当前月份的路径点
+            self._current_month_total_points = len(month_tracks_df)
             iterable = list(month_tracks_df.iterrows())
-            processed_this_month = []
-            if self.max_workers is None or self.max_workers > 1:
-                workers = self.max_workers or min(8, (os.cpu_count() or 1) + 4)
-                print(f"⚙️ 使用 {workers} 个工作线程进行并行处理...")
-                with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
-                    processed_this_month = list(ex.map(_process_row, iterable))
+            
+            if self.max_workers and self.max_workers > 1:
+                print(f"⚙️ 使用 {self.max_workers} 个进程并行处理...")
+                with concurrent.futures.ProcessPoolExecutor(max_workers=self.max_workers) as executor:
+                    processed_this_month = list(executor.map(self._process_track_point, iterable))
             else:
-                print("⚙️ 正在进行串行处理...")
-                processed_this_month = [_process_row(item) for item in iterable]
+                print("⚙️ 使用串行模式处理...")
+                processed_this_month = [self._process_track_point(item) for item in iterable]
+
+            if hasattr(self, "_current_month_total_points"):
+                delattr(self, "_current_month_total_points")
 
             # *** 新增：为当前月份创建并保存结果 ***
             if processed_this_month:
@@ -902,8 +1847,36 @@ class CDSEnvironmentExtractor:
             timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
             output_file = self.output_dir / f"cds_environment_analysis_{timestamp}.json"
         try:
+            def convert_numpy(obj):
+                if isinstance(obj, dict):
+                    return {k: convert_numpy(v) for k, v in obj.items()}
+                if isinstance(obj, list):
+                    return [convert_numpy(v) for v in obj]
+                if isinstance(obj, np.ndarray):
+                    return convert_numpy(obj.tolist())
+                if isinstance(obj, (np.float32, np.float64, np.float16)):
+                    val = float(obj)
+                    return None if not math.isfinite(val) else val
+                if isinstance(obj, (np.int32, np.int64, np.int16, np.int8)):
+                    return int(obj)
+                if isinstance(obj, np.bool_):
+                    return bool(obj)
+                return obj
+
+            def sanitize(obj):
+                if isinstance(obj, dict):
+                    return {k: sanitize(v) for k, v in obj.items()}
+                if isinstance(obj, list):
+                    return [sanitize(v) for v in obj]
+                if isinstance(obj, float):
+                    if math.isinf(obj) or math.isnan(obj):
+                        return None
+                    return obj
+                return obj
+
+            serializable = sanitize(convert_numpy(results))
             with open(output_file, 'w', encoding='utf-8') as f:
-                json.dump(results, f, indent=2, ensure_ascii=False)
+                json.dump(serializable, f, indent=2, ensure_ascii=False)
             print(f"💾 结果已保存到: {output_file}")
             print(f"📊 文件大小: {Path(output_file).stat().st_size / 1024:.1f} KB")
             return str(output_file)
@@ -933,51 +1906,76 @@ class CDSEnvironmentExtractor:
             print(f"⚠️ 清理中间文件时发生错误: {e}")
 
 
-def main():
-    """主函数"""
-    import argparse
-    is_jupyter = 'ipykernel' in sys.modules
+def run_extraction(
+    tracks_file: str = 'western_pacific_typhoons_superfast.csv',
+    output_dir: str | Path = './cds_output',
+    *,
+    max_points: int | None = None,
+    cleanup_intermediate: bool = True,
+    workers: int | None = None,
+) -> list[str]:
+    """Helper to execute the extractor programmatically (e.g., inside notebooks)."""
 
-    if is_jupyter:
-        print("🌀 检测到 Jupyter 环境，使用默认参数运行")
-        args = type('Args', (), {
-            'tracks': 'western_pacific_typhoons_superfast.csv',
-            'output': './cds_output',
-            'max_points': None,
-            'no_clean': False,
-            'workers': None
-        })()
-    else:
-        parser = argparse.ArgumentParser(description='CDS服务器环境气象系统提取器')
-        parser.add_argument('--tracks', default='western_pacific_typhoons_superfast.csv', help='台风路径CSV文件路径')
-        parser.add_argument('--output', default='./cds_output', help='输出目录')
-        parser.add_argument('--max-points', type=int, default=None, help='最大处理路径点数（用于测试）')
-        parser.add_argument('--no-clean', action='store_true', help='保留中间ERA5数据文件')
-        parser.add_argument('--workers', type=int, default=None, help='并行线程数（默认自动，1表示禁用并行）')
-        args = parser.parse_args()
+    extractor = CDSEnvironmentExtractor(
+        tracks_file,
+        output_dir,
+        cleanup_intermediate=cleanup_intermediate,
+        max_workers=workers,
+    )
+
+    if max_points:
+        print(f"🧪 测试模式: 仅处理前 {max_points} 个路径点")
+        extractor.tracks_df = extractor.tracks_df.head(max_points)
+
+    saved_file_list = extractor.process_all_tracks()
+    if not saved_file_list:
+        raise RuntimeError("❌ 处理失败，没有生成任何结果文件。")
+
+    print(f"\n✅ 处理完成！共生成 {len(saved_file_list)} 个月度结果文件:")
+    for file_path in saved_file_list:
+        print(f"  -> {file_path}")
+
+    return saved_file_list
+
+
+def main(cli_args: list[str] | None = None) -> list[str]:
+    """主函数，可同时用于命令行与Jupyter环境。"""
+    import argparse
+
+    parser = argparse.ArgumentParser(description='CDS服务器环境气象系统提取器')
+    parser.add_argument('--tracks', default='western_pacific_typhoons_superfast.csv', help='台风路径CSV文件路径')
+    parser.add_argument('--output', default='./cds_output', help='输出目录')
+    parser.add_argument('--max-points', type=int, default=None, help='最大处理路径点数（用于测试）')
+    parser.add_argument('--no-clean', action='store_true', help='保留中间ERA5数据文件')
+    parser.add_argument('--workers', type=int, default=4, help='并行线程数（1表示禁用并行）')
+
+    if cli_args is None:
+        cli_args = [] if _running_in_notebook() else sys.argv[1:]
+
+    args = parser.parse_args(cli_args)
 
     print("🌀 CDS环境气象系统提取器")
     print("=" * 50)
     print(f"📁 路径文件: {args.tracks}")
     print(f"📂 输出目录: {args.output}")
 
-    extractor = CDSEnvironmentExtractor(args.tracks, args.output, cleanup_intermediate=not args.no_clean, max_workers=args.workers)
-
-    if args.max_points:
-        print(f"🧪 测试模式: 仅处理前 {args.max_points} 个路径点")
-        extractor.tracks_df = extractor.tracks_df.head(args.max_points)
-
-    # process_all_tracks现在处理所有事情，包括保存
-    saved_file_list = extractor.process_all_tracks()
-
-    if saved_file_list:
-        print(f"\n✅ 处理完成！共生成 {len(saved_file_list)} 个月度结果文件:")
-        for file_path in saved_file_list:
-            print(f"  -> {file_path}")
-    else:
-        print("\n❌ 处理失败，没有生成任何结果文件。")
-        sys.exit(1)
+    try:
+        return run_extraction(
+            tracks_file=args.tracks,
+            output_dir=args.output,
+            max_points=args.max_points,
+            cleanup_intermediate=not args.no_clean,
+            workers=args.workers,
+        )
+    except RuntimeError as err:
+        if _running_in_notebook():
+            raise
+        print(err)
+        raise
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except RuntimeError:
+        sys.exit(1)
