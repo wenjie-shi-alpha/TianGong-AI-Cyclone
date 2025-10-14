@@ -26,6 +26,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import random
 import sys
 import textwrap
 import time
@@ -54,6 +55,114 @@ SYSTEM_NAME_LABELS: Dict[str, str] = {
     "AtmosphericStability": "大气稳定度",
     "BlockingHigh": "阻塞高压",
     "MaddenJulianOscillation": "MJO",
+}
+
+GENERATION_STRATEGIES: Dict[str, Dict[str, object]] = {
+    # === 正向样本 (70-80%) ===
+    "comprehensive": {
+        "weight": 0.30,
+        "temperature": 0.7,
+        "top_p": 0.9,
+        "sample_type": "positive",
+        "system_prompt_addition": "请进行全面综合分析，逐一评估所有模式的预报，权衡各种因素。",
+        "quality_threshold": {
+            "max_path_error_24h": 100,
+            "max_path_error_48h": 150,
+            "max_intensity_error": 10,
+        },
+    },
+    "experience": {
+        "weight": 0.20,
+        "temperature": 0.8,
+        "top_p": 0.9,
+        "sample_type": "positive",
+        "system_prompt_addition": "重点参考历史趋势和经验规律，以所有模型预报作为参考验证。",
+        "quality_threshold": {
+            "max_path_error_24h": 150,
+            "max_path_error_48h": 200,
+            "max_intensity_error": 15,
+        },
+    },
+    "model_preferred": {
+        "weight": 0.20,
+        "temperature": 0.75,
+        "top_p": 0.9,
+        "sample_type": "positive",
+        "system_prompt_addition": "主要采用表现较好的模式，但必须用其他模式进行验证和调整。",
+        "quality_threshold": {
+            "max_path_error_24h": 120,
+            "max_path_error_48h": 180,
+            "max_intensity_error": 12,
+        },
+    },
+    "physical": {
+        "weight": 0.10,
+        "temperature": 0.7,
+        "top_p": 0.9,
+        "sample_type": "positive",
+        "system_prompt_addition": "深入分析物理机制（副高、海温、风切变等），用所有模型预报验证物理分析。",
+        "quality_threshold": {
+            "max_path_error_24h": 100,
+            "max_path_error_48h": 150,
+            "max_intensity_error": 10,
+        },
+    },
+    # === 负面样本 (20-30%) ===
+    "single_model_bias": {
+        "weight": 0.08,
+        "temperature": 1.0,
+        "top_p": 0.95,
+        "sample_type": "negative",
+        "system_prompt_addition": "快速分析并给出预报，主要参考某一个模式的结果即可。",
+        "error_type": "over_reliance_single_model",
+        "feedback_template": "❌ 分析不够全面，违背了预报应综合所有模型的基本原则。应该逐一分析所有模型的预报，对比差异，综合判断。",
+        "quality_threshold": {
+            "min_path_error_24h": 200,
+            "max_path_error_24h": 400,
+            "min_path_error_48h": 250,
+            "max_path_error_48h": 500,
+        },
+    },
+    "ignore_physics": {
+        "weight": 0.06,
+        "temperature": 1.1,
+        "top_p": 0.95,
+        "sample_type": "negative",
+        "system_prompt_addition": "快速给出预报结果，不需要过多考虑物理约束和环境场影响。",
+        "error_type": "violate_physical_constraints",
+        "feedback_template": "❌ 预报违反物理规律（如在冷水区预报快速加强，或强度变化过于剧烈）。需要基于物理机制（海温、风切变等）进行合理判断。",
+        "quality_threshold": {
+            "require_physical_violation": True,
+        },
+    },
+    "poor_divergence_handling": {
+        "weight": 0.04,
+        "temperature": 1.0,
+        "top_p": 0.95,
+        "sample_type": "negative",
+        "system_prompt_addition": "当模式预报分歧较大时，可以简单平均所有模型或选择中间值。",
+        "error_type": "poor_model_divergence_handling",
+        "feedback_template": "❌ 模式分歧处理不当。当模型预报差异大时，应深入分析分歧原因（环境场配置、物理机制等），判断哪些模型更合理，而不是简单平均或随机选择。",
+        "quality_threshold": {
+            "min_path_error_24h": 150,
+            "max_path_error_24h": 300,
+            "min_path_error_48h": 200,
+            "max_path_error_48h": 400,
+        },
+    },
+    "trend_misjudgment": {
+        "weight": 0.02,
+        "temperature": 1.0,
+        "top_p": 0.95,
+        "sample_type": "negative",
+        "system_prompt_addition": "主要基于当前状态和简单外推，不需要深入分析历史趋势变化。",
+        "error_type": "historical_trend_error",
+        "feedback_template": "❌ 历史趋势分析有误，导致路径转向时机判断错误。应仔细分析过去24小时的演变规律，识别关键转折点。",
+        "quality_threshold": {
+            "min_path_error_24h": 150,
+            "max_path_error_24h": 300,
+        },
+    },
 }
 
 
@@ -389,9 +498,21 @@ def build_prompt(sample: Dict[str, object]) -> str:
     return "\n".join(sections)
 
 
+def build_prompt_with_strategy(sample: Dict[str, object], strategy_config: Dict[str, object]) -> str:
+    """Inject strategy-specific guidance into the base prompt."""
+    base_prompt = build_prompt(sample)
+    addition = str(strategy_config.get("system_prompt_addition") or "").strip()
+    if not addition:
+        return base_prompt
+    strategy_header = f"【分析策略】\n{addition}\n\n"
+    if "任务要求：" in base_prompt:
+        return base_prompt.replace("任务要求：", strategy_header + "任务要求：", 1)
+    return base_prompt + "\n\n" + strategy_header
+
+
 SYSTEM_INSTRUCTION = textwrap.dedent(
     """\
-    你是经验丰富的热带气旋预报专家，需要输出结构化、可执行的预报建议。
+    输出结构化、可执行的预报建议。
     请遵守以下原则：
     - 所有详细推理必须置于<think></think>标签内，先完成思维链再输出最终答案。
     - 严格遵循用户提示中的六步推理框架，并检验模式预报与环境系统的相互作用是否符合热带气旋动力学。
@@ -400,6 +521,16 @@ SYSTEM_INSTRUCTION = textwrap.dedent(
     - “不确定性”小节列出至少两条关键风险或情景假设。
     - 输出使用中文。"""
 )
+
+
+def select_generation_strategies(num_samples: int) -> List[str]:
+    if num_samples <= 0:
+        return []
+    strategy_names = list(GENERATION_STRATEGIES.keys())
+    if not strategy_names:
+        return []
+    weights = [float(GENERATION_STRATEGIES[name].get("weight", 1.0)) for name in strategy_names]
+    return random.choices(strategy_names, weights=weights, k=num_samples)
 
 
 @dataclass
@@ -423,7 +554,13 @@ class OpenRouterClient:
         self._extra_headers = headers or None
         self._extra_body: Dict[str, object] = {}
 
-    def chat(self, user_prompt: str) -> str:
+    def chat(
+        self,
+        user_prompt: str,
+        *,
+        temperature: Optional[float] = None,
+        top_p: Optional[float] = None,
+    ) -> str:
         messages = [
             {"role": "system", "content": SYSTEM_INSTRUCTION},
             {"role": "user", "content": user_prompt},
@@ -436,8 +573,8 @@ class OpenRouterClient:
                 completion = self.client.chat.completions.create(
                     model=self.model,
                     messages=messages,
-                    temperature=self.temperature,
-                    top_p=self.top_p,
+                    temperature=temperature if temperature is not None else self.temperature,
+                    top_p=top_p if top_p is not None else self.top_p,
                     extra_headers=self._extra_headers,
                     extra_body=self._extra_body,
                 )
@@ -478,6 +615,12 @@ def build_dataset_record(
     response: str,
     instruction: str,
     user_prompt: str,
+    *,
+    strategy_name: str,
+    strategy_config: Dict[str, object],
+    generation_index: int,
+    temperature: float,
+    top_p: float,
 ) -> Dict[str, object]:
     models: List[Dict[str, object]] = []
     for forecast in sample.get("model_forecasts") or []:
@@ -486,12 +629,26 @@ def build_dataset_record(
         model_info = forecast.get("model")
         if isinstance(model_info, dict):
             models.append(model_info)
+    strategy_meta: Dict[str, object] = {
+        "name": strategy_name,
+        "sample_type": strategy_config.get("sample_type", "unknown"),
+        "temperature": temperature,
+        "top_p": top_p,
+        "generation_index": generation_index,
+        "system_guidance": strategy_config.get("system_prompt_addition"),
+        "quality_threshold": strategy_config.get("quality_threshold"),
+    }
+    if "error_type" in strategy_config:
+        strategy_meta["error_type"] = strategy_config["error_type"]
+    if "feedback_template" in strategy_config:
+        strategy_meta["feedback_template"] = strategy_config["feedback_template"]
     metadata = {
         "storm_id": sample.get("storm_id"),
         "storm_name": sample.get("storm_name"),
         "init_time": sample.get("init_time"),
         "model_count": len(models),
         "models": models,
+        "strategy": strategy_meta,
     }
     return {
         "instruction": instruction,
@@ -520,6 +677,12 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         type=int,
         default=20,
         help="从匹配样本中选择的样本数量",
+    )
+    parser.add_argument(
+        "--samples-per-forecast",
+        type=int,
+        default=10,
+        help="为每个预报时刻生成的样本数量",
     )
     parser.add_argument(
         "--env-file",
@@ -571,6 +734,12 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         action="store_true",
         help="跳过实际API调用，输出占位文本（调试用）",
     )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=None,
+        help="随机种子（用于复现策略抽样结果）",
+    )
     return parser.parse_args(argv)
 
 
@@ -586,6 +755,9 @@ def configure_logging(verbosity: int) -> None:
 def main(argv: Optional[Sequence[str]] = None) -> None:
     args = parse_args(argv)
     configure_logging(args.verbose)
+
+    if args.seed is not None:
+        random.seed(args.seed)
 
     samples = read_samples(args.matched_file, args.limit)
     if not samples:
@@ -614,25 +786,70 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             site_title=args.site_title,
         )
 
+    total_records = 0
     with args.output.open("w", encoding="utf-8") as writer:
-        for index, sample in enumerate(samples, 1):
-            user_prompt = build_prompt(sample)
-            if args.dry_run:
-                response = f"[DRY-RUN 占位响应] 样本 {index}"
-            else:
-                try:
-                    # The client call remains the same, but now it's more reliable.
-                    response = client.chat(user_prompt)
-                except APIError as exc:
-                    logger.exception("生成样本 %s 失败，API返回错误: %s", index, exc)
-                    raise SystemExit(3) from exc
-                except Exception as exc:
-                    logger.exception("生成样本 %s 失败，发生意外错误: %s", index, exc)
-                    raise SystemExit(3) from exc
+        for sample_index, sample in enumerate(samples, 1):
+            strategy_names = select_generation_strategies(args.samples_per_forecast)
+            if not strategy_names:
+                logger.warning("未选择到任何策略，跳过样本 %s", sample_index)
+                continue
+            for generation_index, strategy_name in enumerate(strategy_names, 1):
+                strategy_config = GENERATION_STRATEGIES.get(strategy_name)
+                if not strategy_config:
+                    logger.warning(
+                        "策略 %s 未在配置中找到，跳过。", strategy_name
+                    )
+                    continue
+                user_prompt = build_prompt_with_strategy(sample, strategy_config)
+                strategy_temperature = float(strategy_config.get("temperature", args.temperature))
+                strategy_top_p = float(strategy_config.get("top_p", args.top_p))
+                if args.dry_run:
+                    response = (
+                        f"[DRY-RUN 占位响应] 样本 {sample_index} - 策略 {strategy_name} #{generation_index}"
+                    )
+                else:
+                    try:
+                        response = client.chat(
+                            user_prompt,
+                            temperature=strategy_temperature,
+                            top_p=strategy_top_p,
+                        )
+                    except APIError as exc:
+                        logger.exception(
+                            "生成样本 %s (策略 %s) 失败，API返回错误: %s",
+                            sample_index,
+                            strategy_name,
+                            exc,
+                        )
+                        raise SystemExit(3) from exc
+                    except Exception as exc:
+                        logger.exception(
+                            "生成样本 %s (策略 %s) 失败，发生意外错误: %s",
+                            sample_index,
+                            strategy_name,
+                            exc,
+                        )
+                        raise SystemExit(3) from exc
 
-            record = build_dataset_record(sample, response, instruction, user_prompt)
-            writer.write(json.dumps(record, ensure_ascii=False) + "\n")
-            logger.info("完成样本 %s/%s", index, len(samples))
+                record = build_dataset_record(
+                    sample,
+                    response,
+                    instruction,
+                    user_prompt,
+                    strategy_name=strategy_name,
+                    strategy_config=strategy_config,
+                    generation_index=generation_index,
+                    temperature=strategy_temperature,
+                    top_p=strategy_top_p,
+                )
+                writer.write(json.dumps(record, ensure_ascii=False) + "\n")
+                total_records += 1
+            logger.info(
+                "完成样本 %s/%s，累计生成 %s 条记录",
+                sample_index,
+                len(samples),
+                total_records,
+            )
 
 
 if __name__ == "__main__":

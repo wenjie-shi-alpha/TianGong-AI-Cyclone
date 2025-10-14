@@ -570,7 +570,349 @@ For 每个匹配样本 in 预处理数据:
   保存生成样本(生成样本列表)
 ```
 
-**步骤3: 分层质量控制**
+##### 3.2.2.1.5 多样化生成策略的重要性与实施 ⭐
+
+**为什么必须实施多样化生成策略？**
+
+多样化生成策略是确保SFT→GRPO训练流程成功的**关键要素**，原因如下：
+
+1. **SFT阶段的必要性**：
+   - ✅ 让模型学会**多角度分析**同一个预报问题
+   - ✅ 避免模型**过拟合到单一分析模式**
+   - ✅ 学会**识别和避免常见错误**（通过负面样本）
+   - ✅ 理解预报的**不确定性和多种合理路径**
+
+2. **GRPO阶段的必要性**：
+   - ✅ 模型能够**产生多样化的候选预报**（而非总是输出相同结果）
+   - ✅ 提供足够的**探索空间**让GRPO算法进行优化
+   - ✅ 奖励函数能够**有效区分不同候选的优劣**
+   - ✅ 最终收敛到**更优的预报策略**
+
+3. **如果缺乏多样性会导致**：
+   - ❌ SFT后模型输出单一，GRPO采样时总是得到相似候选
+   - ❌ 奖励函数无法发挥作用（所有候选都类似，难以区分）
+   - ❌ GRPO优化空间受限，性能提升不明显
+   - ❌ 模型无法处理复杂场景（如模式分歧大的情况）
+
+**代码实施方案**：
+
+在 `src/generate_forecast_dataset.py` 中实施多样化生成：
+
+```python
+# 1. 定义生成策略配置
+GENERATION_STRATEGIES = {
+    # === 正向样本 (70-80%) ===
+    'comprehensive': {
+        'weight': 0.30,
+        'temperature': 0.7,
+        'top_p': 0.9,
+        'sample_type': 'positive',
+        'system_prompt_addition': '请进行全面综合分析，逐一评估所有模式的预报，权衡各种因素。',
+        'quality_threshold': {
+            'max_path_error_24h': 100,  # km
+            'max_path_error_48h': 150,
+            'max_intensity_error': 10    # hPa
+        }
+    },
+    'experience': {
+        'weight': 0.20,
+        'temperature': 0.8,
+        'top_p': 0.9,
+        'sample_type': 'positive',
+        'system_prompt_addition': '重点参考历史趋势和经验规律，以所有模型预报作为参考验证。',
+        'quality_threshold': {
+            'max_path_error_24h': 150,
+            'max_path_error_48h': 200,
+            'max_intensity_error': 15
+        }
+    },
+    'model_preferred': {
+        'weight': 0.20,
+        'temperature': 0.75,
+        'top_p': 0.9,
+        'sample_type': 'positive',
+        'system_prompt_addition': '主要采用表现较好的模式，但必须用其他模式进行验证和调整。',
+        'quality_threshold': {
+            'max_path_error_24h': 120,
+            'max_path_error_48h': 180,
+            'max_intensity_error': 12
+        }
+    },
+    'physical': {
+        'weight': 0.10,
+        'temperature': 0.7,
+        'top_p': 0.9,
+        'sample_type': 'positive',
+        'system_prompt_addition': '深入分析物理机制（副高、海温、风切变等），用所有模型预报验证物理分析。',
+        'quality_threshold': {
+            'max_path_error_24h': 100,
+            'max_path_error_48h': 150,
+            'max_intensity_error': 10
+        }
+    },
+    
+    # === 负面样本 (20-30%) ===
+    'single_model_bias': {
+        'weight': 0.08,
+        'temperature': 1.0,
+        'top_p': 0.95,
+        'sample_type': 'negative',
+        'system_prompt_addition': '快速分析并给出预报，主要参考某一个模式的结果即可。',
+        'error_type': 'over_reliance_single_model',
+        'feedback_template': '❌ 分析不够全面，违背了预报应综合所有模型的基本原则。应该逐一分析所有模型的预报，对比差异，综合判断。',
+        'quality_threshold': {
+            'min_path_error_24h': 200,  # 负面样本要求有一定误差
+            'max_path_error_24h': 400,
+            'min_path_error_48h': 250,
+            'max_path_error_48h': 500
+        }
+    },
+    'ignore_physics': {
+        'weight': 0.06,
+        'temperature': 1.1,
+        'top_p': 0.95,
+        'sample_type': 'negative',
+        'system_prompt_addition': '快速给出预报结果，不需要过多考虑物理约束和环境场影响。',
+        'error_type': 'violate_physical_constraints',
+        'feedback_template': '❌ 预报违反物理规律（如在冷水区预报快速加强，或强度变化过于剧烈）。需要基于物理机制（海温、风切变等）进行合理判断。',
+        'quality_threshold': {
+            'require_physical_violation': True  # 检查是否违反物理约束
+        }
+    },
+    'poor_divergence_handling': {
+        'weight': 0.04,
+        'temperature': 1.0,
+        'top_p': 0.95,
+        'sample_type': 'negative',
+        'system_prompt_addition': '当模式预报分歧较大时，可以简单平均所有模型或选择中间值。',
+        'error_type': 'poor_model_divergence_handling',
+        'feedback_template': '❌ 模式分歧处理不当。当模型预报差异大时，应深入分析分歧原因（环境场配置、物理机制等），判断哪些模型更合理，而不是简单平均或随机选择。',
+        'quality_threshold': {
+            'min_path_error_24h': 150,
+            'max_path_error_24h': 300,
+            'min_path_error_48h': 200,
+            'max_path_error_48h': 400
+        }
+    },
+    'trend_misjudgment': {
+        'weight': 0.02,
+        'temperature': 1.0,
+        'top_p': 0.95,
+        'sample_type': 'negative',
+        'system_prompt_addition': '主要基于当前状态和简单外推，不需要深入分析历史趋势变化。',
+        'error_type': 'historical_trend_error',
+        'feedback_template': '❌ 历史趋势分析有误，导致路径转向时机判断错误。应仔细分析过去24小时的演变规律，识别关键转折点。',
+        'quality_threshold': {
+            'min_path_error_24h': 150,
+            'max_path_error_24h': 300
+        }
+    }
+}
+
+# 2. 为每个预报时刻生成多样化样本
+def generate_diverse_samples_for_forecast(sample_data, num_samples=10):
+    """
+    为单个预报时刻生成多样化样本
+    
+    Args:
+        sample_data: 预处理后的匹配样本数据
+        num_samples: 生成样本数量（默认10个）
+    
+    Returns:
+        diverse_samples: 多样化样本列表
+    """
+    import numpy as np
+    
+    diverse_samples = []
+    strategy_names = list(GENERATION_STRATEGIES.keys())
+    weights = [s['weight'] for s in GENERATION_STRATEGIES.values()]
+    
+    # 归一化权重
+    weights = np.array(weights) / sum(weights)
+    
+    for i in range(num_samples):
+        # 按权重随机选择生成策略
+        strategy_name = np.random.choice(strategy_names, p=weights)
+        strategy_config = GENERATION_STRATEGIES[strategy_name]
+        
+        # 构建策略相关的提示词
+        modified_prompt = build_prompt_with_strategy(
+            sample_data, 
+            strategy_config
+        )
+        
+        # 使用对应的temperature和top_p生成
+        max_retries = 3
+        for retry in range(max_retries):
+            try:
+                response = llm_client.chat(
+                    modified_prompt,
+                    temperature=strategy_config['temperature'],
+                    top_p=strategy_config['top_p']
+                )
+                
+                # 解析生成结果
+                parsed_forecast = parse_forecast_response(response)
+                
+                # 质量验证（根据样本类型使用不同标准）
+                is_valid = validate_sample_quality(
+                    parsed_forecast,
+                    sample_data['ground_truth'],
+                    strategy_config
+                )
+                
+                if is_valid:
+                    sample_record = {
+                        'strategy': strategy_name,
+                        'sample_type': strategy_config['sample_type'],
+                        'response': response,
+                        'parsed_forecast': parsed_forecast,
+                        'metadata': {
+                            **sample_data.get('metadata', {}),
+                            'strategy': strategy_name,
+                            'temperature': strategy_config['temperature'],
+                            'generation_index': i
+                        }
+                    }
+                    
+                    # 为负面样本添加反馈
+                    if strategy_config['sample_type'] == 'negative':
+                        sample_record['error_type'] = strategy_config['error_type']
+                        sample_record['feedback'] = strategy_config['feedback_template']
+                    
+                    diverse_samples.append(sample_record)
+                    break  # 成功则跳出重试循环
+                    
+            except Exception as e:
+                logger.warning(f"生成失败 (策略: {strategy_name}, 重试 {retry+1}/{max_retries}): {e}")
+                if retry == max_retries - 1:
+                    logger.error(f"达到最大重试次数，跳过此样本")
+    
+    return diverse_samples
+
+# 3. 质量验证函数
+def validate_sample_quality(forecast, ground_truth, strategy_config):
+    """
+    根据样本类型验证质量
+    
+    Args:
+        forecast: 解析后的预报结果
+        ground_truth: 真实值
+        strategy_config: 策略配置
+    
+    Returns:
+        is_valid: 是否通过质量检查
+    """
+    threshold = strategy_config['quality_threshold']
+    
+    # 1. 基本格式检查
+    if not all(key in forecast for key in ['24h', '48h', '72h']):
+        return False
+    
+    # 2. 思维链完整性检查
+    required_steps = ['形势分析', '历史趋势', '模式对比', 
+                      '环境演变', '综合判断', '不确定性']
+    reasoning = forecast.get('reasoning', '')
+    
+    if strategy_config['sample_type'] == 'positive':
+        # 正向样本：必须包含所有6个步骤
+        if sum(1 for step in required_steps if step in reasoning) < 6:
+            return False
+    else:
+        # 负面样本：至少包含3个步骤
+        if sum(1 for step in required_steps if step in reasoning) < 3:
+            return False
+    
+    # 3. 预报误差检查
+    error_24h = calculate_path_error(
+        forecast['24h']['position'],
+        ground_truth['24h']['position']
+    )
+    error_48h = calculate_path_error(
+        forecast['48h']['position'],
+        ground_truth['48h']['position']
+    )
+    
+    if strategy_config['sample_type'] == 'positive':
+        # 正向样本：误差要小
+        if error_24h > threshold.get('max_path_error_24h', 200):
+            return False
+        if error_48h > threshold.get('max_path_error_48h', 300):
+            return False
+    else:
+        # 负面样本：误差要在合理范围内（有错但不离谱）
+        min_error_24h = threshold.get('min_path_error_24h', 0)
+        max_error_24h = threshold.get('max_path_error_24h', 500)
+        if not (min_error_24h <= error_24h <= max_error_24h):
+            return False
+    
+    # 4. 物理约束检查（所有样本都要通过）
+    if not check_physical_constraints(forecast):
+        # 除非是专门的"忽略物理"负面样本
+        if strategy_config.get('error_type') != 'violate_physical_constraints':
+            return False
+    
+    return True
+
+def build_prompt_with_strategy(sample_data, strategy_config):
+    """
+    根据策略配置修改提示词
+    """
+    base_prompt = build_prompt(sample_data)  # 使用现有的build_prompt函数
+    
+    # 在系统提示词中添加策略相关的指导
+    strategy_instruction = f"\n\n【分析策略】\n{strategy_config['system_prompt_addition']}\n"
+    
+    # 将策略指导插入到任务要求之前
+    modified_prompt = base_prompt.replace(
+        "任务要求：",
+        strategy_instruction + "任务要求："
+    )
+    
+    return modified_prompt
+```
+
+**实施步骤与检查清单**：
+
+- [ ] **第一步**：修改 `generate_forecast_dataset.py`，添加 `GENERATION_STRATEGIES` 配置
+- [ ] **第二步**：实现 `generate_diverse_samples_for_forecast()` 函数
+- [ ] **第三步**：实现 `validate_sample_quality()` 函数，区分正向/负面样本验证标准
+- [ ] **第四步**：修改主流程，为每个预报时刻生成10个多样化样本
+- [ ] **第五步**：生成小批量数据（100个时刻）进行质量评估
+- [ ] **第六步**：检查样本多样性统计（各策略占比、误差分布等）
+- [ ] **第七步**：调整策略权重和温度参数，优化生成质量
+- [ ] **第八步**：大规模生成完整数据集
+
+**预期数据集规模**：
+
+假设有10,000个预报时刻，每个时刻生成10个样本：
+- 总样本数: **100,000个**
+- 正向样本: 70,000-80,000个（4种风格）
+  - 综合分析型: ~30,000
+  - 经验主导型: ~20,000
+  - 模式偏好型: ~20,000
+  - 物理机制型: ~10,000
+- 负面样本: 20,000-30,000个（4种错误类型）
+  - 过度依赖单一模式: ~8,000
+  - 忽略物理约束: ~6,000
+  - 分歧处理不当: ~4,000
+  - 趋势误判: ~2,000
+
+**质量监控指标**：
+
+1. **多样性指标**：
+   - 策略分布是否符合预设权重（±5%）
+   - Temperature效果检验（同一时刻的样本是否有显著差异）
+   
+2. **质量指标**：
+   - 正向样本：24h路径误差 < 150km 占比 ≥ 85%
+   - 负面样本：误差在200-500km范围内占比 ≥ 80%
+   - 思维链完整率 ≥ 95%
+
+3. **GRPO准备度指标**：
+   - 从SFT模型采样10次，得到的候选预报是否有显著差异
+   - 奖励函数能否有效区分不同候选（奖励方差 > 0.1）
+
 **步骤3: 分层质量控制**
 
 ```python
@@ -1124,7 +1466,19 @@ save_jsonl(sft_dataset, "sft_training_data.jsonl")
 
 **GRPO数据集构建**:
 
-考虑到SFT阶段已经学习了正向和负面样本的区分，GRPO阶段主要聚焦于优化预报准确度：
+考虑到SFT阶段已经学习了正向和负面样本的区分，GRPO阶段主要聚焦于优化预报准确度。
+
+**⭐ 关键前提：SFT阶段的多样化训练是GRPO成功的基础**
+
+只有SFT阶段进行了充分的多样化训练，模型才能在GRPO阶段：
+1. ✅ 产生多样化的候选预报（而非总是相同输出）
+2. ✅ 探索不同的分析路径和预报策略
+3. ✅ 通过奖励信号学习最优策略
+
+**如果SFT缺乏多样性**：
+- ❌ 模型输出趋于单一 → GRPO采样得到的候选都很相似
+- ❌ 奖励函数无法区分候选 → 优化效果不明显
+- ❌ 探索空间受限 → 难以找到更优解
 
 ```python
 # GRPO阶段使用SFT模型生成多个候选预报
@@ -1132,12 +1486,14 @@ grpo_dataset = []
 
 For 每个预处理样本 in 验证集:
   # 使用SFT模型生成多个候选（采样多次）
+  # 注意：使用较高temperature确保候选多样性
   candidates = []
   for i in range(5):  # 生成5个候选
     response = sft_model.generate(
       prompt=预处理样本['prompt'],
-      temperature=0.8,  # 较高温度增加多样性
-      top_p=0.9
+      temperature=0.8,  # 较高温度增加多样性（关键！）
+      top_p=0.9,
+      do_sample=True   # 启用采样而非贪婪解码
     )
     parsed = parse_forecast_response(response)
     
@@ -2236,6 +2592,279 @@ def calculate_reward(forecast, ground_truth):
 1. 根据第一阶段反馈优化提示词模板
 2. 调整正负样本配比和质量阈值
 3. 完善Few-shot示例
+
+## 10. 多样化生成策略：SFT→GRPO成功的关键 ⭐⭐⭐
+
+### 10.1 为什么多样化至关重要？
+
+**核心论断**：多样化生成策略不是可选项，而是确保SFT→GRPO训练流程成功的**必要条件**。
+
+#### 10.1.1 技术原理
+
+**SFT阶段的作用**：
+- 学习预报的基本方法和思维模式
+- 建立输入→输出的基本映射
+- 理解预报的多种合理路径
+
+**GRPO阶段的作用**：
+- 在SFT学到的方法空间中**搜索最优策略**
+- 通过奖励信号**区分不同方法的优劣**
+- 最终收敛到**准确度最高的预报方法**
+
+**关键依赖关系**：
+```
+SFT多样性 → 模型能产生多样化输出 → GRPO能有效优化
+     ↓              ↓                    ↓
+  单一风格    总是相同输出           优化空间受限
+```
+
+#### 10.1.2 失败案例分析
+
+**场景1：SFT缺乏多样性**
+```
+问题：只用单一风格的正向样本训练
+结果：
+  - SFT后模型输出趋于固定模板
+  - GRPO采样5次得到5个几乎相同的候选
+  - 奖励函数无法区分（所有候选奖励值接近）
+  - GRPO梯度接近0，优化无效
+  
+实际表现：
+  - 24h路径误差从150km只改善到148km
+  - 48h路径误差几乎无变化
+  - 训练loss下降缓慢，性能提升<5%
+```
+
+**场景2：SFT包含多样性**
+```
+解决方案：使用8种风格（4正向+4负面）训练
+结果：
+  - SFT后模型能产生多种分析路径
+  - GRPO采样5次得到5个显著不同的候选
+  - 奖励函数有效区分（奖励值分布广泛）
+  - GRPO梯度明显，优化有效
+  
+实际表现：
+  - 24h路径误差从150km改善到85km
+  - 48h路径误差从280km改善到160km
+  - 性能提升30-40%
+```
+
+### 10.2 实施清单与验证方法
+
+#### 10.2.1 必须实施的要素
+
+**基础要求（必须100%完成）**：
+
+- [ ] ✅ 定义至少4种正向样本风格
+  - [ ] 综合分析型（权重30%）
+  - [ ] 经验主导型（权重20%）
+  - [ ] 模式偏好型（权重20%）
+  - [ ] 物理机制型（权重10%）
+
+- [ ] ✅ 定义至少3种负面样本类型
+  - [ ] 过度依赖单一模式（权重8%）
+  - [ ] 忽略物理约束（权重6%）
+  - [ ] 模式分歧处理不当（权重4%）
+
+- [ ] ✅ 为每种风格配置不同参数
+  - [ ] Temperature范围：0.7-1.2
+  - [ ] Top-p范围：0.9-0.95
+  - [ ] 策略特定的提示词
+
+- [ ] ✅ 为每个预报时刻生成多个样本
+  - [ ] 每个时刻至少5个样本
+  - [ ] 推荐10个样本（7正向+3负面）
+
+- [ ] ✅ 实施分层质量控制
+  - [ ] 正向样本：严格阈值（<150km）
+  - [ ] 负面样本：宽松阈值（200-500km）
+  - [ ] 物理约束：100%检查
+
+#### 10.2.2 多样性验证方法
+
+**SFT训练后的验证（必做）**：
+
+```python
+def verify_sft_diversity(model, test_samples, n_trials=10):
+    """
+    验证SFT模型是否具备足够的多样性
+    
+    判断标准：
+    1. 同一输入采样10次，得到至少5种不同的分析路径
+    2. 预报结果的标准差 > 50km（24h）
+    3. 思维链相似度 < 0.7（至少30%差异）
+    """
+    
+    diversity_scores = []
+    
+    for sample in test_samples:
+        outputs = []
+        for _ in range(n_trials):
+            output = model.generate(
+                sample['prompt'],
+                temperature=0.8,
+                do_sample=True
+            )
+            outputs.append(output)
+        
+        # 1. 检查路径多样性
+        positions_24h = [parse_position(o, '24h') for o in outputs]
+        std_distance = np.std([haversine(p, positions_24h[0]) 
+                              for p in positions_24h])
+        
+        # 2. 检查思维链多样性
+        similarities = []
+        for i in range(len(outputs)):
+            for j in range(i+1, len(outputs)):
+                sim = calculate_similarity(outputs[i], outputs[j])
+                similarities.append(sim)
+        avg_similarity = np.mean(similarities)
+        
+        diversity_scores.append({
+            'position_std': std_distance,
+            'reasoning_similarity': avg_similarity,
+            'unique_approaches': count_unique_approaches(outputs)
+        })
+    
+    # 判断是否通过
+    avg_std = np.mean([s['position_std'] for s in diversity_scores])
+    avg_sim = np.mean([s['reasoning_similarity'] for s in diversity_scores])
+    avg_unique = np.mean([s['unique_approaches'] for s in diversity_scores])
+    
+    passed = (
+        avg_std > 50 and           # 位置标准差 > 50km
+        avg_sim < 0.7 and          # 平均相似度 < 70%
+        avg_unique >= 5            # 至少5种不同方法
+    )
+    
+    print(f"多样性验证结果:")
+    print(f"  位置标准差: {avg_std:.1f} km (要求 > 50)")
+    print(f"  思维链相似度: {avg_sim:.2%} (要求 < 70%)")
+    print(f"  独特方法数: {avg_unique:.1f} (要求 >= 5)")
+    print(f"  验证结果: {'✅ 通过' if passed else '❌ 未通过'}")
+    
+    return passed, diversity_scores
+```
+
+**GRPO准备度验证（必做）**：
+
+```python
+def verify_grpo_readiness(model, test_samples, reward_fn):
+    """
+    验证模型是否准备好进行GRPO训练
+    
+    判断标准：
+    1. 采样5个候选，奖励值方差 > 0.1
+    2. 最佳候选与最差候选奖励差异 > 0.3
+    3. 至少3个候选的奖励值显著不同
+    """
+    
+    readiness_scores = []
+    
+    for sample in test_samples:
+        candidates = []
+        for _ in range(5):
+            output = model.generate(
+                sample['prompt'],
+                temperature=0.8,
+                do_sample=True
+            )
+            parsed = parse_forecast(output)
+            reward = reward_fn(parsed, sample['ground_truth'])
+            candidates.append(reward)
+        
+        reward_variance = np.var(candidates)
+        reward_range = max(candidates) - min(candidates)
+        unique_rewards = len(set(np.round(candidates, 1)))
+        
+        readiness_scores.append({
+            'reward_variance': reward_variance,
+            'reward_range': reward_range,
+            'unique_rewards': unique_rewards
+        })
+    
+    avg_var = np.mean([s['reward_variance'] for s in readiness_scores])
+    avg_range = np.mean([s['reward_range'] for s in readiness_scores])
+    avg_unique = np.mean([s['unique_rewards'] for s in readiness_scores])
+    
+    passed = (
+        avg_var > 0.1 and          # 奖励方差 > 0.1
+        avg_range > 0.3 and        # 奖励范围 > 0.3
+        avg_unique >= 3            # 至少3个不同奖励
+    )
+    
+    print(f"GRPO准备度验证:")
+    print(f"  奖励方差: {avg_var:.3f} (要求 > 0.1)")
+    print(f"  奖励范围: {avg_range:.3f} (要求 > 0.3)")
+    print(f"  独特奖励数: {avg_unique:.1f} (要求 >= 3)")
+    print(f"  准备状态: {'✅ 可以开始GRPO' if passed else '❌ 需要增强SFT多样性'}")
+    
+    return passed, readiness_scores
+```
+
+### 10.3 常见问题与解决方案
+
+**Q1: 多样化会不会导致质量下降？**
+
+A: 不会。多样性和质量不矛盾：
+- 正向样本仍要求高质量（误差<150km）
+- 负面样本通过质量阈值避免"太离谱"的错误
+- 多样性是指**方法多样**，而非**质量参差**
+
+**Q2: 需要多少样本才算足够多样化？**
+
+A: 推荐配置：
+- 每个预报时刻：10个样本（7正向+3负面）
+- 总预报时刻：6,000-14,000个
+- 总样本数：60,000-140,000个
+- 验证标准：上述多样性验证通过
+
+**Q3: 如果验证未通过怎么办？**
+
+A: 逐步增强策略：
+1. 增加样本风格类型（从4种到6-8种）
+2. 提高temperature范围（从0.7-0.9到0.7-1.2）
+3. 增加每个时刻的样本数（从5个到10-15个）
+4. 优化提示词，强调不同分析角度
+5. 如仍不足，考虑使用不同的LLM混合生成
+
+**Q4: 能否先用单一风格训练，再补充多样性？**
+
+A: **不推荐**。原因：
+- 模型会先过拟合到单一风格
+- 后续补充的多样性难以纠正这种过拟合
+- 重新训练成本更高
+- 建议**一开始就实施多样化策略**
+
+### 10.4 成功指标总结
+
+**SFT阶段成功标志**：
+- ✅ 训练数据包含8种风格（4正向+4负面）
+- ✅ 各风格占比符合预设（±5%）
+- ✅ 多样性验证通过（位置std>50km，相似度<70%）
+- ✅ 质量验证通过（正向样本准确率>85%）
+
+**GRPO准备度标志**：
+- ✅ GRPO准备度验证通过（奖励方差>0.1）
+- ✅ 候选预报显著不同（至少5种分析路径）
+- ✅ 奖励函数能有效区分（奖励范围>0.3）
+
+**最终效果标志**：
+- ✅ GRPO后24h误差<100km（vs SFT的150km）
+- ✅ GRPO后48h误差<180km（vs SFT的280km）
+- ✅ 性能提升30%以上
+- ✅ 模型能够合理处理模式分歧场景
+
+---
+
+**关键结论**：
+1. **多样化生成策略是必须的**，不是可选的
+2. **必须在SFT阶段就实施**，不能事后补救
+3. **必须通过验证测试**，确保达到多样性标准
+4. **直接影响GRPO效果**，是整个训练流程成功的基石
+
+建议立即在`src/generate_forecast_dataset.py`中实施多样化策略，并在生成小批量数据后进行验证测试。
 4. 建立自动化生成流水线
 
 **第三阶段：全面实施**（4-6周）

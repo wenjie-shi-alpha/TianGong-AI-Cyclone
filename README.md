@@ -123,3 +123,8 @@ These confirm the skip logic is functioning.
 - 传入 `--concise-log` 可切换到精简模式，只保留必要的摘要统计；处理流程仍会在失败时输出错误信息。
 - 当启用多进程(`--processes > 1`)时，每个 NC 文件的详细日志会写入 `final_single_output/logs/<nc文件名>.log`；若启用 `--concise-log`，则不再生成这些详细日志以减少写入开销。
 - 示例：`python3 src/extractSyst.py --csv output/nc_file_urls.csv --processes 4 --auto --concise-log`
+
+## 生成预报样本
+```bash
+python3 src/generate_forecast_dataset.py --limit 3 --samples-per-forecast 3
+```
