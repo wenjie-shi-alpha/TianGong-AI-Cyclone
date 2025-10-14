@@ -1,8 +1,11 @@
-"""Utility for extracting distance-independent fields from TC environment JSON outputs.
+"""Filter TC environment outputs to keep only the trusted, distance-independent data.
 
-The processed payload keeps descriptive information (location cues, textual shape
-descriptions, intensity) while dropping area/perimeter style metrics that depend on
-distance calculations. Results are written to the processed output directory.
+The specification in ``spec.md`` identifies which parts of the JSON payloads are
+reliable (system identity, position, intensity, steering flow, qualitative shape
+descriptions, and raw coordinates) and which parts must be discarded (any distance-
+based magnitudes such as area or perimeter). This module prunes the untrusted fields
+and writes curated JSON files for both the deterministic ``final_single_output`` data
+and the monthly ``cds_output`` data.
 """
 
 from __future__ import annotations
@@ -10,15 +13,15 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
-from typing import Any, Dict, Iterable, Optional
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
+DEFAULT_FINAL_INPUT_DIR = Path("data/final_single_output")
+DEFAULT_FINAL_OUTPUT_DIR = Path("data/final_single_output_trusted")
+DEFAULT_CDS_INPUT_DIR = Path("data/cds_output")
+DEFAULT_CDS_OUTPUT_DIR = Path("data/cds_output_trusted")
+DEFAULT_SINGLE_OUTPUT_SUFFIX = "_trusted"
 
-DEFAULT_INPUT_DIR = Path("data/final_single_output")
-DEFAULT_OUTPUT_DIR = Path("data/final_single_output_processed")
-
-# Keys whose names imply reliance on distance/area style metrics. These will be pruned
-# from nested dictionaries to avoid surfacing unreliable magnitudes.
-_DISTANCE_KEY_MARKERS: tuple[str, ...] = (
+_UNTRUSTED_KEY_MARKERS: Tuple[str, ...] = (
     "distance",
     "area",
     "perimeter",
@@ -27,149 +30,268 @@ _DISTANCE_KEY_MARKERS: tuple[str, ...] = (
     "axis",
     "span",
     "km",
+    "ratio",
     "core_ratio",
     "middle_ratio",
     "approx",
 )
 
+_UNTRUSTED_STRING_MARKERS_LOWER = ("km",)
+_UNTRUSTED_STRING_MARKERS_LITERAL = ("公里", "千米")
+
+_POSITION_DROP_KEYS = {"bearing_deg"}
+
+_SHAPE_TEXT_KEYS = (
+    "description",
+    "shape_type",
+    "orientation",
+    "complexity",
+    "warm_region_shape",
+    "warm_region_orientation",
+)
+
+_COORDINATE_PATHS: Tuple[Tuple[str, ...], ...] = (
+    ("coordinates", "vertices"),
+    ("coordinates",),
+    ("coordinate_details", "main_contour_coords"),
+    ("coordinate_details", "polygon"),
+    ("coordinate_details", "polygon_features", "polygon"),
+    ("detailed_analysis", "contour_analysis", "simplified_coordinates"),
+    ("detailed_analysis", "contour_analysis", "polygon_features", "polygon"),
+    ("warm_water_boundary_26.5C",),
+    ("warm_water_boundary",),
+)
+
 
 def _should_drop_key(key: str) -> bool:
     key_lower = key.lower()
-    return any(marker in key_lower for marker in _DISTANCE_KEY_MARKERS)
+    return any(marker in key_lower for marker in _UNTRUSTED_KEY_MARKERS)
 
 
-def _compress_coordinates(coords: list[Any], max_pairs: Optional[int] = None) -> Optional[str]:
-    """Convert coordinate arrays to a compact string representation."""
+def _string_contains_untrusted_units(value: str) -> bool:
+    value_lower = value.lower()
+    if any(marker in value_lower for marker in _UNTRUSTED_STRING_MARKERS_LOWER):
+        return True
+    return any(marker in value for marker in _UNTRUSTED_STRING_MARKERS_LITERAL)
 
-    if not isinstance(coords, list) or not coords:
+
+def sanitize_value(value: Any, drop_keys: Optional[Iterable[str]] = None) -> Any:
+    drop_key_set = set(drop_keys or ())
+
+    def _sanitize(obj: Any) -> Any:
+        if isinstance(obj, dict):
+            cleaned: Dict[str, Any] = {}
+            for key, raw in obj.items():
+                if key in drop_key_set or _should_drop_key(key):
+                    continue
+                nested = _sanitize(raw)
+                if nested is not None:
+                    cleaned[key] = nested
+            return cleaned or None
+
+        if isinstance(obj, list):
+            cleaned_list: List[Any] = []
+            for item in obj:
+                nested = _sanitize(item)
+                if nested is not None:
+                    cleaned_list.append(nested)
+            return cleaned_list or None
+
+        if isinstance(obj, str):
+            return None if _string_contains_untrusted_units(obj) else obj
+
+        if isinstance(obj, (int, float, bool)):
+            return obj
+
         return None
 
-    pairs: list[str] = []
-    iterable = coords[: max_pairs] if isinstance(max_pairs, int) and max_pairs > 0 else coords
-    for item in iterable:
-        if isinstance(item, (list, tuple)) and len(item) >= 2:
-            lat, lon = item[0], item[1]
-            try:
-                pairs.append(f"({float(lat):.2f},{float(lon):.2f})")
-            except (TypeError, ValueError):
-                continue
-
-    if not pairs:
-        return None
-
-    serialized = ";".join(pairs)
-    if len(iterable) < len(coords):
-        serialized += ";..."
-    return serialized
+    return _sanitize(value)
 
 
-def _filter_mapping(data: Dict[str, Any]) -> Dict[str, Any]:
-    """Recursively remove keys whose names indicate distance-based quantities."""
-
-    cleaned: Dict[str, Any] = {}
-    for key, value in data.items():
-        if _should_drop_key(key):
-            continue
-
-        if isinstance(value, dict):
-            nested = _filter_mapping(value)
-            if nested:
-                cleaned[key] = nested
-        elif isinstance(value, list):
-            # Preserve lists that contain non-numeric descriptive content.
-            filtered_list = []
-            for item in value:
-                if isinstance(item, dict):
-                    nested = _filter_mapping(item)
-                    if nested:
-                        filtered_list.append(nested)
-                else:
-                    filtered_list.append(item)
-            if filtered_list:
-                cleaned[key] = filtered_list
+def _dig(data: Any, path: Sequence[str]) -> Any:
+    current = data
+    for key in path:
+        if isinstance(current, dict):
+            current = current.get(key)
         else:
-            cleaned[key] = value
+            return None
+    return current
 
-    return cleaned
+
+def _normalize_coordinate_payload(value: Any) -> Any:
+    sanitized = sanitize_value(value)
+    if sanitized is None:
+        return None
+
+    if isinstance(sanitized, dict):
+        if "vertices" in sanitized:
+            return _normalize_coordinate_payload(sanitized["vertices"])
+        if "polygon" in sanitized:
+            return _normalize_coordinate_payload(sanitized["polygon"])
+        if "main_contour_coords" in sanitized:
+            return _normalize_coordinate_payload(sanitized["main_contour_coords"])
+        if "simplified_coordinates" in sanitized:
+            return _normalize_coordinate_payload(sanitized["simplified_coordinates"])
+        if {"lat", "lon"}.issubset(sanitized.keys()):
+            lat = sanitized.get("lat")
+            lon = sanitized.get("lon")
+            if isinstance(lat, (int, float)) and isinstance(lon, (int, float)):
+                return {"lat": lat, "lon": lon}
+        return sanitized or None
+
+    if isinstance(sanitized, list):
+        normalized: List[Any] = []
+        for item in sanitized:
+            norm = _normalize_coordinate_payload(item)
+            if norm is not None:
+                normalized.append(norm)
+        return normalized or None
+
+    if isinstance(sanitized, (int, float)):
+        return sanitized
+
+    return None
 
 
-def _build_shape_summary(shape: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+def _find_boundary_coordinates(shape: Dict[str, Any]) -> Any:
+    for path in _COORDINATE_PATHS:
+        raw = _dig(shape, path)
+        coords = _normalize_coordinate_payload(raw)
+        if coords:
+            return coords
+    return None
+
+
+def clean_shape(shape: Any) -> Optional[Dict[str, Any]]:
     if not isinstance(shape, dict):
         return None
 
-    summary: Dict[str, Any] = {}
+    cleaned: Dict[str, Any] = {}
 
-    for key in ("description", "shape_type", "orientation", "complexity"):
+    for key in _SHAPE_TEXT_KEYS:
         value = shape.get(key)
+        if isinstance(value, str) and value and not _string_contains_untrusted_units(value):
+            cleaned[key] = value
+
+    vector_coords = sanitize_value(shape.get("vector_coordinates"))
+    if vector_coords:
+        cleaned["vector_coordinates"] = vector_coords
+
+    boundary = _find_boundary_coordinates(shape)
+    if boundary:
+        cleaned["boundary_coordinates"] = boundary
+
+    return cleaned or None
+
+
+def process_system(system: Any) -> Optional[Dict[str, Any]]:
+    if not isinstance(system, dict):
+        return None
+
+    cleaned: Dict[str, Any] = {}
+    for field in ("system_name", "system_type", "description", "category"):
+        value = system.get(field)
         if isinstance(value, str) and value:
-            summary[key] = value
+            cleaned[field] = value
 
-    detailed = shape.get("detailed_analysis")
-    if isinstance(detailed, dict):
-        basic = detailed.get("basic_geometry")
-        if isinstance(basic, dict):
-            desc = basic.get("description")
-            if isinstance(desc, str) and desc:
-                summary.setdefault("shape_type", desc)
+    position = sanitize_value(system.get("position"), drop_keys=_POSITION_DROP_KEYS)
+    if position:
+        cleaned["position"] = position
 
-        orientation = detailed.get("orientation")
-        if isinstance(orientation, dict):
-            orient_desc = orientation.get("description")
-            if isinstance(orient_desc, str) and orient_desc:
-                summary.setdefault("orientation_details", orient_desc)
+    intensity = sanitize_value(system.get("intensity"))
+    if intensity:
+        cleaned["intensity"] = intensity
 
-        complexity = detailed.get("shape_complexity")
-        if isinstance(complexity, dict):
-            complexity_desc = complexity.get("description")
-            if isinstance(complexity_desc, str) and complexity_desc:
-                summary.setdefault("complexity_details", complexity_desc)
+    properties = sanitize_value(system.get("properties"))
+    if properties:
+        cleaned["properties"] = properties
 
-        contour = detailed.get("contour_analysis")
-        if isinstance(contour, dict):
-            coords = contour.get("simplified_coordinates")
-            coords_str = _compress_coordinates(coords)
-            if coords_str:
-                summary.setdefault("boundary_coords", coords_str)
+    metrics = sanitize_value(system.get("metrics"))
+    if metrics:
+        cleaned["metrics"] = metrics
 
-    return summary or None
+    shape = clean_shape(system.get("shape"))
+    if shape:
+        cleaned["shape"] = shape
+
+    if not cleaned:
+        return None
+    return cleaned
 
 
-def _process_system(system: Dict[str, Any]) -> Dict[str, Any]:
-    result: Dict[str, Any] = {
-        key: system[key]
-        for key in ("system_name", "description")
-        if key in system
-    }
+def process_entry(entry: Any) -> Optional[Dict[str, Any]]:
+    if not isinstance(entry, dict):
+        return None
 
-    if "intensity" in system:
-        result["intensity"] = _filter_mapping(system["intensity"])
+    cleaned: Dict[str, Any] = {}
+    base_fields = ("time", "time_idx", "forecast_hour", "analysis_time", "lead_time_hours")
+    for field in base_fields:
+        if field in entry:
+            sanitized = sanitize_value(entry[field])
+            if sanitized is not None:
+                cleaned[field] = sanitized
 
-    if "position" in system:
-        result["position"] = _filter_mapping(system["position"])
+    tc_fields = ("tc_position", "tc_intensity", "tc_intensity_hpa", "tc_intensity_kts")
+    for field in tc_fields:
+        if field in entry:
+            sanitized = sanitize_value(entry[field])
+            if sanitized:
+                cleaned[field] = sanitized
 
-    if "properties" in system:
-        filtered_props = _filter_mapping(system["properties"])
-        if filtered_props:
-            result["properties"] = filtered_props
+    for key, value in entry.items():
+        if key in cleaned or key in ("environmental_systems",):
+            continue
+        if key in base_fields or key in tc_fields:
+            continue
+        sanitized = sanitize_value(value)
+        if sanitized is not None:
+            cleaned[key] = sanitized
 
-    shape_summary = _build_shape_summary(system.get("shape"))
-    if shape_summary:
-        result["shape_summary"] = shape_summary
+    systems: List[Dict[str, Any]] = []
+    for system in entry.get("environmental_systems", []):
+        processed = process_system(system)
+        if processed:
+            systems.append(processed)
+    if systems:
+        cleaned["environmental_systems"] = systems
 
-    return result
+    return cleaned or None
 
 
-def _process_time_series_entry(entry: Dict[str, Any]) -> Dict[str, Any]:
-    processed = {
-        key: entry[key]
-        for key in ("time", "time_idx", "tc_position")
-        if key in entry
-    }
+def build_processed_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
+    processed: Dict[str, Any] = {}
 
-    systems = entry.get("environmental_systems") or []
-    processed_systems = [_process_system(system) for system in systems]
-    if processed_systems:
-        processed["environmental_systems"] = processed_systems
+    preserved_top_level = ("tc_id", "analysis_time", "analysis_window", "dataset", "source")
+    for key in preserved_top_level:
+        if key in payload:
+            processed[key] = payload[key]
+
+    metadata = sanitize_value(payload.get("metadata"))
+    if metadata:
+        processed["metadata"] = metadata
+
+    time_series: List[Dict[str, Any]] = []
+    for entry in payload.get("time_series", []):
+        processed_entry = process_entry(entry)
+        if processed_entry:
+            time_series.append(processed_entry)
+    if "time_series" in payload:
+        processed["time_series"] = time_series
+
+    analysis_series: List[Dict[str, Any]] = []
+    for entry in payload.get("environmental_analysis", []):
+        processed_entry = process_entry(entry)
+        if processed_entry:
+            analysis_series.append(processed_entry)
+    if "environmental_analysis" in payload:
+        processed["environmental_analysis"] = analysis_series
+
+    for key, value in payload.items():
+        if key in processed or key in {"time_series", "environmental_analysis", "metadata"}:
+            continue
+        sanitized = sanitize_value(value)
+        if sanitized is not None:
+            processed[key] = sanitized
 
     return processed
 
@@ -178,50 +300,21 @@ def process_file(input_path: Path, output_path: Path) -> None:
     with input_path.open("r", encoding="utf-8") as fp:
         payload = json.load(fp)
 
-    processed: Dict[str, Any] = {
-        key: payload[key]
-        for key in ("tc_id", "analysis_time")
-        if key in payload
-    }
-
-    time_series = payload.get("time_series") or []
-    processed["time_series"] = [_process_time_series_entry(entry) for entry in time_series]
+    processed_payload = build_processed_payload(payload)
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     with output_path.open("w", encoding="utf-8") as fp:
-        json.dump(processed, fp, ensure_ascii=False, indent=2)
+        json.dump(processed_payload, fp, ensure_ascii=False, indent=2)
 
 
 def iter_input_files(input_dir: Path) -> Iterable[Path]:
     return sorted(path for path in input_dir.glob("*.json") if path.is_file())
 
 
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description="Extract distance-independent fields from TC environment JSON outputs."
-    )
-    parser.add_argument(
-        "--input-dir",
-        type=Path,
-        default=DEFAULT_INPUT_DIR,
-        help="Directory containing original JSON files.",
-    )
-    parser.add_argument(
-        "--output-dir",
-        type=Path,
-        default=DEFAULT_OUTPUT_DIR,
-        help="Directory to write processed JSON files.",
-    )
-    return parser.parse_args()
-
-
-def main() -> None:
-    args = parse_args()
-    input_dir: Path = args.input_dir
-    output_dir: Path = args.output_dir
-
+def run_for_directory(label: str, input_dir: Path, output_dir: Path) -> None:
     if not input_dir.exists():
-        raise FileNotFoundError(f"Input directory does not exist: {input_dir}")
+        print(f"⚠️ Skipping {label}: input directory does not exist ({input_dir})")
+        return
 
     files = list(iter_input_files(input_dir))
     if not files:
@@ -233,8 +326,70 @@ def main() -> None:
     for path in files:
         target = output_dir / path.name
         process_file(path, target)
-        print(f"✅ Processed {path.name} -> {target.relative_to(output_dir.parent)}")
+        try:
+            rel_target = target.relative_to(output_dir.parent)
+        except ValueError:
+            rel_target = target
+        print(f"[{label}] ✅ Processed {path.name} -> {rel_target}")
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Filter TC environment JSON outputs to keep only trusted fields."
+    )
+    parser.add_argument(
+        "--input-dir",
+        type=Path,
+        help="Process a single input directory instead of the default directories.",
+    )
+    parser.add_argument(
+        "--output-dir",
+        type=Path,
+        help="Output directory for single-directory processing (defaults to '<input>_trusted').",
+    )
+    parser.add_argument(
+        "--final-input-dir",
+        type=Path,
+        default=DEFAULT_FINAL_INPUT_DIR,
+        help="Directory containing final_single_output JSON files.",
+    )
+    parser.add_argument(
+        "--final-output-dir",
+        type=Path,
+        default=DEFAULT_FINAL_OUTPUT_DIR,
+        help="Directory to write processed final_single_output JSON files.",
+    )
+    parser.add_argument(
+        "--cds-input-dir",
+        type=Path,
+        default=DEFAULT_CDS_INPUT_DIR,
+        help="Directory containing cds_output JSON files.",
+    )
+    parser.add_argument(
+        "--cds-output-dir",
+        type=Path,
+        default=DEFAULT_CDS_OUTPUT_DIR,
+        help="Directory to write processed cds_output JSON files.",
+    )
+    return parser.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
+
+    if args.input_dir:
+        input_dir: Path = args.input_dir
+        if args.output_dir:
+            output_dir = args.output_dir
+        else:
+            output_dir = input_dir.parent / f"{input_dir.name}{DEFAULT_SINGLE_OUTPUT_SUFFIX}"
+        run_for_directory("custom", input_dir, output_dir)
+        return
+
+    run_for_directory("final", args.final_input_dir, args.final_output_dir)
+    run_for_directory("cds", args.cds_input_dir, args.cds_output_dir)
 
 
 if __name__ == "__main__":
     main()
+
