@@ -152,3 +152,5 @@ final_output/
 track_single/
 final_single_output/
 cds_output/
+preprocessed_data/
+generated_data/
