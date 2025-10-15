@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
@@ -62,6 +63,12 @@ _COORDINATE_PATHS: Tuple[Tuple[str, ...], ...] = (
     ("warm_water_boundary",),
 )
 
+# Pattern to match area descriptions like "暖水区域面积约3080km²" or similar
+# This matches various forms of area descriptions with km² or similar units
+_AREA_DESCRIPTION_PATTERN = re.compile(
+    r'[，。\s]*[暖冷热]?水?[区域]*面积约?\s*\d+[\d,\.]*\s*(?:km²|平方公里|公里²|千米²)[，。\s]*',
+    re.UNICODE
+)
 
 def _should_drop_key(key: str) -> bool:
     key_lower = key.lower()
@@ -73,6 +80,42 @@ def _string_contains_untrusted_units(value: str) -> bool:
     if any(marker in value_lower for marker in _UNTRUSTED_STRING_MARKERS_LOWER):
         return True
     return any(marker in value for marker in _UNTRUSTED_STRING_MARKERS_LITERAL)
+
+
+def _clean_area_descriptions(text: str) -> str:
+    """Remove area-related descriptions from text.
+    
+    Args:
+        text: Original text that may contain area descriptions
+        
+    Returns:
+        Cleaned text with area descriptions removed
+    """
+    if not isinstance(text, str):
+        return text
+    
+    original = text
+    
+    # Remove area-related phrases
+    cleaned = _AREA_DESCRIPTION_PATTERN.sub('', text)
+    
+    # Only apply cleanup if something was changed
+    if cleaned != original:
+        # Clean up extra spaces
+        cleaned = re.sub(r'\s+', ' ', cleaned)
+        # Fix spacing after period: ensure there's no space before next character starts
+        cleaned = re.sub(r'([。！？])\s+', r'\1', cleaned)
+        # Clean up spaces before Chinese punctuation
+        cleaned = re.sub(r'\s+([，。！？])', r'\1', cleaned)
+        # Clean up multiple punctuation marks
+        cleaned = re.sub(r'([，。])+', r'\1', cleaned)
+        cleaned = cleaned.strip()
+        # Remove leading punctuation
+        cleaned = re.sub(r'^[，。\s]+', '', cleaned)
+        # Remove trailing punctuation except period/exclamation/question
+        cleaned = re.sub(r'[，]+$', '', cleaned)
+    
+    return cleaned
 
 
 def sanitize_value(value: Any, drop_keys: Optional[Iterable[str]] = None) -> Any:
@@ -98,7 +141,9 @@ def sanitize_value(value: Any, drop_keys: Optional[Iterable[str]] = None) -> Any
             return cleaned_list or None
 
         if isinstance(obj, str):
-            return None if _string_contains_untrusted_units(obj) else obj
+            # First clean area descriptions, then check for untrusted units
+            cleaned_str = _clean_area_descriptions(obj)
+            return None if _string_contains_untrusted_units(cleaned_str) else cleaned_str
 
         if isinstance(obj, (int, float, bool)):
             return obj
