@@ -263,9 +263,16 @@ class TCEnvironmentalSystemsExtractor:
             # print(f"⚠️ 引导系统提取失败: {e}")
             return None
 
-    def extract_vertical_wind_shear(self, time_idx, tc_lat, tc_lon):
+    def extract_vertical_wind_shear(self, time_idx, tc_lat, tc_lon, radius_km=500):
         """
         [深度重构] 提取并解译垂直风切变。
+        使用台风中心500km圆域内的面积平均计算200-850hPa风矢量差。
+        
+        Parameters:
+            time_idx: 时间索引
+            tc_lat: 台风中心纬度
+            tc_lon: 台风中心经度
+            radius_km: 计算半径（公里），默认500km
         """
         try:
             u200, v200 = self._get_data_at_level("u", 200, time_idx), self._get_data_at_level(
@@ -277,12 +284,18 @@ class TCEnvironmentalSystemsExtractor:
             if any(x is None for x in [u200, v200, u850, v850]):
                 return None
 
-            lat_idx, lon_idx = (
-                np.abs(self.lat - tc_lat).argmin(),
-                np.abs(self.lon - tc_lon).argmin(),
-            )
-            shear_u = u200[lat_idx, lon_idx] - u850[lat_idx, lon_idx]
-            shear_v = v200[lat_idx, lon_idx] - v850[lat_idx, lon_idx]
+            # 使用Haversine距离创建500km圆形掩膜
+            circular_mask = self._create_circular_mask_haversine(tc_lat, tc_lon, radius_km)
+            
+            # 在圆域内计算各层风场的面积平均
+            u200_mean = np.nanmean(u200[circular_mask])
+            v200_mean = np.nanmean(v200[circular_mask])
+            u850_mean = np.nanmean(u850[circular_mask])
+            v850_mean = np.nanmean(v850[circular_mask])
+            
+            # 计算矢量差（先平均后相减）
+            shear_u = u200_mean - u850_mean
+            shear_v = v200_mean - v850_mean
             shear_mag = np.sqrt(shear_u**2 + shear_v**2)
 
             if shear_mag < 5:
@@ -292,40 +305,44 @@ class TCEnvironmentalSystemsExtractor:
             else:
                 level, impact = "强", "显著抑制发展"
 
-            # 方向定义为风从哪个方向来
-            direction_from = (np.degrees(np.arctan2(shear_u, shear_v)) + 180) % 360
+            # 方向定义为风从哪个方向来（修正公式：使用 atan2(-u, -v)）
+            direction_from = np.degrees(np.arctan2(-shear_u, -shear_v)) % 360
             dir_desc, _ = self._bearing_to_desc(direction_from)
 
             desc = (
-                f"台风核心区正受到来自{dir_desc}方向、强度为“{level}”的垂直风切变影响，"
-                f"当前风切变环境对台风的发展{impact.split(' ')[-1]}。"
+                f"台风中心{radius_km}公里范围内的垂直风切变来自{dir_desc}方向，"
+                f"强度为\"{level}\"（{round(shear_mag, 1)} m/s），"
+                f"当前风切变环境对台风的发展{impact}。"
             )
 
             return {
                 "system_name": "VerticalWindShear",
                 "description": desc,
                 "position": {
-                    "description": "在台风中心点计算的200-850hPa风矢量差",
+                    "description": f"台风中心{radius_km}km圆域平均的200-850hPa风矢量差",
                     "lat": tc_lat,
                     "lon": tc_lon,
+                    "radius_km": radius_km,
                 },
-                "intensity": {"value": round(shear_mag.item(), 2), "unit": "m/s", "level": level},
+                "intensity": {"value": round(shear_mag, 2), "unit": "m/s", "level": level},
                 "shape": {
                     "description": f"一个从{dir_desc}指向的矢量",
                     "vector_coordinates": self._get_vector_coords(tc_lat, tc_lon, shear_u, shear_v),
                 },
                 "properties": {
-                    "direction_from_deg": round(direction_from.item(), 1),
+                    "direction_from_deg": round(direction_from, 1),
                     "impact": impact,
                     "shear_vector_mps": {
-                        "u": round(shear_u.item(), 2),
-                        "v": round(shear_v.item(), 2),
+                        "u": round(shear_u, 2),
+                        "v": round(shear_v, 2),
                     },
+                    "calculation_method": f"面积平均于{radius_km}km圆域",
                 },
             }
         except Exception as e:
             # print(f"⚠️ 垂直风切变提取失败: {e}")
             return None
+
 
     def extract_ocean_heat_content(self, time_idx, tc_lat, tc_lon, radius_deg=2.0):
         """
