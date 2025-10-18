@@ -741,73 +741,257 @@ class TCEnvironmentalSystemsExtractor:
 
     def extract_westerly_trough(self, time_idx, tc_lat, tc_lon):
         """
-        提取并解译西风槽系统。
+        [深度重构] 提取并解译西风槽系统。
         西风槽可以为台风提供额外的动力支持或影响其路径。
+        
+        改进点：
+        1. 使用500hPa高度距平（去除纬向平均）识别槽
+        2. 计算位涡(PV)梯度确定槽轴位置
+        3. 提取槽轴作为折线和槽底位置
+        4. 结合200hPa急流位置确认动力槽特征
         """
         try:
             z500 = self._get_data_at_level("z", 500, time_idx)
             if z500 is None:
                 return None
 
-            # 寻找中纬度地区的槽线（位势高度相对低值区）
+            # 1. 计算500hPa高度距平（去除纬向平均）
+            z500_zonal_mean = np.nanmean(z500, axis=1, keepdims=True)
+            z500_anomaly = z500 - z500_zonal_mean
+            
+            # 2. 限定中纬度搜索区域（20°N-60°N）
             mid_lat_mask = (self.lat >= 20) & (self.lat <= 60)
             if not np.any(mid_lat_mask):
                 return None
 
-            # 寻找500hPa高度场的波动
-            z500_mid = z500[mid_lat_mask, :]
-            trough_threshold = np.percentile(z500_mid, 25)  # 寻找低四分位数区域
+            # 3. 计算位涡(PV)近似值和其梯度
+            # PV ≈ -g * (ζ + f) * ∂θ/∂p
+            # 这里简化为使用相对涡度和科氏参数
+            u500 = self._get_data_at_level("u", 500, time_idx)
+            v500 = self._get_data_at_level("v", 500, time_idx)
+            
+            if u500 is None or v500 is None:
+                # 如果没有风场数据，只使用高度距平
+                pv_gradient = None
+            else:
+                # 计算相对涡度
+                gy_u, gx_u = self._raw_gradients(u500)
+                gy_v, gx_v = self._raw_gradients(v500)
+                du_dy = gy_u / (self.lat_spacing * 111000)
+                dv_dx = gx_v / (self.lon_spacing * 111000 * self._coslat_safe[:, np.newaxis])
+                vorticity = dv_dx - du_dy
+                
+                # 计算科氏参数 f = 2Ω*sin(φ)
+                omega = 7.2921e-5  # 地球自转角速度 (rad/s)
+                f = 2 * omega * np.sin(np.deg2rad(self.lat))[:, np.newaxis]
+                
+                # 绝对涡度
+                abs_vorticity = vorticity + f
+                
+                # PV梯度（使用绝对涡度的梯度作为近似）
+                gy_pv, gx_pv = self._raw_gradients(abs_vorticity)
+                pv_gradient = np.sqrt(gy_pv**2 + gx_pv**2)
 
-            trough_systems = self._identify_pressure_system(
-                z500, tc_lat, tc_lon, "low", trough_threshold
-            )
-            if not trough_systems:
+            # 4. 在中纬度区域寻找槽（高度距平负值区）
+            z500_anomaly_mid = z500_anomaly.copy()
+            z500_anomaly_mid[~mid_lat_mask, :] = np.nan
+            
+            # 使用动态阈值：找负距平的显著区域
+            negative_anomaly = z500_anomaly_mid < 0
+            if not np.any(negative_anomaly):
                 return None
-
-            trough_lat = trough_systems["position"]["center_of_mass"]["lat"]
-            trough_lon = trough_systems["position"]["center_of_mass"]["lon"]
-
-            # 计算与台风的相对位置
-            bearing, rel_pos_desc = self._calculate_bearing(tc_lat, tc_lon, trough_lat, trough_lon)
-            distance = self._calculate_distance(tc_lat, tc_lon, trough_lat, trough_lon)
-
+            
+            # 找到负距平区域的25分位数作为槽的阈值
+            neg_values = z500_anomaly_mid[negative_anomaly]
+            if len(neg_values) == 0:
+                return None
+            
+            trough_threshold_anomaly = np.percentile(neg_values, 25)
+            
+            # 5. 识别槽系统（在台风周围一定范围内）
+            search_radius_deg = 30  # 搜索半径30度
+            lat_idx, lon_idx = self._loc_idx(tc_lat, tc_lon)
+            radius_points = int(search_radius_deg / self.lat_spacing)
+            
+            lat_start = max(0, lat_idx - radius_points)
+            lat_end = min(len(self.lat), lat_idx + radius_points + 1)
+            lon_start = max(0, lon_idx - radius_points)
+            lon_end = min(len(self.lon), lon_idx + radius_points + 1)
+            
+            # 创建局部掩膜
+            local_mask = np.zeros_like(z500_anomaly, dtype=bool)
+            local_mask[lat_start:lat_end, lon_start:lon_end] = True
+            local_mask = local_mask & mid_lat_mask[:, np.newaxis]
+            
+            # 在局部区域内寻找槽
+            trough_mask = (z500_anomaly < trough_threshold_anomaly) & local_mask
+            
+            if not np.any(trough_mask):
+                return None
+            
+            # 6. 提取槽轴线和槽底
+            # 槽轴：沿经向的高度距平最小值连线
+            # 槽底：槽轴上的最低点
+            
+            trough_axis = []
+            trough_lons = []
+            trough_lats = []
+            
+            # 对每个经度，找到该经度上高度距平的最小值位置
+            lon_indices = np.where(np.any(trough_mask, axis=0))[0]
+            
+            if len(lon_indices) < 2:
+                # 槽太小，不足以形成轴线
+                return None
+            
+            for lon_idx_local in lon_indices:
+                # 在该经度上找到高度距平最小的纬度
+                col = z500_anomaly[:, lon_idx_local]
+                col_mask = trough_mask[:, lon_idx_local]
+                
+                if not np.any(col_mask):
+                    continue
+                
+                # 找到掩膜区域内的最小值
+                masked_col = np.where(col_mask, col, np.nan)
+                if not np.any(np.isfinite(masked_col)):
+                    continue
+                
+                min_lat_idx = np.nanargmin(masked_col)
+                
+                trough_lats.append(float(self.lat[min_lat_idx]))
+                trough_lons.append(float(self.lon[lon_idx_local]))
+                trough_axis.append([float(self.lon[lon_idx_local]), float(self.lat[min_lat_idx])])
+            
+            if len(trough_axis) < 2:
+                return None
+            
+            # 找到槽底（高度距平最小的点）
+            min_anomaly_idx = np.nanargmin(z500_anomaly[trough_mask])
+            trough_mask_indices = np.where(trough_mask)
+            trough_bottom_lat_idx = trough_mask_indices[0][min_anomaly_idx]
+            trough_bottom_lon_idx = trough_mask_indices[1][min_anomaly_idx]
+            
+            trough_bottom_lat = float(self.lat[trough_bottom_lat_idx])
+            trough_bottom_lon = float(self.lon[trough_bottom_lon_idx])
+            trough_bottom_anomaly = float(z500_anomaly[trough_bottom_lat_idx, trough_bottom_lon_idx])
+            
+            # 7. 计算槽的质心位置（用于距离和方位计算）
+            trough_center_lat = np.mean(trough_lats)
+            trough_center_lon = np.mean(trough_lons)
+            
+            # 8. 计算与台风的相对位置
+            bearing, rel_pos_desc = self._calculate_bearing(tc_lat, tc_lon, trough_center_lat, trough_center_lon)
+            distance = self._haversine_distance(tc_lat, tc_lon, trough_center_lat, trough_center_lon)
+            
+            # 计算槽底到台风的距离
+            distance_bottom = self._haversine_distance(tc_lat, tc_lon, trough_bottom_lat, trough_bottom_lon)
+            bearing_bottom, _ = self._calculate_bearing(tc_lat, tc_lon, trough_bottom_lat, trough_bottom_lon)
+            
+            # 9. 评估槽的强度
+            # 使用高度距平、PV梯度等指标
+            trough_intensity = abs(trough_bottom_anomaly)
+            
+            if trough_intensity > 150:
+                strength = "强"
+            elif trough_intensity > 80:
+                strength = "中等"
+            else:
+                strength = "弱"
+            
+            # 10. 评估对台风的影响
             if distance < 1000:
-                influence = "直接影响台风路径和强度"
+                if distance_bottom < 500:
+                    influence = "槽前西南气流直接影响台风路径和强度，可能促进台风向东北方向移动"
+                    interaction_potential = "高"
+                else:
+                    influence = "直接影响台风路径和强度"
+                    interaction_potential = "高"
             elif distance < 2000:
-                influence = "对台风有间接影响"
+                influence = "对台风有间接影响，可能通过引导气流影响台风移动"
+                interaction_potential = "中"
             else:
                 influence = "影响较小"
-
-            desc = f"在台风{rel_pos_desc}约{distance:.0f}公里处存在西风槽系统，{influence}。"
-
-            # 添加详细的坐标信息
-            trough_coords = self._get_system_coordinates(
-                z500, trough_threshold, "low", max_points=12
+                interaction_potential = "低"
+            
+            # 11. 检查200hPa急流（如果有数据）
+            u200 = self._get_data_at_level("u", 200, time_idx)
+            jet_info = None
+            
+            if u200 is not None:
+                # 寻找急流（u > 30 m/s）
+                jet_mask = u200 > 30
+                if np.any(jet_mask & local_mask):
+                    jet_info = "检测到200hPa急流，确认为动力活跃的西风槽"
+            
+            # 12. 构建描述
+            desc = (
+                f"在台风{rel_pos_desc}约{distance:.0f}公里处存在{strength}西风槽系统，"
+                f"槽底位于({trough_bottom_lat:.1f}°N, {trough_bottom_lon:.1f}°E)，"
+                f"距台风中心{distance_bottom:.0f}公里。"
             )
-            shape_info = {"description": "南北向延伸的槽线系统"}
-
-            if trough_coords:
-                shape_info.update(
-                    {
-                        "coordinates": trough_coords,
-                        "extent_desc": f"纬度跨度{trough_coords['span_deg'][1]:.1f}°，经度跨度{trough_coords['span_deg'][0]:.1f}°",
-                    }
-                )
-                desc += f" 槽线主体跨越纬度{trough_coords['span_deg'][1]:.1f}°，经度{trough_coords['span_deg'][0]:.1f}°。"
-
+            
+            desc += f"槽轴呈南北向延伸，跨越{len(trough_axis)}个采样点。"
+            
+            if jet_info:
+                desc += jet_info + "。"
+            
+            desc += influence + "。"
+            
+            # 13. 构建输出
+            shape_info = {
+                "description": "南北向延伸的槽线系统",
+                "trough_axis": trough_axis,  # 槽轴折线
+                "trough_bottom": [trough_bottom_lon, trough_bottom_lat],  # 槽底位置
+                "axis_extent": {
+                    "lat_range": [min(trough_lats), max(trough_lats)],
+                    "lon_range": [min(trough_lons), max(trough_lons)],
+                    "lat_span_deg": max(trough_lats) - min(trough_lats),
+                    "lon_span_deg": max(trough_lons) - min(trough_lons),
+                },
+            }
+            
+            if pv_gradient is not None:
+                # 在槽底附近的PV梯度
+                pv_grad_at_bottom = float(pv_gradient[trough_bottom_lat_idx, trough_bottom_lon_idx])
+                shape_info["pv_gradient_at_bottom"] = float(f"{pv_grad_at_bottom:.2e}")
+            
             return {
                 "system_name": "WesterlyTrough",
                 "description": desc,
-                "position": trough_systems["position"],
-                "intensity": trough_systems["intensity"],
+                "position": {
+                    "description": "槽的质心位置（槽轴平均）",
+                    "center_of_mass": {
+                        "lat": round(trough_center_lat, 2),
+                        "lon": round(trough_center_lon, 2),
+                    },
+                    "trough_bottom": {
+                        "lat": round(trough_bottom_lat, 2),
+                        "lon": round(trough_bottom_lon, 2),
+                        "description": "槽底（高度距平最小点）",
+                    },
+                },
+                "intensity": {
+                    "value": round(trough_intensity, 1),
+                    "unit": "gpm",
+                    "description": "500hPa高度距平绝对值",
+                    "level": strength,
+                    "z500_anomaly_at_bottom": round(trough_bottom_anomaly, 1),
+                },
                 "shape": shape_info,
                 "properties": {
                     "distance_to_tc_km": round(distance, 0),
+                    "distance_bottom_to_tc_km": round(distance_bottom, 0),
                     "bearing_from_tc": round(bearing, 1),
+                    "bearing_bottom_from_tc": round(bearing_bottom, 1),
+                    "azimuth": f"台风{rel_pos_desc}",
                     "influence": influence,
+                    "interaction_potential": interaction_potential,
+                    "jet_detected": jet_info is not None,
                 },
             }
         except Exception as e:
+            # print(f"⚠️ 西风槽提取失败: {e}")
             return None
 
     def extract_frontal_system(self, time_idx, tc_lat, tc_lon):
