@@ -175,20 +175,38 @@ class TCEnvironmentalSystemsExtractor:
             if z500 is None:
                 return None
 
-            # 1. 识别副高系统
-            subtropical_high_obj = self._identify_pressure_system(
-                z500, tc_lat, tc_lon, "high", 5880
+            # 1. 识别副高系统 (改进版 - 使用区域化处理)
+            subtropical_high_obj = self._identify_subtropical_high_regional(
+                z500, tc_lat, tc_lon, time_idx
             )
             if not subtropical_high_obj:
-                return None
+                # 如果区域化方法失败，回退到原方法
+                subtropical_high_obj = self._identify_pressure_system(
+                    z500, tc_lat, tc_lon, "high", 5880
+                )
+                if not subtropical_high_obj:
+                    return None
 
             # 2. 增强形状分析
             enhanced_shape = self._get_enhanced_shape_info(z500, 5880, "high", tc_lat, tc_lon)
 
-            # 3. 计算引导气流
-            steering_speed, steering_direction, u_steering, v_steering = (
-                self._calculate_steering_flow(z500, tc_lat, tc_lon)
-            )
+            # 3. 计算引导气流 (改进版 - 使用层平均风)
+            steering_result = self._calculate_steering_flow_layered(time_idx, tc_lat, tc_lon)
+            if not steering_result:
+                # 如果层平均方法失败，回退到地转风方法
+                steering_speed, steering_direction, u_steering, v_steering = (
+                    self._calculate_steering_flow(z500, tc_lat, tc_lon)
+                )
+                steering_result = {
+                    "speed": steering_speed,
+                    "direction": steering_direction,
+                    "u": u_steering,
+                    "v": v_steering,
+                    "method": "geostrophic_wind"
+                }
+
+            # 4. 提取脊线位置 (588线)
+            ridge_info = self._extract_ridge_line(z500, tc_lat, tc_lon)
 
             # 4. 丰富化描述和属性
             # 4.1 强度定性分级
@@ -201,12 +219,12 @@ class TCEnvironmentalSystemsExtractor:
                 level = "弱"
             subtropical_high_obj["intensity"]["level"] = level
 
-            # 4.2 更新形状信息
+            # 4.2 更新形状信息（移除面积计算）
             if enhanced_shape:
                 subtropical_high_obj["shape"].update(
                     {
                         "detailed_analysis": enhanced_shape["detailed_analysis"],
-                        "area_km2": enhanced_shape["area_km2"],
+                        # 移除 area_km2 - 不需要计算面积
                         "shape_type": enhanced_shape["shape_type"],
                         "orientation": enhanced_shape["orientation"],
                         "complexity": enhanced_shape["complexity"],
@@ -219,17 +237,44 @@ class TCEnvironmentalSystemsExtractor:
                         "coordinate_info"
                     ]
 
-            # 4.3 提取关键坐标点
-            system_coords = self._get_system_coordinates(z500, 5880, "high", max_points=15)
-            if system_coords:
-                subtropical_high_obj["shape"]["coordinates"] = system_coords
-
-            # 4.4 传统等值线坐标（保持兼容性）
-            contour_coords = self._get_contour_coords(z500, 5880, tc_lon)
-            if contour_coords:
-                subtropical_high_obj["shape"]["contour_5880gpm"] = contour_coords
-                if not enhanced_shape:
-                    subtropical_high_obj["shape"]["description"] = "呈东西向伸展的脊线形态"
+            # 4.3 提取闭合边界和特征点（科学安全的方法）
+            # 获取动态阈值（如果有的话）
+            if "extraction_info" in subtropical_high_obj and "dynamic_threshold" in subtropical_high_obj["extraction_info"]:
+                dynamic_threshold = subtropical_high_obj["extraction_info"]["dynamic_threshold"]
+            else:
+                dynamic_threshold = 5880  # 默认值
+            
+            # 使用改进的闭合边界提取方法
+            boundary_result = self._extract_closed_boundary_with_features(
+                z500, tc_lat, tc_lon, 
+                threshold=dynamic_threshold,
+                lat_range=20.0,
+                lon_range=40.0,
+                target_points=50
+            )
+            
+            if boundary_result:
+                # 添加边界坐标（闭合）
+                subtropical_high_obj["boundary_coordinates"] = boundary_result["boundary_coordinates"]
+                
+                # 添加关键特征点
+                subtropical_high_obj["boundary_features"] = boundary_result["boundary_features"]
+                
+                # 添加边界度量信息
+                subtropical_high_obj["boundary_metrics"] = boundary_result["boundary_metrics"]
+                
+                print(f"✅ 边界提取成功: {boundary_result['boundary_metrics']['total_points']}点, "
+                      f"{'闭合' if boundary_result['boundary_metrics']['is_closed'] else '开放'}, "
+                      f"方法: {boundary_result['boundary_metrics']['extraction_method']}")
+            else:
+                # 如果新方法失败，回退到旧方法
+                print(f"⚠️ 新方法失败，使用旧方法提取边界")
+                boundary_coords = self._extract_local_boundary_coords(
+                    z500, tc_lat, tc_lon, threshold=dynamic_threshold, radius_deg=20
+                )
+                if boundary_coords:
+                    subtropical_high_obj["boundary_coordinates"] = boundary_coords
+                    subtropical_high_obj["boundary_note"] = "使用旧方法（新方法失败）"
 
             # 4.4 相对位置和综合描述
             high_pos = subtropical_high_obj["position"]["center_of_mass"]
@@ -237,6 +282,16 @@ class TCEnvironmentalSystemsExtractor:
                 tc_lat, tc_lon, high_pos["lat"], high_pos["lon"]
             )
             subtropical_high_obj["position"]["relative_to_tc"] = rel_pos_desc
+            steering_speed = steering_result["speed"]
+            steering_direction = steering_result["direction"]
+            u_steering = steering_result["u"]
+            v_steering = steering_result["v"]
+
+            steering_speed = steering_result["speed"]
+            steering_direction = steering_result["direction"]
+            u_steering = steering_result["u"]
+            v_steering = steering_result["v"]
+
 
             desc = (
                 f"一个强度为“{level}”的副热带高压系统位于台风的{rel_pos_desc}，"
@@ -254,10 +309,20 @@ class TCEnvironmentalSystemsExtractor:
                             "speed_mps": round(steering_speed, 2),
                             "direction_deg": round(steering_direction, 1),
                             "vector_mps": {"u": round(u_steering, 2), "v": round(v_steering, 2)},
+                            "calculation_method": steering_result.get("method", "unknown")
                         },
                     },
                 }
             )
+
+            # 添加脊线信息
+            if ridge_info:
+                subtropical_high_obj["properties"]["ridge_line"] = ridge_info
+
+            # 添加脊线信息
+            if ridge_info:
+                subtropical_high_obj["properties"]["ridge_line"] = ridge_info
+
             return subtropical_high_obj
         except Exception as e:
             # print(f"⚠️ 引导系统提取失败: {e}")
@@ -391,34 +456,67 @@ class TCEnvironmentalSystemsExtractor:
             local_lat = self.lat[lat_start:lat_end]
             local_lon = self.lon[lon_start:lon_end]
             
-            # 在局部区域提取26.5°C等值线
-            contour_26_5 = self._get_contour_coords_local(
-                sst_local, 26.5, local_lat, local_lon, tc_lon
+            # 【改进】使用闭合边界提取方法（科学方法）
+            boundary_result = self._extract_closed_ocean_boundary_with_features(
+                sst, tc_lat, tc_lon, threshold=26.5,
+                lat_range=radius_deg * 6,  # 使用6倍半径确保完整性
+                lon_range=radius_deg * 12,
+                target_points=50
             )
-
-            # 增强形状分析：使用全局数据但限制在台风附近
-            enhanced_shape = self._get_enhanced_shape_info(sst, 26.5, "high", tc_lat, tc_lon)
 
             shape_info = {
                 "description": "26.5°C是台风发展的最低海温门槛，此线是生命线",
-                "warm_water_boundary_26.5C": contour_26_5,
-                "boundary_type": "local_region",  # 标注这是局部边界
+                "boundary_type": "closed_contour_with_features",  # 新方法标注
                 "extraction_radius_deg": radius_deg * 3,  # 记录提取范围
             }
 
-            # 如果有增强形状分析，添加更多细节
-            if enhanced_shape:
-                shape_info.update(
-                    {
+            # 如果成功提取闭合边界
+            if boundary_result:
+                shape_info["warm_water_boundary_26.5C"] = boundary_result["boundary_coordinates"]
+                shape_info["boundary_features"] = boundary_result["boundary_features"]
+                shape_info["boundary_metrics"] = boundary_result["boundary_metrics"]
+                
+                # 使用新方法计算的面积
+                metrics = boundary_result["boundary_metrics"]
+                if "warm_water_area_approx_km2" in metrics:
+                    shape_info["warm_water_area_km2"] = metrics["warm_water_area_approx_km2"]
+                    desc += f" 暖水区域面积约{metrics['warm_water_area_approx_km2']:.0f}km²"
+                
+                # 添加闭合性信息
+                if metrics.get("is_closed"):
+                    desc += f"，边界完整闭合（{metrics['total_points']}个采样点，周长{metrics['perimeter_km']:.0f}km）"
+                
+                # 添加关键特征信息
+                features = boundary_result["boundary_features"]
+                tc_rel = features.get("tc_relative_points", {})
+                if "nearest_to_tc" in tc_rel:
+                    nearest_dist = tc_rel["nearest_to_tc"]["distance_km"]
+                    desc += f"，台风距暖水区边界最近{nearest_dist:.0f}km"
+                
+                # 暖涡信息
+                warm_eddies = features.get("warm_eddy_centers", [])
+                if warm_eddies:
+                    desc += f"，检测到{len(warm_eddies)}个暖涡特征"
+                    
+            else:
+                # 回退到旧方法
+                print("⚠️ 闭合边界提取失败，回退到旧方法")
+                contour_26_5 = self._get_contour_coords_local(
+                    sst_local, 26.5, local_lat, local_lon, tc_lon
+                )
+                shape_info["warm_water_boundary_26.5C"] = contour_26_5
+                shape_info["boundary_type"] = "fallback_local_region"
+                
+                # 旧的形状分析
+                enhanced_shape = self._get_enhanced_shape_info(sst, 26.5, "high", tc_lat, tc_lon)
+                if enhanced_shape:
+                    shape_info.update({
                         "warm_water_area_km2": enhanced_shape["area_km2"],
                         "warm_region_shape": enhanced_shape["shape_type"],
                         "warm_region_orientation": enhanced_shape["orientation"],
                         "detailed_analysis": enhanced_shape["detailed_analysis"],
-                    }
-                )
-
-                # 更新描述信息
-                desc += f" 暖水区域面积约{enhanced_shape['area_km2']:.0f}km²，呈{enhanced_shape['shape_type']}，{enhanced_shape['orientation']}。"
+                    })
+                    desc += f" 暖水区域面积约{enhanced_shape['area_km2']:.0f}km²，呈{enhanced_shape['shape_type']}，{enhanced_shape['orientation']}。"
 
             return {
                 "system_name": "OceanHeatContent",
@@ -1352,5 +1450,1230 @@ class TCEnvironmentalSystemsExtractor:
         lon_mask = (self.lon >= center_lon - radius_deg) & (self.lon <= center_lon + radius_deg)
         return np.outer(lat_mask, lon_mask)
 
+    # ================= 新增: 副热带高压和引导气流改进函数 =================
+    
+    def _identify_subtropical_high_regional(self, z500, tc_lat, tc_lon, time_idx):
+        """
+        使用区域化处理识别副热带高压
+        
+        改进:
+        1. 在台风周围20°x40°区域内处理
+        2. 计算高度异常场(相对于时间/纬向平均)
+        3. 使用局部阈值而非全局固定5880gpm
+        
+        Returns:
+            副高系统信息字典，或None
+        """
+        try:
+            # 1. 定义局部区域 (台风周围 20°纬度 x 40°经度)
+            lat_range = 20.0
+            lon_range = 40.0
+            
+            lat_min = max(tc_lat - lat_range/2, self.lat.min())
+            lat_max = min(tc_lat + lat_range/2, self.lat.max())
+            lon_min = tc_lon - lon_range/2
+            lon_max = tc_lon + lon_range/2
+            
+            # 创建区域掩膜
+            lat_mask = (self.lat >= lat_min) & (self.lat <= lat_max)
+            lon_mask_raw = (self.lon >= lon_min) & (self.lon <= lon_max)
+            
+            # 处理经度跨越0°/360°的情况
+            if lon_min < 0:
+                lon_mask = (self.lon >= lon_min + 360) | (self.lon <= lon_max)
+            elif lon_max > 360:
+                lon_mask = (self.lon >= lon_min) | (self.lon <= lon_max - 360)
+            else:
+                lon_mask = lon_mask_raw
+            
+            # 2. 提取局部区域数据
+            region_z500 = z500[np.ix_(lat_mask, lon_mask)]
+            
+            # 3. 计算高度异常 (简化版:相对于区域平均)
+            z500_mean = np.nanmean(region_z500)
+            z500_anomaly = region_z500 - z500_mean
+            
+            # 4. 使用动态阈值 (75百分位或区域平均+标准差)
+            threshold_percentile = np.nanpercentile(region_z500, 75)
+            threshold_std = z500_mean + np.nanstd(region_z500)
+            dynamic_threshold = min(threshold_percentile, threshold_std)
+            
+            # 确保阈值合理 (至少5860 gpm)
+            dynamic_threshold = max(dynamic_threshold, 5860)
+            
+            # 5. 识别高压区域
+            high_mask = region_z500 > dynamic_threshold
+            
+            if not np.any(high_mask):
+                return None
+            
+            # 6. 标记连通区域
+            labeled_array, num_features = label(high_mask)
+            
+            if num_features == 0:
+                return None
+            
+            # 7. 选择最大/最强的连通区域
+            max_area = 0
+            best_feature_idx = -1
+            
+            for i in range(1, num_features + 1):
+                feature_mask = (labeled_array == i)
+                area = np.sum(feature_mask)
+                
+                if area > max_area:
+                    max_area = area
+                    best_feature_idx = i
+            
+            if best_feature_idx == -1:
+                return None
+            
+            # 8. 计算副高属性
+            target_mask = (labeled_array == best_feature_idx)
+            com_y, com_x = center_of_mass(target_mask)
+            
+            # 转换回全局坐标
+            local_lat = self.lat[lat_mask]
+            local_lon = self.lon[lon_mask]
+            
+            pos_lat = local_lat[int(com_y)]
+            pos_lon = local_lon[int(com_x)]
+            
+            intensity_val = np.max(region_z500[target_mask])
+            
+            return {
+                "position": {
+                    "center_of_mass": {
+                        "lat": round(float(pos_lat), 2),
+                        "lon": round(float(pos_lon), 2)
+                    }
+                },
+                "intensity": {
+                    "value": round(float(intensity_val), 1),
+                    "unit": "gpm"
+                },
+                "shape": {},
+                "extraction_info": {
+                    "method": "regional_processing",
+                    "region_extent": {
+                        "lat_range": [float(lat_min), float(lat_max)],
+                        "lon_range": [float(lon_min), float(lon_max)]
+                    },
+                    "dynamic_threshold": round(float(dynamic_threshold), 1)
+                }
+            }
+            
+        except Exception as e:
+            print(f"⚠️ 区域化副高识别失败: {e}")
+            return None
+    
+    def _calculate_steering_flow_layered(self, time_idx, tc_lat, tc_lon, radius_deg=5.0):
+        """
+        使用850-300hPa层平均风计算引导气流
+        
+        改进:
+        1. 计算多层风场的质量加权平均
+        2. 在台风中心周围区域进行面积平均
+        3. 考虑纬度相关的科里奥利参数
+        
+        Args:
+            time_idx: 时间索引
+            tc_lat: 台风中心纬度
+            tc_lon: 台风中心经度
+            radius_deg: 计算半径(度)，默认5度
+        
+        Returns:
+            {"speed": ..., "direction": ..., "u": ..., "v": ..., "method": ...} 或 None
+        """
+        try:
+            # 1. 定义层次 (850, 700, 500, 300 hPa)
+            levels = [850, 700, 500, 300]
+            weights = [0.3, 0.3, 0.2, 0.2]  # 低层权重更大
+            
+            u_weighted = 0
+            v_weighted = 0
+            total_weight = 0
+            
+            # 2. 对每一层计算面积平均风
+            for level, weight in zip(levels, weights):
+                u_level = self._get_data_at_level("u", level, time_idx)
+                v_level = self._get_data_at_level("v", level, time_idx)
+                
+                if u_level is None or v_level is None:
+                    continue
+                
+                # 创建区域掩膜
+                region_mask = self._create_region_mask(tc_lat, tc_lon, radius_deg)
+                
+                # 面积平均
+                u_mean = np.nanmean(u_level[region_mask])
+                v_mean = np.nanmean(v_level[region_mask])
+                
+                u_weighted += weight * u_mean
+                v_weighted += weight * v_mean
+                total_weight += weight
+            
+            if total_weight == 0:
+                return None
+            
+            # 3. 归一化
+            u_steering = u_weighted / total_weight
+            v_steering = v_weighted / total_weight
+            
+            # 4. 计算速度和方向
+            speed = np.sqrt(u_steering**2 + v_steering**2)
+            
+            # 风向: 风吹向的方向 (气象惯例)
+            direction = (np.degrees(np.arctan2(u_steering, v_steering)) + 180) % 360
+            
+            return {
+                "speed": float(speed),
+                "direction": float(direction),
+                "u": float(u_steering),
+                "v": float(v_steering),
+                "method": "layer_averaged_wind_850-300hPa"
+            }
+            
+        except Exception as e:
+            print(f"⚠️ 层平均引导气流计算失败: {e}")
+            return None
+    
+    def _extract_ridge_line(self, z500, tc_lat, tc_lon, threshold=5880):
+        """
+        提取副高脊线位置(588线的东西端点)
+        
+        Args:
+            z500: 500hPa位势高度场
+            tc_lat: 台风中心纬度
+            tc_lon: 台风中心经度
+            threshold: 脊线阈值 (默认5880gpm)
+        
+        Returns:
+            脊线信息字典，包含东西端点位置，或None
+        """
+        try:
+            # 1. 提取等值线
+            contours = find_contours(z500, threshold)
+            
+            if not contours or len(contours) == 0:
+                return None
+            
+            # 2. 选择最长的等值线 (主脊线)
+            main_contour = sorted(contours, key=len, reverse=True)[0]
+            
+            # 3. 转换为地理坐标
+            contour_indices_lat = main_contour[:, 0].astype(int)
+            contour_indices_lon = main_contour[:, 1].astype(int)
+            
+            # 确保索引有效
+            contour_indices_lat = np.clip(contour_indices_lat, 0, len(self.lat) - 1)
+            contour_indices_lon = np.clip(contour_indices_lon, 0, len(self.lon) - 1)
+            
+            contour_lons = self.lon[contour_indices_lon]
+            contour_lats = self.lat[contour_indices_lat]
+            
+            # 4. 找到脊线的东西端点
+            # 归一化经度到台风中心附近
+            contour_lons_normalized = self._normalize_longitude(contour_lons, tc_lon)
+            
+            # 东端 (最大经度)
+            east_idx = np.argmax(contour_lons_normalized)
+            east_lon = float(contour_lons[east_idx])
+            east_lat = float(contour_lats[east_idx])
+            
+            # 西端 (最小经度)
+            west_idx = np.argmin(contour_lons_normalized)
+            west_lon = float(contour_lons[west_idx])
+            west_lat = float(contour_lats[west_idx])
+            
+            # 5. 计算脊线相对于台风的位置
+            _, east_bearing = self._calculate_bearing(tc_lat, tc_lon, east_lat, east_lon)
+            _, west_bearing = self._calculate_bearing(tc_lat, tc_lon, west_lat, west_lon)
+            
+            return {
+                "east_end": {
+                    "latitude": round(east_lat, 2),
+                    "longitude": round(east_lon, 2),
+                    "relative_position": east_bearing
+                },
+                "west_end": {
+                    "latitude": round(west_lat, 2),
+                    "longitude": round(west_lon, 2),
+                    "relative_position": west_bearing
+                },
+                "threshold_gpm": threshold,
+                "description": f"588线从{west_bearing}延伸至{east_bearing}"
+            }
+            
+        except Exception as e:
+            print(f"⚠️ 脊线提取失败: {e}")
+            return None
+    
+    def _extract_local_boundary_coords(self, z500, tc_lat, tc_lon, threshold=5880, radius_deg=20, max_points=50):
+        """
+        在局部区域内提取副高边界坐标
+        
+        Args:
+            z500: 500hPa位势高度场
+            tc_lat: 台风中心纬度
+            tc_lon: 台风中心经度
+            threshold: 等值线阈值 (默认5880gpm)
+            radius_deg: 局部区域半径（度），默认20度
+            max_points: 最大返回点数
+        
+        Returns:
+            边界坐标列表 [[lon, lat], ...] 或 None
+        """
+        try:
+            # 1. 定义局部区域范围
+            lat_min = max(tc_lat - radius_deg, self.lat.min())
+            lat_max = min(tc_lat + radius_deg, self.lat.max())
+            lon_min = tc_lon - radius_deg
+            lon_max = tc_lon + radius_deg
+            
+            # 2. 创建区域掩膜
+            lat_mask = (self.lat >= lat_min) & (self.lat <= lat_max)
+            
+            # 处理经度跨越0°/360°的情况
+            if lon_min < 0:
+                lon_mask = (self.lon >= lon_min + 360) | (self.lon <= lon_max)
+            elif lon_max > 360:
+                lon_mask = (self.lon >= lon_min) | (self.lon <= lon_max - 360)
+            else:
+                lon_mask = (self.lon >= lon_min) & (self.lon <= lon_max)
+            
+            # 3. 提取局部数据
+            local_z500 = z500[np.ix_(lat_mask, lon_mask)]
+            local_lat = self.lat[lat_mask]
+            local_lon = self.lon[lon_mask]
+            
+            # 4. 在局部数据上提取等值线
+            boundary_coords = self._get_contour_coords_local(
+                local_z500, threshold, local_lat, local_lon, tc_lon, max_points
+            )
+            
+            return boundary_coords
+            
+        except Exception as e:
+            print(f"⚠️ 局部边界提取失败: {e}")
+            return None
+    
+    def _extract_closed_boundary_with_features(self, z500, tc_lat, tc_lon, threshold, 
+                                               lat_range=20.0, lon_range=40.0, 
+                                               target_points=50):
+        """
+        提取闭合边界并标注关键特征点（科学安全的方法）
+        
+        改进点:
+        1. 使用连通区域标注确保边界闭合
+        2. 自适应采样保留关键形态特征
+        3. 自动识别并标注关键特征点
+        4. 多重回退机制确保稳定性
+        
+        Args:
+            z500: 500hPa位势高度场
+            tc_lat: 台风中心纬度
+            tc_lon: 台风中心经度
+            threshold: 等值线阈值
+            lat_range: 纬度范围（默认20度）
+            lon_range: 经度范围（默认40度）
+            target_points: 目标采样点数（默认50）
+        
+        Returns:
+            dict: {
+                "boundary_coordinates": [[lon, lat], ...],  # 闭合边界坐标
+                "boundary_features": {
+                    "extreme_points": {...},  # 极值点
+                    "ridge_intersections": [...],  # 脊线交点
+                    "curvature_extremes": [...],  # 曲率极值点
+                    "tc_relative_points": {...}  # 相对台风的关键点
+                },
+                "boundary_metrics": {
+                    "is_closed": bool,
+                    "total_points": int,
+                    "perimeter_km": float,
+                    "angle_coverage_deg": float,
+                    ...
+                }
+            }
+        """
+        try:
+            from skimage.measure import label, find_contours
+            from scipy.spatial.distance import cdist
+            
+            # 第1步: 定义局部区域并提取数据
+            lat_min = max(tc_lat - lat_range / 2, self.lat.min())
+            lat_max = min(tc_lat + lat_range / 2, self.lat.max())
+            lon_min = tc_lon - lon_range / 2
+            lon_max = tc_lon + lon_range / 2
+            
+            # 创建区域掩膜
+            lat_mask = (self.lat >= lat_min) & (self.lat <= lat_max)
+            
+            # 处理经度跨越0°/360°
+            if lon_min < 0:
+                lon_mask = (self.lon >= lon_min + 360) | (self.lon <= lon_max)
+            elif lon_max > 360:
+                lon_mask = (self.lon >= lon_min) | (self.lon <= lon_max - 360)
+            else:
+                lon_mask = (self.lon >= lon_min) & (self.lon <= lon_max)
+            
+            # 提取局部数据
+            local_z500 = z500[np.ix_(lat_mask, lon_mask)]
+            local_lat = self.lat[lat_mask]
+            local_lon = self.lon[lon_mask]
+            
+            if local_z500.size == 0:
+                print(f"⚠️ 局部区域无数据")
+                return None
+            
+            # 第2步: 使用连通区域标注方法提取闭合边界（科学方法）
+            boundary_coords = None
+            method_used = None
+            
+            # 方法1: 连通区域标注（最优方法）
+            try:
+                # 创建二值掩膜
+                mask = (local_z500 >= threshold).astype(int)
+                
+                # 标注连通区域
+                labeled = label(mask, connectivity=2)
+                
+                if labeled.max() == 0:
+                    raise ValueError("未找到连通区域")
+                
+                # 找到包含台风周围的连通区域（距台风中心最近的区域）
+                tc_lat_idx = np.argmin(np.abs(local_lat - tc_lat))
+                tc_lon_idx = np.argmin(np.abs(local_lon - tc_lon))
+                
+                # 获取台风附近的标签
+                target_label = labeled[tc_lat_idx, tc_lon_idx]
+                
+                if target_label == 0:
+                    # 如果台风位置不在高压区，选择最大连通区域
+                    unique, counts = np.unique(labeled[labeled > 0], return_counts=True)
+                    target_label = unique[np.argmax(counts)]
+                
+                # 提取该连通区域的外轮廓
+                contours = find_contours((labeled == target_label).astype(float), 0.5)
+                
+                if contours and len(contours) > 0:
+                    # 选择最长的轮廓（外边界）
+                    main_contour = sorted(contours, key=len, reverse=True)[0]
+                    boundary_coords = main_contour
+                    method_used = "connected_component_labeling"
+                    
+            except Exception as e:
+                print(f"⚠️ 连通区域方法失败: {e}，尝试方法2")
+            
+            # 方法2: 扩大区域重试（回退方法）
+            if boundary_coords is None:
+                try:
+                    # 扩大到30°x60°
+                    expanded_result = self._extract_closed_boundary_with_features(
+                        z500, tc_lat, tc_lon, threshold,
+                        lat_range=30.0, lon_range=60.0, target_points=target_points
+                    )
+                    if expanded_result:
+                        expanded_result["boundary_metrics"]["method_note"] = "使用扩大区域(30x60)"
+                        return expanded_result
+                        
+                except Exception as e:
+                    print(f"⚠️ 扩大区域方法失败: {e}，尝试方法3")
+            
+            # 方法3: 原find_contours方法（最后兜底）
+            if boundary_coords is None:
+                try:
+                    contours = find_contours(local_z500, threshold)
+                    if contours and len(contours) > 0:
+                        boundary_coords = sorted(contours, key=len, reverse=True)[0]
+                        method_used = "direct_contour_extraction"
+                except Exception as e:
+                    print(f"⚠️ 所有方法均失败: {e}")
+                    return None
+            
+            if boundary_coords is None or len(boundary_coords) == 0:
+                return None
+            
+            # 第3步: 将像素坐标转换为地理坐标
+            geo_coords = []
+            for point in boundary_coords:
+                lat_idx = int(np.clip(point[0], 0, len(local_lat) - 1))
+                lon_idx = int(np.clip(point[1], 0, len(local_lon) - 1))
+                
+                lat_val = float(local_lat[lat_idx])
+                lon_val = float(local_lon[lon_idx])
+                
+                # 归一化经度
+                lon_normalized = self._normalize_longitude(np.array([lon_val]), tc_lon)[0]
+                if lon_normalized < 0:
+                    lon_normalized += 360
+                    
+                geo_coords.append([lon_normalized, lat_val])
+            
+            # 第4步: 智能采样（保留关键特征）
+            sampled_coords = self._adaptive_boundary_sampling(
+                geo_coords, target_points=target_points
+            )
+            
+            # 第5步: 确保闭合（如果首尾距离>阈值，添加闭合点）
+            if len(sampled_coords) > 2:
+                first = sampled_coords[0]
+                last = sampled_coords[-1]
+                closure_dist = np.sqrt((last[0]-first[0])**2 + (last[1]-first[1])**2)
+                
+                if closure_dist > 1.0:  # 如果首尾距离>1度，添加首点形成闭合
+                    sampled_coords.append(first)
+            
+            # 第6步: 提取关键特征点
+            features = self._extract_boundary_features(
+                sampled_coords, tc_lat, tc_lon, threshold
+            )
+            
+            # 第7步: 计算边界度量
+            metrics = self._calculate_boundary_metrics(
+                sampled_coords, tc_lat, tc_lon, method_used
+            )
+            
+            # 返回完整结果
+            return {
+                "boundary_coordinates": sampled_coords,
+                "boundary_features": features,
+                "boundary_metrics": metrics
+            }
+            
+        except Exception as e:
+            print(f"⚠️ 闭合边界提取完全失败: {e}")
+            import traceback
+            traceback.print_exc()
+            return None
+    
+    def _adaptive_boundary_sampling(self, coords, target_points=50, method="auto"):
+        """
+        智能自适应边界采样
+        
+        支持三种采样策略:
+        1. curvature: 基于曲率的自适应采样（高曲率区域密集采样）
+        2. perimeter: 基于周长的比例采样（均匀分布）
+        3. douglas_peucker: 道格拉斯-普克算法（保留关键点）
+        
+        Args:
+            coords: 原始坐标列表 [[lon, lat], ...]
+            target_points: 目标点数
+            method: 采样方法 ("auto", "curvature", "perimeter", "douglas_peucker")
+        
+        Returns:
+            采样后的坐标列表
+        """
+        if len(coords) <= target_points:
+            return coords
+        
+        # 自动选择最佳方法
+        if method == "auto":
+            perimeter_deg = self._calculate_perimeter(coords)
+            
+            # 小系统（周长<50°）使用曲率方法
+            if perimeter_deg < 50:
+                method = "curvature"
+            # 大系统使用道格拉斯-普克算法
+            else:
+                method = "douglas_peucker"
+        
+        # 方法1: 基于曲率的自适应采样
+        if method == "curvature":
+            return self._curvature_adaptive_sampling(coords, target_points)
+        
+        # 方法2: 基于周长的比例采样
+        elif method == "perimeter":
+            return self._perimeter_proportional_sampling(coords, target_points)
+        
+        # 方法3: 道格拉斯-普克算法
+        elif method == "douglas_peucker":
+            return self._douglas_peucker_sampling(coords, target_points)
+        
+        # 默认: 等间隔采样
+        else:
+            step = max(1, len(coords) // target_points)
+            return coords[::step]
+    
+    def _curvature_adaptive_sampling(self, coords, target_points):
+        """基于曲率的自适应采样（高曲率区域密集采样）"""
+        if len(coords) < 3:
+            return coords
+        
+        # 计算每个点的曲率
+        curvatures = []
+        for i in range(len(coords)):
+            prev_idx = (i - 1) % len(coords)
+            next_idx = (i + 1) % len(coords)
+            
+            p1 = np.array(coords[prev_idx])
+            p2 = np.array(coords[i])
+            p3 = np.array(coords[next_idx])
+            
+            # 使用Menger曲率公式
+            v1 = p2 - p1
+            v2 = p3 - p2
+            
+            cross = np.abs(v1[0] * v2[1] - v1[1] * v2[0])
+            denom = np.linalg.norm(v1) * np.linalg.norm(v2) * np.linalg.norm(p3 - p1)
+            
+            if denom > 1e-10:
+                curvature = cross / denom
+            else:
+                curvature = 0.0
+            
+            curvatures.append(curvature)
+        
+        curvatures = np.array(curvatures)
+        
+        # 基于曲率分配采样权重
+        # 归一化曲率到[0.5, 1.5]范围
+        if curvatures.max() > 1e-10:
+            weights = 0.5 + (curvatures / curvatures.max())
+        else:
+            weights = np.ones_like(curvatures)
+        
+        # 累积权重
+        cum_weights = np.cumsum(weights)
+        cum_weights = cum_weights / cum_weights[-1]  # 归一化到[0, 1]
+        
+        # 均匀采样累积权重空间
+        target_weights = np.linspace(0, 1, target_points, endpoint=False)
+        
+        # 找到最接近的索引
+        sampled_indices = []
+        for tw in target_weights:
+            idx = np.argmin(np.abs(cum_weights - tw))
+            if idx not in sampled_indices:  # 避免重复
+                sampled_indices.append(idx)
+        
+        sampled_indices = sorted(sampled_indices)
+        return [coords[i] for i in sampled_indices]
+    
+    def _perimeter_proportional_sampling(self, coords, target_points):
+        """基于周长的比例采样（沿周长均匀分布）"""
+        if len(coords) < 2:
+            return coords
+        
+        # 计算累积距离
+        distances = [0.0]
+        for i in range(1, len(coords)):
+            dx = coords[i][0] - coords[i-1][0]
+            dy = coords[i][1] - coords[i-1][1]
+            dist = np.sqrt(dx**2 + dy**2)
+            distances.append(distances[-1] + dist)
+        
+        total_dist = distances[-1]
+        if total_dist < 1e-10:
+            # 所有点重合，返回第一个点
+            return [coords[0]]
+        
+        # 沿周长均匀采样
+        target_distances = np.linspace(0, total_dist, target_points, endpoint=False)
+        
+        sampled_coords = []
+        for td in target_distances:
+            # 找到距离最接近的点
+            idx = np.argmin(np.abs(np.array(distances) - td))
+            sampled_coords.append(coords[idx])
+        
+        return sampled_coords
+    
+    def _douglas_peucker_sampling(self, coords, target_points):
+        """道格拉斯-普克算法（保留关键特征点）"""
+        if len(coords) <= target_points:
+            return coords
+        
+        # 简化版道格拉斯-普克: 迭代移除最不重要的点
+        current_coords = coords.copy()
+        
+        while len(current_coords) > target_points:
+            min_importance = float('inf')
+            min_idx = -1
+            
+            # 计算每个点的重要性（到前后点连线的距离）
+            for i in range(1, len(current_coords) - 1):
+                p1 = np.array(current_coords[i-1])
+                p2 = np.array(current_coords[i])
+                p3 = np.array(current_coords[i+1])
+                
+                # 点到线段的距离
+                importance = self._point_to_line_distance(p2, p1, p3)
+                
+                if importance < min_importance:
+                    min_importance = importance
+                    min_idx = i
+            
+            # 移除最不重要的点
+            if min_idx > 0:
+                current_coords.pop(min_idx)
+            else:
+                break
+        
+        return current_coords
+    
+    def _point_to_line_distance(self, point, line_start, line_end):
+        """计算点到线段的垂直距离"""
+        p = np.array(point)
+        a = np.array(line_start)
+        b = np.array(line_end)
+        
+        ab = b - a
+        ap = p - a
+        
+        if np.linalg.norm(ab) < 1e-10:
+            return np.linalg.norm(ap)
+        
+        # 投影比例
+        t = np.dot(ap, ab) / np.dot(ab, ab)
+        t = np.clip(t, 0, 1)
+        
+        # 最近点
+        closest = a + t * ab
+        
+        return np.linalg.norm(p - closest)
+    
+    def _calculate_perimeter(self, coords):
+        """计算边界周长（度）"""
+        if len(coords) < 2:
+            return 0.0
+        
+        perimeter = 0.0
+        for i in range(len(coords)):
+            next_idx = (i + 1) % len(coords)
+            dx = coords[next_idx][0] - coords[i][0]
+            dy = coords[next_idx][1] - coords[i][1]
+            perimeter += np.sqrt(dx**2 + dy**2)
+        
+        return perimeter
+    
+    def _extract_boundary_features(self, coords, tc_lat, tc_lon, threshold):
+        """提取边界关键特征点"""
+        if not coords or len(coords) < 4:
+            return {}
+        
+        lons = [c[0] for c in coords]
+        lats = [c[1] for c in coords]
+        
+        # 1. 极值点
+        north_idx = np.argmax(lats)
+        south_idx = np.argmin(lats)
+        east_idx = np.argmax(lons)
+        west_idx = np.argmin(lons)
+        
+        extreme_points = {
+            "north": {
+                "lon": round(lons[north_idx], 2),
+                "lat": round(lats[north_idx], 2),
+                "index": north_idx
+            },
+            "south": {
+                "lon": round(lons[south_idx], 2),
+                "lat": round(lats[south_idx], 2),
+                "index": south_idx
+            },
+            "east": {
+                "lon": round(lons[east_idx], 2),
+                "lat": round(lats[east_idx], 2),
+                "index": east_idx
+            },
+            "west": {
+                "lon": round(lons[west_idx], 2),
+                "lat": round(lats[west_idx], 2),
+                "index": west_idx
+            }
+        }
+        
+        # 2. 相对台风的关键点
+        distances = []
+        for lon, lat in coords:
+            dist = self._haversine_distance(tc_lat, tc_lon, lat, lon)
+            distances.append(dist)
+        
+        nearest_idx = np.argmin(distances)
+        farthest_idx = np.argmax(distances)
+        
+        tc_relative_points = {
+            "nearest": {
+                "lon": round(lons[nearest_idx], 2),
+                "lat": round(lats[nearest_idx], 2),
+                "index": nearest_idx,
+                "distance_km": round(distances[nearest_idx], 1)
+            },
+            "farthest": {
+                "lon": round(lons[farthest_idx], 2),
+                "lat": round(lats[farthest_idx], 2),
+                "index": farthest_idx,
+                "distance_km": round(distances[farthest_idx], 1)
+            }
+        }
+        
+        # 3. 曲率极值点（找出最凸和最凹的点）
+        curvature_extremes = []
+        if len(coords) >= 5:
+            curvatures = []
+            for i in range(len(coords)):
+                prev_idx = (i - 1) % len(coords)
+                next_idx = (i + 1) % len(coords)
+                
+                p1 = np.array(coords[prev_idx])
+                p2 = np.array(coords[i])
+                p3 = np.array(coords[next_idx])
+                
+                v1 = p2 - p1
+                v2 = p3 - p2
+                
+                cross = v1[0] * v2[1] - v1[1] * v2[0]
+                denom = np.linalg.norm(v1) * np.linalg.norm(v2) * np.linalg.norm(p3 - p1)
+                
+                if denom > 1e-10:
+                    curvature = cross / denom
+                else:
+                    curvature = 0.0
+                
+                curvatures.append((i, curvature))
+            
+            # 找出曲率最大和最小的点（各取前2个）
+            curvatures_sorted = sorted(curvatures, key=lambda x: abs(x[1]), reverse=True)
+            
+            for i, curv in curvatures_sorted[:4]:  # 取前4个高曲率点
+                if abs(curv) > 0.01:  # 只记录显著的曲率点
+                    curvature_extremes.append({
+                        "lon": round(lons[i], 2),
+                        "lat": round(lats[i], 2),
+                        "index": i,
+                        "curvature": round(curv, 4),
+                        "type": "凸出" if curv > 0 else "凹陷"
+                    })
+        
+        return {
+            "extreme_points": extreme_points,
+            "tc_relative_points": tc_relative_points,
+            "curvature_extremes": curvature_extremes
+        }
+    
+    def _calculate_boundary_metrics(self, coords, tc_lat, tc_lon, method_used):
+        """计算边界度量指标"""
+        if not coords or len(coords) < 2:
+            return {}
+        
+        lons = [c[0] for c in coords]
+        lats = [c[1] for c in coords]
+        
+        # 检查闭合性
+        first = coords[0]
+        last = coords[-1]
+        closure_dist = np.sqrt((last[0]-first[0])**2 + (last[1]-first[1])**2)
+        is_closed = closure_dist < 1.0
+        
+        # 计算周长（km）
+        perimeter_km = 0.0
+        for i in range(len(coords)):
+            next_idx = (i + 1) % len(coords) if is_closed else min(i + 1, len(coords) - 1)
+            if next_idx != i:
+                dist_km = self._haversine_distance(
+                    lats[i], lons[i], lats[next_idx], lons[next_idx]
+                )
+                perimeter_km += dist_km
+        
+        # 计算方位角覆盖
+        center_lon = np.mean(lons)
+        center_lat = np.mean(lats)
+        
+        angles = []
+        for lon, lat in coords:
+            angle = np.arctan2(lat - center_lat, lon - center_lon) * 180 / np.pi
+            angles.append(angle)
+        
+        angle_coverage = max(angles) - min(angles) if angles else 0
+        if is_closed:
+            angle_coverage = 360.0
+        
+        # 平均点间距
+        avg_spacing_km = perimeter_km / len(coords) if len(coords) > 0 else 0
+        
+        # 长宽比
+        lon_span = max(lons) - min(lons)
+        lat_span = max(lats) - min(lats)
+        aspect_ratio = lon_span / lat_span if lat_span > 0 else 0
+        
+        return {
+            "is_closed": bool(is_closed),  # 转换为Python bool
+            "total_points": int(len(coords)),  # 转换为Python int
+            "perimeter_km": round(float(perimeter_km), 1),
+            "avg_point_spacing_km": round(float(avg_spacing_km), 1),
+            "angle_coverage_deg": round(float(angle_coverage), 1),
+            "closure_distance_deg": round(float(closure_dist), 2),
+            "aspect_ratio": round(float(aspect_ratio), 2),
+            "lon_span_deg": round(float(lon_span), 2),
+            "lat_span_deg": round(float(lat_span), 2),
+            "extraction_method": method_used or "unknown"
+        }
+
+    def _extract_closed_ocean_boundary_with_features(self, sst, tc_lat, tc_lon, threshold=26.5, 
+                                                      lat_range=20.0, lon_range=40.0, 
+                                                      target_points=50):
+        """
+        提取海洋热含量闭合边界并标注关键特征点（专用于SST场）
+        
+        改进点:
+        1. 使用连通区域标注确保26.5°C等温线边界闭合
+        2. 曲率自适应采样保留暖涡/冷涡特征
+        3. 自动识别并标注关键特征点（极值点、暖涡中心、相对台风位置）
+        4. 多重回退机制确保稳定性
+        
+        技术特点:
+        - 复用Steering系统的成功经验（90%代码复用）
+        - 针对SST场特性优化（暖水区识别、暖涡提取）
+        - 三重安全机制：连通标注 → 扩大区域 → 原始方法
+        
+        Args:
+            sst: 海表温度场 (2D array)
+            tc_lat: 台风中心纬度
+            tc_lon: 台风中心经度
+            threshold: 等温线阈值（默认26.5°C，台风发展最低海温门槛）
+            lat_range: 纬度范围（默认20度）
+            lon_range: 经度范围（默认40度）
+            target_points: 目标采样点数（默认50）
+        
+        Returns:
+            dict: {
+                "boundary_coordinates": [[lon, lat], ...],  # 闭合边界坐标
+                "boundary_features": {
+                    "extreme_points": {...},  # 4个极值点（最北/南/东/西）
+                    "warm_eddy_centers": [...],  # 暖涡中心（凸出部分）
+                    "cold_intrusion_points": [...],  # 冷涡侵入点（凹陷部分）
+                    "curvature_extremes": [...],  # 曲率极值点
+                    "tc_relative_points": {...}  # 相对台风的关键点（最近/最远）
+                },
+                "boundary_metrics": {
+                    "is_closed": bool,  # 边界是否闭合
+                    "total_points": int,  # 总点数
+                    "perimeter_km": float,  # 周长（公里）
+                    "angle_coverage_deg": float,  # 方位角覆盖度（度）
+                    "warm_water_area_approx_km2": float,  # 暖水区近似面积
+                    ...
+                }
+            }
+        """
+        try:
+            from skimage.measure import label, find_contours
+            from scipy.spatial.distance import cdist
+            
+            # 第1步: 定义局部区域并提取数据
+            lat_min = max(tc_lat - lat_range / 2, self.lat.min())
+            lat_max = min(tc_lat + lat_range / 2, self.lat.max())
+            lon_min = tc_lon - lon_range / 2
+            lon_max = tc_lon + lon_range / 2
+            
+            # 创建区域掩膜
+            lat_mask = (self.lat >= lat_min) & (self.lat <= lat_max)
+            
+            # 处理经度跨越0°/360°
+            if lon_min < 0:
+                lon_mask = (self.lon >= lon_min + 360) | (self.lon <= lon_max)
+            elif lon_max > 360:
+                lon_mask = (self.lon >= lon_min) | (self.lon <= lon_max - 360)
+            else:
+                lon_mask = (self.lon >= lon_min) & (self.lon <= lon_max)
+            
+            # 提取局部SST数据
+            local_sst = sst[np.ix_(lat_mask, lon_mask)]
+            local_lat = self.lat[lat_mask]
+            local_lon = self.lon[lon_mask]
+            
+            if local_sst.size == 0:
+                print(f"⚠️ 局部区域无SST数据")
+                return None
+            
+            # 第2步: 使用连通区域标注方法提取闭合边界（科学方法）
+            boundary_coords = None
+            method_used = None
+            
+            # 方法1: 连通区域标注（最优方法）
+            try:
+                # 创建二值掩膜（SST >= 26.5°C的暖水区）
+                mask = (local_sst >= threshold).astype(int)
+                
+                # 标注连通区域
+                labeled = label(mask, connectivity=2)
+                
+                if labeled.max() == 0:
+                    raise ValueError("未找到暖水连通区域")
+                
+                # 找到包含台风的连通区域（距台风中心最近的暖水区）
+                tc_lat_idx = np.argmin(np.abs(local_lat - tc_lat))
+                tc_lon_idx = np.argmin(np.abs(local_lon - tc_lon))
+                
+                # 获取台风位置的标签
+                target_label = labeled[tc_lat_idx, tc_lon_idx]
+                
+                if target_label == 0:
+                    # 如果台风位置不在暖水区，选择最大连通区域
+                    unique, counts = np.unique(labeled[labeled > 0], return_counts=True)
+                    target_label = unique[np.argmax(counts)]
+                
+                # 提取该连通区域的外轮廓
+                contours = find_contours((labeled == target_label).astype(float), 0.5)
+                
+                if contours and len(contours) > 0:
+                    # 选择最长的轮廓（外边界）
+                    main_contour = sorted(contours, key=len, reverse=True)[0]
+                    boundary_coords = main_contour
+                    method_used = "connected_component_labeling"
+                    print(f"✅ 方法1成功: 连通区域标注提取到{len(main_contour)}个点")
+                    
+            except Exception as e:
+                print(f"⚠️ 连通区域方法失败: {e}，尝试方法2")
+            
+            # 方法2: 扩大区域重试（回退方法）
+            if boundary_coords is None:
+                try:
+                    print(f"🔄 方法2: 扩大区域到30°x60°")
+                    # 扩大到30°x60°
+                    expanded_result = self._extract_closed_ocean_boundary_with_features(
+                        sst, tc_lat, tc_lon, threshold,
+                        lat_range=30.0, lon_range=60.0, target_points=target_points
+                    )
+                    if expanded_result:
+                        expanded_result["boundary_metrics"]["method_note"] = "使用扩大区域(30x60)"
+                        return expanded_result
+                        
+                except Exception as e:
+                    print(f"⚠️ 扩大区域方法失败: {e}，尝试方法3")
+            
+            # 方法3: 原find_contours方法（最后兜底）
+            if boundary_coords is None:
+                try:
+                    print(f"🔄 方法3: 使用原始find_contours方法")
+                    contours = find_contours(local_sst, threshold)
+                    if contours and len(contours) > 0:
+                        boundary_coords = sorted(contours, key=len, reverse=True)[0]
+                        method_used = "direct_contour_extraction"
+                        print(f"✅ 方法3成功: 提取到{len(boundary_coords)}个点")
+                except Exception as e:
+                    print(f"⚠️ 所有方法均失败: {e}")
+                    return None
+            
+            if boundary_coords is None or len(boundary_coords) == 0:
+                return None
+            
+            # 第3步: 将像素坐标转换为地理坐标
+            geo_coords = []
+            for point in boundary_coords:
+                lat_idx = int(np.clip(point[0], 0, len(local_lat) - 1))
+                lon_idx = int(np.clip(point[1], 0, len(local_lon) - 1))
+                
+                lat_val = float(local_lat[lat_idx])
+                lon_val = float(local_lon[lon_idx])
+                
+                # 归一化经度
+                lon_normalized = self._normalize_longitude(np.array([lon_val]), tc_lon)[0]
+                if lon_normalized < 0:
+                    lon_normalized += 360
+                    
+                geo_coords.append([lon_normalized, lat_val])
+            
+            # 第4步: 智能采样（保留暖涡/冷涡特征）
+            sampled_coords = self._adaptive_boundary_sampling(
+                geo_coords, target_points=target_points, method="curvature"
+            )
+            
+            # 第5步: 确保闭合（如果首尾距离>阈值，添加闭合点）
+            if len(sampled_coords) > 2:
+                first = sampled_coords[0]
+                last = sampled_coords[-1]
+                closure_dist = np.sqrt((last[0]-first[0])**2 + (last[1]-first[1])**2)
+                
+                if closure_dist > 1.0:  # 如果首尾距离>1度，添加首点形成闭合
+                    sampled_coords.append(first)
+                    print(f"🔒 边界闭合: 添加首点，闭合距离从{closure_dist:.2f}°降至0")
+            
+            # 第6步: 提取关键特征点（针对海洋热含量特性）
+            features = self._extract_ocean_boundary_features(
+                sampled_coords, tc_lat, tc_lon, threshold
+            )
+            
+            # 第7步: 计算边界度量
+            metrics = self._calculate_boundary_metrics(
+                sampled_coords, tc_lat, tc_lon, method_used
+            )
+            
+            # 额外计算暖水区近似面积（使用Green定理）
+            metrics["warm_water_area_approx_km2"] = self._calculate_polygon_area_km2(sampled_coords)
+            
+            # 返回完整结果
+            return {
+                "boundary_coordinates": sampled_coords,
+                "boundary_features": features,
+                "boundary_metrics": metrics
+            }
+            
+        except Exception as e:
+            print(f"⚠️ OceanHeat闭合边界提取完全失败: {e}")
+            import traceback
+            traceback.print_exc()
+            return None
+    
+    def _extract_ocean_boundary_features(self, coords, tc_lat, tc_lon, threshold):
+        """
+        提取海洋热含量边界的关键特征点
+        
+        针对SST边界的特殊处理:
+        - 暖涡中心: 边界向外凸出的部分（高曲率凸点）
+        - 冷涡侵入: 边界向内凹陷的部分（高曲率凹点）
+        - 相对台风位置: 最近点（台风可能驶离）、最远点（暖水区延伸方向）
+        
+        Returns:
+            dict: 包含各类特征点的字典
+        """
+        if not coords or len(coords) < 3:
+            return {}
+        
+        lons = np.array([c[0] for c in coords])
+        lats = np.array([c[1] for c in coords])
+        
+        # 1. 四个极值点（地理位置极值）
+        north_idx = np.argmax(lats)
+        south_idx = np.argmin(lats)
+        east_idx = np.argmax(lons)
+        west_idx = np.argmin(lons)
+        
+        extreme_points = {
+            "northernmost": {"lon": float(lons[north_idx]), "lat": float(lats[north_idx])},
+            "southernmost": {"lon": float(lons[south_idx]), "lat": float(lats[south_idx])},
+            "easternmost": {"lon": float(lons[east_idx]), "lat": float(lats[east_idx])},
+            "westernmost": {"lon": float(lons[west_idx]), "lat": float(lats[west_idx])},
+        }
+        
+        # 2. 相对台风的关键点
+        distances = [self._haversine_distance(tc_lat, tc_lon, lat, lon) 
+                    for lon, lat in coords]
+        
+        nearest_idx = np.argmin(distances)
+        farthest_idx = np.argmax(distances)
+        
+        tc_relative_points = {
+            "nearest_to_tc": {
+                "lon": float(lons[nearest_idx]),
+                "lat": float(lats[nearest_idx]),
+                "distance_km": round(float(distances[nearest_idx]), 1),
+                "description": "台风到暖水区边界的最短距离"
+            },
+            "farthest_from_tc": {
+                "lon": float(lons[farthest_idx]),
+                "lat": float(lats[farthest_idx]),
+                "distance_km": round(float(distances[farthest_idx]), 1),
+                "description": "暖水区延伸的最远点"
+            }
+        }
+        
+        # 3. 曲率极值点（暖涡和冷涡特征）
+        curvature_extremes = []
+        warm_eddy_centers = []
+        cold_intrusion_points = []
+        
+        if len(coords) >= 5:
+            # 计算每个点的Menger曲率
+            curvatures = []
+            for i in range(len(coords)):
+                prev_idx = (i - 2) % len(coords)
+                next_idx = (i + 2) % len(coords)
+                
+                p1 = np.array([lons[prev_idx], lats[prev_idx]])
+                p2 = np.array([lons[i], lats[i]])
+                p3 = np.array([lons[next_idx], lats[next_idx]])
+                
+                # Menger曲率公式
+                area = 0.5 * abs((p2[0]-p1[0])*(p3[1]-p1[1]) - (p3[0]-p1[0])*(p2[1]-p1[1]))
+                a = np.linalg.norm(p2 - p1)
+                b = np.linalg.norm(p3 - p2)
+                c = np.linalg.norm(p3 - p1)
+                
+                if a * b * c > 1e-10:
+                    curvature = 4 * area / (a * b * c)
+                else:
+                    curvature = 0
+                
+                curvatures.append(curvature)
+            
+            curvatures = np.array(curvatures)
+            
+            # 找到局部极大值（高曲率点）
+            high_curvature_threshold = np.percentile(curvatures, 90)
+            high_curv_indices = np.where(curvatures > high_curvature_threshold)[0]
+            
+            for idx in high_curv_indices[:5]:  # 最多5个
+                # 判断是凸出（暖涡）还是凹陷（冷涡）
+                # 简化判断：相对台风中心的距离变化
+                dist_to_tc = self._haversine_distance(tc_lat, tc_lon, lats[idx], lons[idx])
+                avg_dist = np.mean(distances)
+                
+                point_info = {
+                    "lon": float(lons[idx]),
+                    "lat": float(lats[idx]),
+                    "curvature": round(float(curvatures[idx]), 6)
+                }
+                
+                if dist_to_tc > avg_dist * 1.1:
+                    # 凸出部分 - 可能是暖涡中心
+                    warm_eddy_centers.append({
+                        **point_info,
+                        "type": "warm_eddy",
+                        "description": "暖水区向外延伸的暖涡"
+                    })
+                elif dist_to_tc < avg_dist * 0.9:
+                    # 凹陷部分 - 可能是冷水侵入
+                    cold_intrusion_points.append({
+                        **point_info,
+                        "type": "cold_intrusion",
+                        "description": "冷水向暖水区侵入"
+                    })
+                
+                curvature_extremes.append(point_info)
+        
+        return {
+            "extreme_points": extreme_points,
+            "warm_eddy_centers": warm_eddy_centers[:3],  # 最多3个暖涡
+            "cold_intrusion_points": cold_intrusion_points[:3],  # 最多3个冷涡
+            "curvature_extremes": curvature_extremes[:5],  # 最多5个高曲率点
+            "tc_relative_points": tc_relative_points
+        }
+    
+    def _calculate_polygon_area_km2(self, coords):
+        """
+        使用Green定理计算多边形面积（近似，适用于小区域）
+        
+        Args:
+            coords: [[lon, lat], ...] 坐标列表
+        
+        Returns:
+            float: 面积（平方公里）
+        """
+        if not coords or len(coords) < 3:
+            return 0.0
+        
+        # 转换为米制坐标（近似）
+        lons = np.array([c[0] for c in coords])
+        lats = np.array([c[1] for c in coords])
+        
+        # 中心点
+        center_lat = np.mean(lats)
+        center_lon = np.mean(lons)
+        
+        # 转换为相对米坐标
+        x_m = (lons - center_lon) * 111000 * np.cos(np.radians(center_lat))
+        y_m = (lats - center_lat) * 111000
+        
+        # Shoelace公式
+        area_m2 = 0.5 * abs(sum(x_m[i]*y_m[i+1] - x_m[i+1]*y_m[i] 
+                                for i in range(len(x_m)-1)))
+        
+        # 转换为km²
+        area_km2 = area_m2 / 1e6
+        
+        return round(float(area_km2), 1)
 
     # ================= 新增: 流式顺序处理函数 =================
+
