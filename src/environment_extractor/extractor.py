@@ -1127,102 +1127,215 @@ class TCEnvironmentalSystemsExtractor:
 
     def extract_frontal_system(self, time_idx, tc_lat, tc_lon):
         """
-        提取并解译锋面系统。
-        锋面系统通过温度梯度和风切变影响台风的移动路径。
+        提取并解译锋面系统（改进版）。
+        使用厚度场梯度+前生函数+风向辐合综合判定锋面。
+        在台风周围800-1200km范围内搜索，提取近中心段锋线。
         """
         try:
+            # 1. 获取必要的气象场
             t850 = self._get_data_at_level("t", 850, time_idx)
-            if t850 is None:
+            t500 = self._get_data_at_level("t", 500, time_idx)
+            t1000 = self._get_data_at_level("t", 1000, time_idx)
+            
+            # 尝试获取925hPa风场用于辐合判断
+            u925 = self._get_data_at_level("u", 925, time_idx)
+            v925 = self._get_data_at_level("v", 925, time_idx)
+            
+            if t850 is None or t500 is None:
                 return None
-
-            # 转换温度单位
+            
+            # 转换温度单位到摄氏度
             if np.nanmean(t850) > 200:
                 t850 = t850 - 273.15
-
-            # 计算温度梯度来识别锋面 (防止极区 cos(latitude)=0 导致除零 -> inf)
+            if np.nanmean(t500) > 200:
+                t500 = t500 - 273.15
+            if t1000 is not None and np.nanmean(t1000) > 200:
+                t1000 = t1000 - 273.15
+            
+            # 2. 计算厚度场 (1000-500 hPa 或使用850作为替代)
+            if t1000 is not None:
+                thickness = t1000 - t500  # 厚度近似
+            else:
+                thickness = t850 - t500  # 使用850-500作为替代
+            
+            # 3. 计算厚度梯度（更能体现锋面特征）
+            with np.errstate(divide="ignore", invalid="ignore"):
+                gy_thick, gx_thick = self._raw_gradients(thickness)
+                dthick_dy = gy_thick / (self.lat_spacing * 111000)
+                dthick_dx = gx_thick / (self.lon_spacing * 111000 * self._coslat_safe[:, np.newaxis])
+                thickness_gradient = np.sqrt(dthick_dx**2 + dthick_dy**2)
+            
+            # 4. 计算850hPa温度梯度（辅助判断）
             with np.errstate(divide="ignore", invalid="ignore"):
                 gy_t, gx_t = self._raw_gradients(t850)
                 dt_dy = gy_t / (self.lat_spacing * 111000)
                 dt_dx = gx_t / (self.lon_spacing * 111000 * self._coslat_safe[:, np.newaxis])
                 temp_gradient = np.sqrt(dt_dx**2 + dt_dy**2)
-
+            
+            # 5. 计算前生函数（简化版：温度梯度的变化率）
+            with np.errstate(divide="ignore", invalid="ignore"):
+                gy_tgrad, gx_tgrad = self._raw_gradients(temp_gradient)
+                frontogenesis = np.sqrt(gy_tgrad**2 + gx_tgrad**2)
+            
+            # 6. 如果有925hPa风场，计算风向辐合
+            wind_convergence = None
+            if u925 is not None and v925 is not None:
+                with np.errstate(divide="ignore", invalid="ignore"):
+                    gy_v, gx_u = self._raw_gradients(v925)[0], self._raw_gradients(u925)[1]
+                    # 球面散度（简化）
+                    du_dx = gx_u / (self.lon_spacing * 111000 * self._coslat_safe[:, np.newaxis])
+                    dv_dy = gy_v / (self.lat_spacing * 111000)
+                    wind_convergence = -(du_dx + dv_dy)  # 负散度=辐合
+            
             # 清理异常值
-            if not np.any(np.isfinite(temp_gradient)):
+            for field in [thickness_gradient, temp_gradient, frontogenesis]:
+                if field is not None:
+                    field[~np.isfinite(field)] = np.nan
+            
+            if wind_convergence is not None:
+                wind_convergence[~np.isfinite(wind_convergence)] = np.nan
+            
+            # 7. 综合判断锋面（厚度梯度为主，温度梯度和前生函数为辅）
+            # 标准化到0-1范围
+            def normalize_field(field):
+                if field is None or not np.any(np.isfinite(field)):
+                    return np.zeros_like(thickness_gradient)
+                valid = field[np.isfinite(field)]
+                if len(valid) == 0:
+                    return np.zeros_like(field)
+                p5, p95 = np.percentile(valid, [5, 95])
+                if p95 <= p5:
+                    return np.zeros_like(field)
+                return np.clip((field - p5) / (p95 - p5), 0, 1)
+            
+            norm_thickness_grad = normalize_field(thickness_gradient)
+            norm_temp_grad = normalize_field(temp_gradient)
+            norm_frontogenesis = normalize_field(frontogenesis)
+            norm_convergence = normalize_field(wind_convergence) if wind_convergence is not None else np.zeros_like(norm_thickness_grad)
+            
+            # 综合指标：厚度梯度权重最高
+            frontal_index = (
+                0.5 * norm_thickness_grad +
+                0.25 * norm_temp_grad +
+                0.15 * norm_frontogenesis +
+                0.10 * norm_convergence
+            )
+            
+            # 8. 在台风周围800-1200km范围内搜索锋面
+            search_radius_km = 1000  # 1000km搜索半径
+            search_mask = self._create_circular_mask_haversine(tc_lat, tc_lon, search_radius_km)
+            
+            # 应用掩膜
+            frontal_index_local = np.where(search_mask, frontal_index, np.nan)
+            
+            if not np.any(np.isfinite(frontal_index_local)):
                 return None
-            temp_gradient[~np.isfinite(temp_gradient)] = np.nan
-
-            # 寻找强温度梯度区域（锋面特征）
-            front_threshold = np.percentile(temp_gradient, 90)  # 前10%的强梯度区域
-            front_mask = temp_gradient > front_threshold
-
+            
+            # 9. 确定锋面阈值（在搜索区域内的前15%）
+            valid_values = frontal_index_local[np.isfinite(frontal_index_local)]
+            if len(valid_values) < 10:
+                return None
+            
+            front_threshold = np.percentile(valid_values, 85)  # 前15%
+            front_mask = frontal_index_local > front_threshold
+            
             if not np.any(front_mask):
                 return None
-
-            # 寻找离台风最近的锋面
-            lat_idx, lon_idx = self._loc_idx(tc_lat, tc_lon)
-            search_radius = 50  # 搜索半径格点数
-
-            lat_start = max(0, lat_idx - search_radius)
-            lat_end = min(len(self.lat), lat_idx + search_radius)
-            lon_start = max(0, lon_idx - search_radius)
-            lon_end = min(len(self.lon), lon_idx + search_radius)
-
-            local_front = front_mask[lat_start:lat_end, lon_start:lon_end]
-            if not np.any(local_front):
+            
+            # 10. 提取锋面最强区域的特征
+            # 找到最大强度位置
+            max_idx = np.unravel_index(np.nanargmax(frontal_index_local), frontal_index_local.shape)
+            front_lat = self.lat[max_idx[0]]
+            front_lon = self.lon[max_idx[1]]
+            
+            # 计算实际温度梯度强度（用于输出）
+            front_temp_gradient = temp_gradient[max_idx]
+            if not np.isfinite(front_temp_gradient) or front_temp_gradient <= 0:
                 return None
-
-            # 使用有限值的最大值
-            finite_vals = temp_gradient[front_mask][np.isfinite(temp_gradient[front_mask])]
-            if finite_vals.size == 0:
-                return None
-            front_strength = np.max(finite_vals)
-
-            # 数值合理性限制，极端情况裁剪，单位: °C/m
-            if not np.isfinite(front_strength) or front_strength <= 0:
-                return None
-            # 典型锋面水平温度梯度 ~ 1e-5 到 数值模式中少见超过 1e-4
-            front_strength = float(np.clip(front_strength, 0, 5e-4))
-
-            if front_strength > 3e-5:
+            
+            front_temp_gradient = float(np.clip(front_temp_gradient, 0, 5e-4))
+            
+            # 11. 判断锋面强度等级
+            if front_temp_gradient > 3e-5:
                 level = "强"
-            elif front_strength > 1e-5:
+            elif front_temp_gradient > 1.5e-5:
                 level = "中等"
             else:
                 level = "弱"
-
-            strength_1e5 = front_strength * 1e5  # 转换为 ×10⁻⁵ °C/m 标度
+            
+            # 12. 计算锋面距台风中心的距离
+            distance_to_tc = self._haversine_distance(tc_lat, tc_lon, front_lat, front_lon)
+            
+            # 13. 尝试分类锋面类型（冷锋/暖锋/准静止）
+            # 通过温度梯度方向判断
+            front_type = "准静止锋"  # 默认
+            if max_idx[0] > 0 and max_idx[0] < len(self.lat) - 1:
+                # 检查南北温度分布
+                t_north = t850[max_idx[0] - 1, max_idx[1]]
+                t_south = t850[max_idx[0] + 1, max_idx[1]]
+                if np.isfinite(t_north) and np.isfinite(t_south):
+                    if t_south > t_north + 2:  # 南侧明显更暖
+                        front_type = "冷锋"
+                    elif t_north > t_south + 2:  # 北侧明显更暖
+                        front_type = "暖锋"
+            
+            strength_1e5 = front_temp_gradient * 1e5
             desc = (
-                f"台风周围存在强度为'{level}'的锋面系统，温度梯度达到{strength_1e5:.1f}×10⁻⁵ °C/m，"
-                f"可能影响台风的移动路径。"
+                f"台风周围{distance_to_tc:.0f}km处存在{front_type}，强度为'{level}'，"
+                f"温度梯度达到{strength_1e5:.1f}×10⁻⁵ °C/m。"
+                f"锋面位于{front_lat:.2f}°N, {front_lon:.2f}°E，"
+                f"可能影响台风的移动路径和强度变化。"
             )
-
-            # 提取锋面带的坐标信息
-            frontal_coords = self._get_system_coordinates(
-                temp_gradient, front_threshold, "high", max_points=15
-            )
-            shape_info = {"description": "线性的温度梯度带"}
-
-            if frontal_coords:
-                shape_info.update(
-                    {
-                        "coordinates": frontal_coords,
-                        "extent_desc": f"锋面带跨越纬度{frontal_coords['span_deg'][1]:.1f}°，经度{frontal_coords['span_deg'][0]:.1f}°",
-                        "orientation_note": "根据几何形状确定锋面走向",
-                    }
+            
+            # 14. 提取锋面带的坐标（只在局部区域）
+            # 创建局部数据进行等值线提取
+            frontal_coords = None
+            try:
+                # 在前10%最强区域提取轮廓
+                contour_threshold = np.percentile(valid_values, 90)
+                local_front_for_contour = np.where(front_mask & (frontal_index_local > contour_threshold), 
+                                                   frontal_index_local, np.nan)
+                
+                frontal_coords = self._get_system_coordinates_local(
+                    local_front_for_contour, contour_threshold, "high", 
+                    tc_lat, tc_lon, max_points=20
                 )
+            except Exception:
+                pass
+            
+            shape_info = {
+                "description": f"线性的{front_type}带，基于厚度场梯度识别",
+                "type": front_type
+            }
+            
+            if frontal_coords:
+                shape_info.update({
+                    "coordinates": frontal_coords,
+                    "extent_desc": f"锋面带跨越纬度{frontal_coords['span_deg'][1]:.1f}°，经度{frontal_coords['span_deg'][0]:.1f}°",
+                })
                 desc += f" 锋面带主体跨越{frontal_coords['span_deg'][1]:.1f}°纬度和{frontal_coords['span_deg'][0]:.1f}°经度。"
-
+            
             return {
                 "system_name": "FrontalSystem",
                 "description": desc,
-                "position": {"description": "台风周围的锋面区域", "lat": tc_lat, "lon": tc_lon},
+                "position": {
+                    "description": f"锋面位置（距台风中心{distance_to_tc:.0f}km）",
+                    "lat": float(front_lat),
+                    "lon": float(front_lon)
+                },
                 "intensity": {
                     "value": round(strength_1e5, 2),
                     "unit": "×10⁻⁵ °C/m",
                     "level": level,
+                    "frontal_index": round(float(np.nanmax(frontal_index_local)), 3)
                 },
                 "shape": shape_info,
-                "properties": {"impact": "影响台风路径和结构"},
+                "properties": {
+                    "impact": "影响台风路径和结构",
+                    "distance_to_tc_km": round(float(distance_to_tc), 1),
+                    "front_type": front_type,
+                    "search_radius_km": search_radius_km
+                },
             }
         except Exception as e:
             return None
@@ -1729,6 +1842,113 @@ class TCEnvironmentalSystemsExtractor:
         except Exception as e:
             print(f"形状分析失败: {e}")
         return None
+
+    def _get_system_coordinates_local(self, data_field, threshold, system_type, 
+                                      center_lat, center_lon, max_points=20):
+        """
+        在局部区域提取气象系统的关键坐标点（改进版，处理已掩膜的数据）
+        
+        Parameters:
+            data_field: 已经应用掩膜的数据场（掩膜外为nan）
+            threshold: 阈值
+            system_type: 'high' 或 'low'
+            center_lat, center_lon: 中心位置（用于处理跨日界线）
+            max_points: 最大点数
+        """
+        try:
+            # 创建系统掩膜（只考虑有效数据）
+            valid_mask = np.isfinite(data_field)
+            if not np.any(valid_mask):
+                return None
+            
+            if system_type == "high":
+                mask = valid_mask & (data_field >= threshold)
+            else:
+                mask = valid_mask & (data_field <= threshold)
+
+            if not np.any(mask):
+                return None
+
+            # 找到连通区域
+            labeled_mask, num_features = label(mask)
+            if num_features == 0:
+                return None
+
+            # 选择最大的连通区域
+            flat_labels = labeled_mask.ravel()
+            counts = np.bincount(flat_labels)[1: num_features + 1]
+            if counts.size == 0:
+                return None
+            main_label = int(np.argmax(counts) + 1)
+            main_region = labeled_mask == main_label
+
+            # 提取边界坐标
+            contours = find_contours(main_region.astype(float), 0.5)
+            if not contours:
+                return None
+
+            main_contour = max(contours, key=len)
+
+            # 简化多边形以获得关键点
+            epsilon = max(len(main_contour) * 0.01, 1)  # 简化程度
+            simplified = approximate_polygon(main_contour, tolerance=epsilon)
+
+            # 限制点数
+            if len(simplified) > max_points:
+                step = max(1, len(simplified) // max_points)
+                simplified = simplified[::step]
+
+            # 转换为地理坐标
+            geo_coords = []
+            for point in simplified:
+                lat_idx = int(np.clip(point[0], 0, len(self.lat) - 1))
+                lon_idx = int(np.clip(point[1], 0, len(self.lon) - 1))
+                geo_coords.append([round(self.lon[lon_idx], 3), round(self.lat[lat_idx], 3)])
+
+            # 计算系统范围（处理跨日界线）
+            if geo_coords:
+                lons = [coord[0] for coord in geo_coords]
+                lats = [coord[1] for coord in geo_coords]
+                
+                # 归一化经度到中心经度附近
+                lons_normalized = []
+                for lon in lons:
+                    diff = lon - center_lon
+                    if diff > 180:
+                        lon = lon - 360
+                    elif diff < -180:
+                        lon = lon + 360
+                    lons_normalized.append(lon)
+
+                lon_min = round(min(lons_normalized), 3)
+                lon_max = round(max(lons_normalized), 3)
+                lat_min = round(min(lats), 3)
+                lat_max = round(max(lats), 3)
+                
+                # 将经度转回0-360范围
+                if lon_min < 0:
+                    lon_min += 360
+                if lon_max < 0:
+                    lon_max += 360
+
+                extent = {
+                    "lon_range": [lon_min, lon_max],
+                    "lat_range": [lat_min, lat_max],
+                    "center": [round(np.mean(lons_normalized), 3), round(np.mean(lats), 3)],
+                    "span": [round(lon_max - lon_min, 3), round(lat_max - lat_min, 3)],
+                }
+
+                return {
+                    "vertices": geo_coords,
+                    "total_points": len(geo_coords),
+                    "lon_range": [lon_min, lon_max],
+                    "lat_range": [lat_min, lat_max],
+                    "span_deg": [extent["span"][0], extent["span"][1]],
+                }
+
+            return None
+        except Exception as e:
+            return None
 
     def _get_system_coordinates(self, data_field, threshold, system_type, max_points=20):
         """
