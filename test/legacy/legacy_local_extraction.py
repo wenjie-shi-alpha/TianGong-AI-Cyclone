@@ -13,7 +13,7 @@ from pathlib import Path
 from datetime import datetime
 
 # 添加src目录到路径
-sys.path.insert(0, str(Path(__file__).parent / 'src'))
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / 'src'))
 
 from initial_tracker import Tracker, track_file_with_initials
 from environment_extractor import TCEnvironmentalSystemsExtractor

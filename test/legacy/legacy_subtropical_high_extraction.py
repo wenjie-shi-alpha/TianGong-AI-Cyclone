@@ -21,7 +21,7 @@ from datetime import datetime
 import numpy as np
 
 # 添加src目录到路径
-sys.path.insert(0, str(Path(__file__).parent / 'src'))
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / 'src'))
 
 from environment_extractor import TCEnvironmentalSystemsExtractor
 import xarray as xr
