@@ -686,8 +686,15 @@ class TCEnvironmentalSystemsExtractor:
 
     def extract_intertropical_convergence_zone(self, time_idx, tc_lat, tc_lon):
         """
-        提取并解译热带辐合带(ITCZ)。
+        [深度重构] 提取并解译热带辐合带(ITCZ)。
         ITCZ是热带对流活动的主要区域，影响台风的生成和路径。
+        
+        改进点：
+        1. 使用850hPa散度（辐合）作为主要判据
+        2. 结合垂直速度判断上升运动
+        3. 使用Haversine距离计算
+        4. 提取辐合线的经度段范围
+        5. 支持南北半球
         """
         try:
             u850 = self._get_data_at_level("u", 850, time_idx)
@@ -695,47 +702,171 @@ class TCEnvironmentalSystemsExtractor:
             if u850 is None or v850 is None:
                 return None
 
-            # 计算850hPa涡度来识别ITCZ
+            # 1. 计算850hPa球面散度
+            a = 6371000  # 地球半径(m)
+            lat_rad = np.deg2rad(self.lat)
+            lon_rad = np.deg2rad(self.lon)
+            
+            # 计算梯度
             gy_u, gx_u = self._raw_gradients(u850)
             gy_v, gx_v = self._raw_gradients(v850)
-            du_dy = gy_u / (self.lat_spacing * 111000)
-            dv_dx = gx_v / (self.lon_spacing * 111000 * self._coslat_safe[:, np.newaxis])
-            vorticity = dv_dx - du_dy
-
-            # ITCZ通常位于5°N-15°N之间，寻找最大涡度带
-            tropical_mask = (self.lat >= 0) & (self.lat <= 20)
+            
+            # 球面散度公式
+            dlat = self.lat_spacing * np.pi / 180
+            dlon = self.lon_spacing * np.pi / 180
+            cos_lat = self._coslat_safe[:, np.newaxis]
+            
+            du_dlon = gx_u / dlon
+            dv_dlat = gy_v / dlat
+            
+            divergence = (1 / (a * cos_lat)) * du_dlon + (1 / a) * (dv_dlat * cos_lat - v850 * np.sin(lat_rad)[:, np.newaxis])
+            
+            # 2. 尝试获取垂直速度(如果存在)
+            w700 = self._get_data_at_level("w", 700, time_idx)  # 700hPa垂直速度
+            
+            # 3. 根据台风所在半球确定搜索范围
+            if tc_lat >= 0:
+                # 北半球：搜索5°N-20°N
+                lat_min, lat_max = 5, 20
+                hemisphere = "北半球"
+            else:
+                # 南半球：搜索5°S-20°S
+                lat_min, lat_max = -20, -5
+                hemisphere = "南半球"
+            
+            tropical_mask = (self.lat >= lat_min) & (self.lat <= lat_max)
             if not np.any(tropical_mask):
                 return None
-
-            tropical_vort = vorticity[tropical_mask, :]
-            max_vort_lat_idx = np.unravel_index(np.nanargmax(tropical_vort), tropical_vort.shape)[0]
-            itcz_lat = self.lat[tropical_mask][max_vort_lat_idx]
-
-            distance_to_tc = abs(tc_lat - itcz_lat)
-            if distance_to_tc < 5:
+            
+            # 4. 寻找辐合带（散度为负的区域）
+            convergence = -divergence  # 辐合为正
+            tropical_conv = convergence[tropical_mask, :]
+            
+            # 找到辐合最强的纬度
+            conv_by_lat = np.nanmean(tropical_conv, axis=1)
+            if not np.any(np.isfinite(conv_by_lat)):
+                return None
+                
+            max_conv_idx = np.nanargmax(conv_by_lat)
+            itcz_lat = self.lat[tropical_mask][max_conv_idx]
+            max_convergence = conv_by_lat[max_conv_idx] * 1e5  # 转换为 10^-5 s^-1
+            
+            # 5. 提取该纬度上辐合显著的经度范围
+            lat_idx = self._loc_idx(itcz_lat, tc_lon)[0]
+            conv_at_lat = convergence[lat_idx, :]
+            
+            # 找到辐合值大于阈值的经度段
+            conv_threshold = np.nanpercentile(conv_at_lat[conv_at_lat > 0], 50) if np.any(conv_at_lat > 0) else 0
+            strong_conv_mask = conv_at_lat > conv_threshold
+            
+            # 提取连续经度段
+            lon_ranges = []
+            in_range = False
+            start_lon = None
+            for i, is_strong in enumerate(strong_conv_mask):
+                if is_strong and not in_range:
+                    start_lon = self.lon[i]
+                    in_range = True
+                elif not is_strong and in_range:
+                    lon_ranges.append((start_lon, self.lon[i-1]))
+                    in_range = False
+            if in_range:
+                lon_ranges.append((start_lon, self.lon[-1]))
+            
+            # 找到包含或最接近台风经度的经度段
+            best_range = None
+            min_dist = float('inf')
+            for lon_start, lon_end in lon_ranges:
+                if lon_start <= tc_lon <= lon_end:
+                    best_range = (lon_start, lon_end)
+                    break
+                dist = min(abs(tc_lon - lon_start), abs(tc_lon - lon_end))
+                if dist < min_dist:
+                    min_dist = dist
+                    best_range = (lon_start, lon_end)
+            
+            # 6. 使用Haversine距离计算台风与ITCZ的距离
+            distance_km = self._haversine_distance(tc_lat, tc_lon, itcz_lat, tc_lon)
+            distance_deg = abs(tc_lat - itcz_lat)
+            
+            # 7. 判断影响程度
+            if distance_km < 500:
                 influence = "直接影响台风发展"
-            elif distance_to_tc < 10:
+                impact_level = "强"
+            elif distance_km < 1000:
                 influence = "对台风路径有显著影响"
+                impact_level = "中"
             else:
                 influence = "对台风影响较小"
+                impact_level = "弱"
+            
+            # 8. 评估辐合强度等级
+            if max_convergence > 5:
+                conv_level = "强"
+                conv_desc = "辐合活跃，有利于对流发展"
+            elif max_convergence > 2:
+                conv_level = "中等"
+                conv_desc = "辐合中等，对对流有一定支持"
+            else:
+                conv_level = "弱"
+                conv_desc = "辐合较弱"
+            
+            # 9. 检查垂直运动(如果有数据)
+            vertical_motion_desc = ""
+            if w700 is not None:
+                w_at_itcz = w700[lat_idx, :]
+                mean_w = np.nanmean(w_at_itcz[strong_conv_mask]) if np.any(strong_conv_mask) else 0
+                if mean_w < -0.05:  # 上升运动(Pa/s为负)
+                    vertical_motion_desc = "，伴随强上升运动"
+                elif mean_w < 0:
+                    vertical_motion_desc = "，伴随上升运动"
+            
+            # 10. 构建描述
+            lon_range_str = f"{best_range[0]:.1f}°E-{best_range[1]:.1f}°E" if best_range else "跨经度带"
+            
+            desc = (f"{hemisphere}热带辐合带位于约{itcz_lat:.1f}°{'N' if itcz_lat >= 0 else 'S'}附近，"
+                   f"经度范围{lon_range_str}，"
+                   f"辐合强度{max_convergence:.2f}×10⁻⁵ s⁻¹（{conv_level}）{vertical_motion_desc}。"
+                   f"与台风中心距离{distance_km:.0f}公里（{distance_deg:.1f}度），{influence}。")
 
-            desc = f"热带辐合带当前位于约{itcz_lat:.1f}°N附近，与台风中心距离{distance_to_tc:.1f}度，{influence}。"
-
-            return {
+            result = {
                 "system_name": "InterTropicalConvergenceZone",
                 "description": desc,
                 "position": {
-                    "description": f"热带辐合带位置",
-                    "lat": round(itcz_lat, 1),
-                    "lon": "跨经度带",
+                    "description": f"热带辐合带中心位置",
+                    "lat": round(itcz_lat, 2),
+                    "lon": tc_lon,  # 使用台风经度作为参考
+                    "lon_range": lon_range_str,
                 },
-                "intensity": {"description": "基于850hPa涡度确定的活跃程度"},
-                "shape": {"description": "东西向延伸的辐合带"},
+                "intensity": {
+                    "value": round(max_convergence, 2),
+                    "unit": "×10⁻⁵ s⁻¹",
+                    "level": conv_level,
+                    "description": conv_desc,
+                },
+                "shape": {
+                    "description": "东西向延伸的辐合带",
+                    "type": "convergence_line"
+                },
                 "properties": {
-                    "distance_to_tc_deg": round(distance_to_tc, 1),
+                    "distance_to_tc_km": round(distance_km, 1),
+                    "distance_to_tc_deg": round(distance_deg, 2),
                     "influence": influence,
+                    "impact_level": impact_level,
+                    "hemisphere": hemisphere,
+                    "convergence_strength": conv_level,
                 },
             }
+            
+            # 11. 如果有经度范围，添加边界坐标
+            if best_range:
+                # 简化：只在起点、中点、终点取样
+                sample_lons = [best_range[0], (best_range[0] + best_range[1])/2, best_range[1]]
+                boundary_coords = [[lon, itcz_lat] for lon in sample_lons]
+                result["boundary_coordinates"] = boundary_coords
+            
+            return result
+            
         except Exception as e:
             return None
 
@@ -1098,8 +1229,15 @@ class TCEnvironmentalSystemsExtractor:
 
     def extract_monsoon_trough(self, time_idx, tc_lat, tc_lon):
         """
-        提取并解译季风槽系统。
+        [深度重构] 提取并解译季风槽系统。
         季风槽是热带气旋生成的重要环境，也影响现有台风的发展。
+        
+        改进点：
+        1. 结合850hPa相对涡度、纬向风和海平面气压综合判断
+        2. 使用Haversine距离限制搜索范围
+        3. 区分南北半球
+        4. 提取槽轴和槽底位置
+        5. 限制搜索在典型纬度带（10°S-25°N）
         """
         try:
             u850 = self._get_data_at_level("u", 850, time_idx)
@@ -1107,79 +1245,203 @@ class TCEnvironmentalSystemsExtractor:
             if u850 is None or v850 is None:
                 return None
 
-            # 计算850hPa相对涡度
+            # 1. 根据台风所在半球确定搜索范围
+            if tc_lat >= 0:
+                # 北半球：西北太平洋季风槽通常在5°N-25°N（放宽范围）
+                lat_min, lat_max = 5, 25
+                hemisphere = "北半球"
+                expected_vort_sign = 1  # 北半球正涡度
+            else:
+                # 南半球：通常在5°S-25°S
+                lat_min, lat_max = -25, -5
+                hemisphere = "南半球"
+                expected_vort_sign = -1  # 南半球负涡度
+            
+            # 2. 使用Haversine距离限制搜索范围（1500km内）
+            search_radius_km = 1500
+            lat_mask = (self.lat >= lat_min) & (self.lat <= lat_max)
+            
+            # 创建距离掩膜 (2D数组)
+            distance_mask = np.zeros((len(self.lat), len(self.lon)), dtype=bool)
+            for i, lat in enumerate(self.lat):
+                if not lat_mask[i]:
+                    continue
+                for j, lon in enumerate(self.lon):
+                    dist = self._haversine_distance(tc_lat, tc_lon, lat, lon)
+                    if dist <= search_radius_km:
+                        distance_mask[i, j] = True
+            
+            if not np.any(distance_mask):
+                return None
+
+            # 3. 计算850hPa相对涡度（使用简化的平面近似）
             gy_u, gx_u = self._raw_gradients(u850)
             gy_v, gx_v = self._raw_gradients(v850)
+            
             du_dy = gy_u / (self.lat_spacing * 111000)
             dv_dx = gx_v / (self.lon_spacing * 111000 * self._coslat_safe[:, np.newaxis])
+            
             relative_vorticity = dv_dx - du_dy
-
+            
             # 清理异常数值
             with np.errstate(invalid="ignore"):
                 relative_vorticity[~np.isfinite(relative_vorticity)] = np.nan
-
-            # 季风槽通常在热带地区，寻找正涡度带
-            tropical_mask = (self.lat >= -30) & (self.lat <= 30)
-            if not np.any(tropical_mask):
+            
+            # 4. 考虑半球差异：在南半球取绝对值或反转符号
+            if hemisphere == "南半球":
+                relative_vorticity = -relative_vorticity
+            
+            # 5. 在搜索区域内寻找季风槽（高涡度区域）
+            masked_vort = np.where(distance_mask, relative_vorticity, np.nan)
+            
+            if not np.any(np.isfinite(masked_vort)):
                 return None
-
-            tropical_vort = relative_vorticity[tropical_mask, :]
-            monsoon_threshold = (
-                np.percentile(tropical_vort[tropical_vort > 0], 75)
-                if np.any(tropical_vort > 0)
-                else 0
-            )
-
-            if monsoon_threshold <= 0:
+            
+            # 找到涡度最大的区域作为季风槽中心
+            vort_threshold = np.nanpercentile(masked_vort[masked_vort > 0], 75) if np.any(masked_vort > 0) else 0
+            
+            if vort_threshold <= 0:
                 return None
-
-            monsoon_mask = relative_vorticity > monsoon_threshold
-            lat_idx, lon_idx = self._loc_idx(tc_lat, tc_lon)
-
-            # 检查台风附近是否存在季风槽
-            search_radius = 30
-            lat_start = max(0, lat_idx - search_radius)
-            lat_end = min(len(self.lat), lat_idx + search_radius)
-            lon_start = max(0, lon_idx - search_radius)
-            lon_end = min(len(self.lon), lon_idx + search_radius)
-
-            local_monsoon = monsoon_mask[lat_start:lat_end, lon_start:lon_end]
-            if not np.any(local_monsoon):
+            
+            trough_mask = masked_vort > vort_threshold
+            
+            if not np.any(trough_mask):
                 return None
-
-            finite_vort = relative_vorticity[monsoon_mask][
-                np.isfinite(relative_vorticity[monsoon_mask])
-            ]
-            if finite_vort.size == 0:
-                return None
-            max_vorticity = float(np.max(finite_vort))
-            # 裁剪到合理范围 (典型热带涡度 < 2e-3 s^-1)
-            max_vorticity = float(np.clip(max_vorticity, 0, 2e-3)) * 1e5
-
-            if max_vorticity > 10:
-                level, impact = "活跃", "为台风发展提供有利环境"
-            elif max_vorticity > 5:
-                level, impact = "中等", "对台风发展有一定支持"
+            
+            # 6. 找到槽底位置（涡度最大点）
+            max_vort_idx = np.unravel_index(np.nanargmax(masked_vort), masked_vort.shape)
+            trough_bottom_lat = self.lat[max_vort_idx[0]]
+            trough_bottom_lon = self.lon[max_vort_idx[1]]
+            max_vorticity = masked_vort[max_vort_idx] * 1e5  # 转换为 10^-5 s^-1
+            
+            # 7. 提取槽轴（沿槽底纬度的高涡度区域）
+            trough_lat_idx = max_vort_idx[0]
+            vort_along_axis = masked_vort[trough_lat_idx, :]
+            
+            # 找到沿槽轴的高涡度经度范围
+            axis_threshold = vort_threshold * 0.7
+            axis_mask = vort_along_axis > axis_threshold
+            
+            # 提取槽轴经度范围
+            axis_lons = self.lon[axis_mask]
+            if len(axis_lons) > 0:
+                axis_lon_start = axis_lons[0]
+                axis_lon_end = axis_lons[-1]
+                axis_length_deg = axis_lon_end - axis_lon_start
+                # 估算槽轴长度（km）
+                axis_length_km = axis_length_deg * 111 * np.cos(np.deg2rad(trough_bottom_lat))
             else:
-                level, impact = "弱", "对台风影响有限"
+                axis_lon_start = trough_bottom_lon
+                axis_lon_end = trough_bottom_lon
+                axis_length_km = 0
+            
+            # 8. 分析纬向风（季风槽的特征：赤道侧西风，极侧东风）
+            u_at_trough = u850[trough_lat_idx, :]
+            mean_u = np.nanmean(u_at_trough[axis_mask]) if np.any(axis_mask) else 0
+            
+            if mean_u > 2:
+                wind_pattern = "西风为主"
+                monsoon_confidence = "高"
+            elif mean_u > 0:
+                wind_pattern = "弱西风"
+                monsoon_confidence = "中"
+            else:
+                wind_pattern = "东风分量"
+                monsoon_confidence = "低"
+            
+            # 9. 尝试获取海平面气压（如果存在）
+            pressure_desc = ""
+            try:
+                mslp = self._get_data_at_level("msl", None, time_idx)
+                if mslp is not None and not isinstance(mslp, tuple):
+                    mslp_at_trough = mslp[trough_lat_idx, :]
+                    if np.any(axis_mask):
+                        mean_mslp = float(np.nanmean(mslp_at_trough[axis_mask]))
+                        mean_mslp_hpa = mean_mslp / 100
+                        pressure_desc = f"，气压约{mean_mslp_hpa:.0f} hPa"
+            except:
+                pass
+            
+            # 10. 计算台风到季风槽的距离和方位
+            distance_to_trough = self._haversine_distance(tc_lat, tc_lon, trough_bottom_lat, trough_bottom_lon)
+            
+            # 计算方位
+            bearing, direction = self._calculate_bearing(tc_lat, tc_lon, trough_bottom_lat, trough_bottom_lon)
+            
+            # 11. 判断影响程度
+            if distance_to_trough < 500:
+                influence = "台风位于季风槽内或紧邻，受水汽输送直接影响"
+                impact_level = "强"
+            elif distance_to_trough < 1000:
+                influence = "台风受季风槽环流影响，水汽条件较好"
+                impact_level = "中"
+            else:
+                influence = "季风槽对台风影响有限"
+                impact_level = "弱"
+            
+            # 12. 评估涡度强度等级
+            if max_vorticity > 10:
+                vort_level = "强"
+                vort_desc = "季风槽活跃，有利于台风发展"
+            elif max_vorticity > 5:
+                vort_level = "中等"
+                vort_desc = "季风槽中等强度"
+            else:
+                vort_level = "弱"
+                vort_desc = "季风槽较弱"
+            
+            # 13. 构建描述
+            desc = (f"在台风{direction}约{distance_to_trough:.0f}公里处检测到{hemisphere}季风槽，"
+                   f"槽底位于{trough_bottom_lat:.1f}°{'N' if trough_bottom_lat >= 0 else 'S'}, "
+                   f"{trough_bottom_lon:.1f}°E，"
+                   f"槽轴长度约{axis_length_km:.0f}公里，"
+                   f"最大涡度{max_vorticity:.1f}×10⁻⁵ s⁻¹（{vort_level}），"
+                   f"低层{wind_pattern}{pressure_desc}。{influence}。")
 
-            desc = (
-                f"台风周围存在活跃程度为'{level}'的季风槽系统，最大相对涡度为{max_vorticity:.1f}×10⁻⁵ s⁻¹，"
-                f"{impact}。"
-            )
-
-            return {
+            result = {
                 "system_name": "MonsoonTrough",
                 "description": desc,
-                "position": {"description": "台风周围的季风槽区域", "lat": tc_lat, "lon": tc_lon},
-                "intensity": {
-                    "value": round(max_vorticity, 1),
-                    "unit": "×10⁻⁵ s⁻¹",
-                    "level": level,
+                "position": {
+                    "description": f"季风槽槽底位置",
+                    "lat": round(trough_bottom_lat, 2),
+                    "lon": round(trough_bottom_lon, 2),
                 },
-                "shape": {"description": "东西向延伸的低压槽"},
-                "properties": {"impact": impact, "vorticity_support": max_vorticity > 5},
+                "intensity": {
+                    "value": round(max_vorticity, 2),
+                    "unit": "×10⁻⁵ s⁻¹",
+                    "level": vort_level,
+                    "description": vort_desc,
+                },
+                "shape": {
+                    "description": f"东西向延伸的低压槽，长度约{axis_length_km:.0f}公里",
+                    "type": "trough_axis",
+                    "axis_length_km": round(axis_length_km, 1),
+                },
+                "properties": {
+                    "distance_to_tc_km": round(distance_to_trough, 1),
+                    "direction_from_tc": direction,
+                    "bearing": round(bearing, 1),
+                    "influence": influence,
+                    "impact_level": impact_level,
+                    "hemisphere": hemisphere,
+                    "vorticity_level": vort_level,
+                    "zonal_wind_pattern": wind_pattern,
+                    "monsoon_confidence": monsoon_confidence,
+                    "axis_lon_range": f"{axis_lon_start:.1f}°E - {axis_lon_end:.1f}°E",
+                },
             }
+            
+            # 14. 添加槽轴边界坐标（简化：槽底和两端点）
+            if axis_length_km > 0:
+                boundary_coords = [
+                    [axis_lon_start, trough_bottom_lat],
+                    [trough_bottom_lon, trough_bottom_lat],  # 槽底
+                    [axis_lon_end, trough_bottom_lat],
+                ]
+                result["boundary_coordinates"] = boundary_coords
+            
+            return result
+            
         except Exception as e:
             return None
 
