@@ -538,6 +538,11 @@ class TCEnvironmentalSystemsExtractor:
         """
         提取并解译高空辐散系统（200hPa散度场）。
         高空辐散有利于低层辐合加强，促进台风发展。
+        
+        改进点：
+        1. 使用球面散度公式：div = (1/(a*cos(φ))) * ∂u/∂λ + (1/a) * ∂(v*cos(φ))/∂φ
+        2. 在台风中心500km圆域内计算面积平均散度
+        3. 统计最大辐散中心的位置和方位
         """
         try:
             u200 = self._get_data_at_level("u", 200, time_idx)
@@ -545,30 +550,82 @@ class TCEnvironmentalSystemsExtractor:
             if u200 is None or v200 is None:
                 return None
 
-            # 计算散度场 (加入极区防护和有限值过滤)
+            # 使用球面散度公式计算散度场
+            # div = (1/(a*cos(φ))) * ∂u/∂λ + (1/a) * ∂(v*cos(φ))/∂φ
             with np.errstate(divide="ignore", invalid="ignore"):
+                # 地球半径 (米)
+                a = 6371000.0
+                
+                # 计算梯度
                 gy_u, gx_u = self._raw_gradients(u200)
-                gy_v, gx_v = self._raw_gradients(v200)
-                du_dx = gx_u / (self.lon_spacing * 111000 * self._coslat_safe[:, np.newaxis])
-                dv_dy = gy_v / (self.lat_spacing * 111000)
-                divergence = du_dx + dv_dy
+                
+                # 计算 v*cos(φ)
+                coslat = self._coslat_safe[:, np.newaxis]
+                v_coslat = v200 * coslat
+                gy_v_coslat, gx_v_coslat = self._raw_gradients(v_coslat)
+                
+                # 转换为弧度梯度
+                dlambda = np.deg2rad(self.lon_spacing)  # 经度间隔（弧度）
+                dphi = np.deg2rad(self.lat_spacing)     # 纬度间隔（弧度）
+                
+                # 球面散度：div = (1/(a*cos(φ))) * ∂u/∂λ + (1/a) * ∂(v*cos(φ))/∂φ
+                du_dlambda = gx_u / dlambda
+                dv_coslat_dphi = gy_v_coslat / dphi
+                
+                divergence = (du_dlambda / (a * coslat) + dv_coslat_dphi / a)
+            
             if not np.any(np.isfinite(divergence)):
                 return None
             divergence[~np.isfinite(divergence)] = np.nan
 
-            lat_idx, lon_idx = self._loc_idx(tc_lat, tc_lon)
-            div_val_raw = divergence[lat_idx, lon_idx]
+            # 创建500km圆形掩膜
+            radius_km = 500
+            circular_mask = self._create_circular_mask_haversine(tc_lat, tc_lon, radius_km)
+            
+            # 在掩膜区域内计算平均散度
+            divergence_masked = np.where(circular_mask, divergence, np.nan)
+            
+            # 计算区域平均散度
+            div_val_raw = float(np.nanmean(divergence_masked))
             if not np.isfinite(div_val_raw):
-                # 使用周围 3x3 有限值平均替代
-                r = 1
-                sub = divergence[max(0, lat_idx-r):lat_idx+r+1, max(0, lon_idx-r):lon_idx+r+1]
-                finite_sub = sub[np.isfinite(sub)]
-                if finite_sub.size == 0:
-                    return None
-                div_val_raw = float(np.nanmean(finite_sub))
+                return None
+            
+            # 找到掩膜区域内的最大辐散中心
+            max_div_idx = np.nanargmax(divergence_masked)
+            max_div_lat_idx, max_div_lon_idx = np.unravel_index(max_div_idx, divergence_masked.shape)
+            max_div_lat = float(self.lat[max_div_lat_idx])
+            max_div_lon = float(self.lon[max_div_lon_idx])
+            max_div_value = float(divergence[max_div_lat_idx, max_div_lon_idx])
+            
+            # 计算最大辐散中心与台风中心的距离和方位
+            distance_to_max = self._haversine_distance(tc_lat, tc_lon, max_div_lat, max_div_lon)
+            
+            # 计算方位角
+            def calculate_bearing(lat1, lon1, lat2, lon2):
+                """计算从点1到点2的方位角（度，正北为0°，顺时针）"""
+                lat1_rad = np.deg2rad(lat1)
+                lat2_rad = np.deg2rad(lat2)
+                dlon_rad = np.deg2rad(lon2 - lon1)
+                
+                x = np.sin(dlon_rad) * np.cos(lat2_rad)
+                y = np.cos(lat1_rad) * np.sin(lat2_rad) - np.sin(lat1_rad) * np.cos(lat2_rad) * np.cos(dlon_rad)
+                bearing = np.rad2deg(np.arctan2(x, y))
+                return (bearing + 360) % 360
+            
+            bearing = calculate_bearing(tc_lat, tc_lon, max_div_lat, max_div_lon)
+            
+            # 方位描述
+            direction_names = ["北", "东北", "东", "东南", "南", "西南", "西", "西北"]
+            direction_idx = int((bearing + 22.5) // 45) % 8
+            direction = direction_names[direction_idx]
+            
             # 合理范围裁剪 (典型散度量级 < 2e-4 s^-1)
             div_val_raw = float(np.clip(div_val_raw, -5e-4, 5e-4))
-            div_value = div_val_raw * 1e5  # 转换为10^-5 s^-1单位
+            max_div_value = float(np.clip(max_div_value, -5e-4, 5e-4))
+            
+            # 转换为10^-5 s^-1单位
+            div_value = div_val_raw * 1e5
+            max_div_value_scaled = max_div_value * 1e5
 
             if div_value > 5:
                 level, impact = "强", "极其有利于台风发展和加强"
@@ -579,18 +636,50 @@ class TCEnvironmentalSystemsExtractor:
             else:
                 level, impact = "负值", "不利于台风发展"
 
+            # 判断辐散中心是否偏移
+            offset_note = ""
+            if distance_to_max > 100:  # 如果最大辐散中心距离台风中心超过100km
+                offset_note = f"最大辐散中心位于台风中心{direction}方向约{distance_to_max:.0f}公里处，强度为{max_div_value_scaled:.1f}×10⁻⁵ s⁻¹，"
+                if distance_to_max > 200:
+                    offset_note += "辐散中心明显偏移可能影响台风的对称结构。"
+                else:
+                    offset_note += "辐散中心略有偏移。"
+
             desc = (
-                f"台风上方200hPa高度的散度值为{div_value:.1f}×10⁻⁵ s⁻¹，高空辐散强度为'{level}'，"
-                f"{impact}。"
+                f"台风中心周围500公里范围内200hPa高度的平均散度值为{div_value:.1f}×10⁻⁵ s⁻¹，"
+                f"高空辐散强度为'{level}'，{impact}。"
             )
+            if offset_note:
+                desc += offset_note
 
             return {
                 "system_name": "UpperLevelDivergence",
                 "description": desc,
-                "position": {"description": "台风中心上方200hPa高度", "lat": tc_lat, "lon": tc_lon},
-                "intensity": {"value": round(div_value, 2), "unit": "×10⁻⁵ s⁻¹", "level": level},
+                "position": {
+                    "description": f"台风中心周围{radius_km}公里范围内200hPa高度",
+                    "center_lat": tc_lat,
+                    "center_lon": tc_lon,
+                    "radius_km": radius_km
+                },
+                "intensity": {
+                    "average_value": round(div_value, 2),
+                    "max_value": round(max_div_value_scaled, 2),
+                    "unit": "×10⁻⁵ s⁻¹",
+                    "level": level
+                },
+                "divergence_center": {
+                    "lat": round(max_div_lat, 2),
+                    "lon": round(max_div_lon, 2),
+                    "distance_to_tc_km": round(distance_to_max, 1),
+                    "direction": direction,
+                    "bearing_deg": round(bearing, 1)
+                },
                 "shape": {"description": "高空辐散中心的空间分布"},
-                "properties": {"impact": impact, "favorable_development": div_value > 0},
+                "properties": {
+                    "impact": impact,
+                    "favorable_development": div_value > 0,
+                    "center_offset": distance_to_max > 100
+                },
             }
         except Exception as e:
             return None
