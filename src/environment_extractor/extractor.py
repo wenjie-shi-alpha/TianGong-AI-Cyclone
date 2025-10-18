@@ -96,6 +96,74 @@ class TCEnvironmentalSystemsExtractor:
     def __exit__(self, exc_type, exc_value, traceback) -> None:
         self.close()
 
+    # --- 工具函数：距离计算和掩膜生成 ---
+
+    def _haversine_distance(self, lat1, lon1, lat2, lon2):
+        """
+        使用Haversine公式计算两点间的球面距离（单位：公里）
+        """
+        R = 6371.0  # 地球半径，公里
+        lat1_rad = np.deg2rad(lat1)
+        lat2_rad = np.deg2rad(lat2)
+        lon1_rad = np.deg2rad(lon1)
+        lon2_rad = np.deg2rad(lon2)
+        
+        dlat = lat2_rad - lat1_rad
+        dlon = lon2_rad - lon1_rad
+        
+        a = np.sin(dlat / 2) ** 2 + np.cos(lat1_rad) * np.cos(lat2_rad) * np.sin(dlon / 2) ** 2
+        c = 2 * np.arcsin(np.sqrt(np.clip(a, 0, 1)))
+        
+        return R * c
+
+    def _create_circular_mask_haversine(self, center_lat, center_lon, radius_km):
+        """
+        基于Haversine距离创建圆形掩膜，正确处理跨越日期变更线的情况
+        
+        Args:
+            center_lat: 中心纬度
+            center_lon: 中心经度
+            radius_km: 半径（公里）
+        
+        Returns:
+            掩膜数组（True表示在圆内）
+        """
+        # 创建经纬度网格
+        lon_grid, lat_grid = np.meshgrid(self.lon, self.lat)
+        
+        # 处理经度跨越日期变更线的情况
+        # 将所有经度归一化到以center_lon为中心的[-180, 180]范围
+        lon_normalized = lon_grid.copy()
+        lon_diff = lon_grid - center_lon
+        lon_normalized = np.where(lon_diff > 180, lon_grid - 360, lon_grid)
+        lon_normalized = np.where(lon_diff < -180, lon_grid + 360, lon_normalized)
+        
+        # 计算距离
+        distances = self._haversine_distance(lat_grid, lon_normalized, center_lat, center_lon)
+        
+        return distances <= radius_km
+
+    def _normalize_longitude(self, lon_array, center_lon):
+        """
+        将经度数组归一化到以center_lon为中心的连续范围
+        处理跨越0°/360°经线的情况
+        
+        Args:
+            lon_array: 经度数组
+            center_lon: 中心经度
+        
+        Returns:
+            归一化后的经度数组
+        """
+        lon_normalized = lon_array.copy()
+        lon_diff = lon_array - center_lon
+        
+        # 将超过180度的差值调整到[-180, 180]范围
+        lon_normalized = np.where(lon_diff > 180, lon_array - 360, lon_array)
+        lon_normalized = np.where(lon_diff < -180, lon_array + 360, lon_normalized)
+        
+        return lon_normalized
+
     # --- 核心系统提取函数 (深度重构) ---
 
     def extract_steering_system(self, time_idx, tc_lat, tc_lon):
@@ -262,14 +330,19 @@ class TCEnvironmentalSystemsExtractor:
     def extract_ocean_heat_content(self, time_idx, tc_lat, tc_lon, radius_deg=2.0):
         """
         [深度重构] 提取并解译海洋热含量（海表温度SST近似）。
+        使用基于Haversine距离的圆形掩膜和局部子域进行等值线提取。
         """
         try:
             sst = self._get_sst_field(time_idx)
             if sst is None:
                 return None
 
-            region_mask = self._create_region_mask(tc_lat, tc_lon, radius_deg)
-            sst_mean = np.nanmean(sst[region_mask])
+            # 使用Haversine距离创建圆形掩膜
+            radius_km = radius_deg * 111  # 粗略转换：1度 ≈ 111公里
+            circular_mask = self._create_circular_mask_haversine(tc_lat, tc_lon, radius_km)
+            
+            # 计算区域平均SST（使用圆形掩膜）
+            sst_mean = np.nanmean(sst[circular_mask])
 
             if sst_mean > 29:
                 level, impact = "极高", "为爆发性增强提供顶级能量"
@@ -285,14 +358,35 @@ class TCEnvironmentalSystemsExtractor:
                 f"{impact}。"
             )
 
-            contour_26_5 = self._get_contour_coords(sst, 26.5, tc_lon)
+            # 提取局部SST数据用于等值线分析
+            lat_idx, lon_idx = self._loc_idx(tc_lat, tc_lon)
+            
+            # 计算局部区域的索引范围（扩大到3-4倍半径以确保等值线完整）
+            radius_points = int(radius_deg * 3 / self.lat_spacing)
+            
+            lat_start = max(0, lat_idx - radius_points)
+            lat_end = min(len(self.lat), lat_idx + radius_points + 1)
+            lon_start = max(0, lon_idx - radius_points)
+            lon_end = min(len(self.lon), lon_idx + radius_points + 1)
+            
+            # 提取局部SST数据
+            sst_local = sst[lat_start:lat_end, lon_start:lon_end]
+            local_lat = self.lat[lat_start:lat_end]
+            local_lon = self.lon[lon_start:lon_end]
+            
+            # 在局部区域提取26.5°C等值线
+            contour_26_5 = self._get_contour_coords_local(
+                sst_local, 26.5, local_lat, local_lon, tc_lon
+            )
 
-            # 增强形状分析：分析暖水区域形状
+            # 增强形状分析：使用全局数据但限制在台风附近
             enhanced_shape = self._get_enhanced_shape_info(sst, 26.5, "high", tc_lat, tc_lon)
 
             shape_info = {
                 "description": "26.5°C是台风发展的最低海温门槛，此线是生命线",
                 "warm_water_boundary_26.5C": contour_26_5,
+                "boundary_type": "local_region",  # 标注这是局部边界
+                "extraction_radius_deg": radius_deg * 3,  # 记录提取范围
             }
 
             # 如果有增强形状分析，添加更多细节
@@ -891,6 +985,61 @@ class TCEnvironmentalSystemsExtractor:
                 for lon, lat in zip(contour_lon[::step], contour_lat[::step])
             ]
         except Exception:
+            return None
+
+    def _get_contour_coords_local(self, data_field, level, lat_array, lon_array, 
+                                   center_lon, max_points=100):
+        """
+        在局部数据场上提取等值线坐标
+        
+        Args:
+            data_field: 局部数据场（2D数组）
+            level: 等值线阈值
+            lat_array: 对应的纬度数组
+            lon_array: 对应的经度数组
+            center_lon: 中心经度（用于归一化）
+            max_points: 最大返回点数
+        
+        Returns:
+            等值线坐标列表 [[lon, lat], ...] 或 None
+        """
+        try:
+            contours = find_contours(data_field, level)
+            if not contours:
+                return None
+            
+            # 寻找最长的等值线段
+            main_contour = sorted(contours, key=len, reverse=True)[0]
+            
+            # 使用局部的经纬度数组进行索引映射
+            contour_indices_lat = main_contour[:, 0].astype(int)
+            contour_indices_lon = main_contour[:, 1].astype(int)
+            
+            # 确保索引在有效范围内
+            contour_indices_lat = np.clip(contour_indices_lat, 0, len(lat_array) - 1)
+            contour_indices_lon = np.clip(contour_indices_lon, 0, len(lon_array) - 1)
+            
+            contour_lon = lon_array[contour_indices_lon]
+            contour_lat = lat_array[contour_indices_lat]
+            
+            # 对经度进行归一化处理，避免跨越日期变更线导致的跳变
+            contour_lon_normalized = self._normalize_longitude(contour_lon, center_lon)
+            
+            # 降采样以减少数据量
+            step = max(1, len(main_contour) // max_points)
+            
+            # 返回归一化后的坐标，但将超出[-180, 180]的经度转回[0, 360]范围
+            coords = []
+            for lon, lat in zip(contour_lon_normalized[::step], contour_lat[::step]):
+                # 将归一化的经度转回标准[0, 360]范围（如果需要）
+                if lon < 0:
+                    lon = lon + 360
+                coords.append([round(float(lon), 2), round(float(lat), 2)])
+            
+            return coords
+        except Exception as e:
+            # 调试时可以打印错误信息
+            # print(f"局部等值线提取失败: {e}")
             return None
 
     def _get_enhanced_shape_info(self, data_field, threshold, system_type, center_lat, center_lon):
