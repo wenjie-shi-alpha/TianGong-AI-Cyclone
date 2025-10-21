@@ -917,6 +917,7 @@ class CDSEnvironmentExtractor:
             return None
 
     def _get_enhanced_shape_info(self, data_field, threshold, system_type, center_lat, center_lon):
+        """获取增强的形状信息（简化版，仅包含边界坐标）."""
         try:
             shape_analysis = self.shape_analyzer.analyze_system_shape(
                 data_field, threshold, system_type, center_lat, center_lon
@@ -925,19 +926,15 @@ class CDSEnvironmentExtractor:
                 return None
 
             basic_info = {
-                "area_km2": shape_analysis["basic_geometry"]["area_km2"],
-                "shape_type": shape_analysis["basic_geometry"]["description"],
-                "orientation": shape_analysis["orientation"]["direction_type"],
-                "complexity": shape_analysis["shape_complexity"]["description"],
+                "description": shape_analysis.get("description", ""),
                 "detailed_analysis": shape_analysis,
             }
 
-            contour_data = shape_analysis.get("contour_analysis")
-            if contour_data:
+            # 新的简化结构：直接包含边界坐标和多边形特征
+            if "boundary_coordinates" in shape_analysis:
                 basic_info["coordinate_info"] = {
-                    "main_contour_coords": contour_data.get("simplified_coordinates", []),
-                    "polygon_features": contour_data.get("polygon_features", {}),
-                    "contour_length_km": contour_data.get("contour_length_km", 0),
+                    "main_contour_coords": shape_analysis.get("boundary_coordinates", []),
+                    "polygon_features": shape_analysis.get("polygon_features", {}),
                 }
             return basic_info
         except Exception as exc:
