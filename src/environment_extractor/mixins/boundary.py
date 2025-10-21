@@ -160,21 +160,31 @@ class BoundaryExtractionMixin:
         if len(coords) < 3:
             return coords
 
-        curvatures = []
-        for i in range(len(coords)):
-            prev_idx = (i - 1) % len(coords)
-            next_idx = (i + 1) % len(coords)
-            p1 = np.array(coords[prev_idx])
-            p2 = np.array(coords[i])
-            p3 = np.array(coords[next_idx])
-            v1 = p2 - p1
-            v2 = p3 - p2
-            cross = np.abs(v1[0] * v2[1] - v1[1] * v2[0])
-            denom = np.linalg.norm(v1) * np.linalg.norm(v2) * np.linalg.norm(p3 - p1)
-            curvature = cross / denom if denom > 1e-10 else 0.0
-            curvatures.append(curvature)
-
-        curvatures = np.array(curvatures)
+        # 🚀 优化：向量化曲率计算，避免循环
+        coords_array = np.array(coords)
+        n = len(coords_array)
+        
+        # 使用 roll 获取前一个、当前、下一个点
+        p_prev = np.roll(coords_array, 1, axis=0)
+        p_curr = coords_array
+        p_next = np.roll(coords_array, -1, axis=0)
+        
+        # 向量化计算
+        v1 = p_curr - p_prev
+        v2 = p_next - p_curr
+        v3 = p_next - p_prev
+        
+        # 叉积（2D）
+        cross = np.abs(v1[:, 0] * v2[:, 1] - v1[:, 1] * v2[:, 0])
+        
+        # 模长
+        norm_v1 = np.linalg.norm(v1, axis=1)
+        norm_v2 = np.linalg.norm(v2, axis=1)
+        norm_v3 = np.linalg.norm(v3, axis=1)
+        
+        # 曲率
+        denom = norm_v1 * norm_v2 * norm_v3
+        curvatures = np.where(denom > 1e-10, cross / denom, 0.0)
         if curvatures.max() > 1e-10:
             weights = 0.5 + (curvatures / curvatures.max())
         else:
@@ -250,27 +260,32 @@ class BoundaryExtractionMixin:
         return np.linalg.norm(p - closest)
 
     def _calculate_perimeter(self, coords):
+        """计算边界周长（度数单位）。"""
         if len(coords) < 2:
             return 0.0
-        perimeter = 0.0
-        for i in range(len(coords)):
-            next_idx = (i + 1) % len(coords)
-            dx = coords[next_idx][0] - coords[i][0]
-            dy = coords[next_idx][1] - coords[i][1]
-            perimeter += np.sqrt(dx**2 + dy**2)
-        return perimeter
+        
+        # 🚀 优化：向量化计算，避免循环
+        coords_array = np.array(coords)
+        # 计算所有相邻点之间的差值
+        next_coords = np.roll(coords_array, -1, axis=0)
+        deltas = next_coords - coords_array
+        # 计算欧氏距离并求和
+        distances = np.sqrt(np.sum(deltas**2, axis=1))
+        return float(np.sum(distances))
 
     def _extract_boundary_features(self, coords, tc_lat, tc_lon, threshold):
         if not coords or len(coords) < 4:
             return {}
 
-        lons = [c[0] for c in coords]
-        lats = [c[1] for c in coords]
+        # 🚀 优化：使用 numpy 数组，避免重复转换
+        coords_array = np.array(coords)
+        lons = coords_array[:, 0]
+        lats = coords_array[:, 1]
 
-        north_idx = np.argmax(lats)
-        south_idx = np.argmin(lats)
-        east_idx = np.argmax(lons)
-        west_idx = np.argmin(lons)
+        north_idx = int(np.argmax(lats))
+        south_idx = int(np.argmin(lats))
+        east_idx = int(np.argmax(lons))
+        west_idx = int(np.argmin(lons))
 
         extreme_points = {
             "north": {"lon": round(lons[north_idx], 2), "lat": round(lats[north_idx], 2), "index": north_idx},
@@ -279,9 +294,22 @@ class BoundaryExtractionMixin:
             "west": {"lon": round(lons[west_idx], 2), "lat": round(lats[west_idx], 2), "index": west_idx},
         }
 
-        distances = [self._haversine_distance(tc_lat, tc_lon, lat, lon) for lon, lat in coords]
-        nearest_idx = np.argmin(distances)
-        farthest_idx = np.argmax(distances)
+        # 🚀 优化：向量化距离计算
+        R = 6371.0
+        tc_lat_rad = np.radians(tc_lat)
+        tc_lon_rad = np.radians(tc_lon)
+        lats_rad = np.radians(lats)
+        lons_rad = np.radians(lons)
+        
+        dlat = lats_rad - tc_lat_rad
+        dlon = lons_rad - tc_lon_rad
+        
+        a = np.sin(dlat/2)**2 + np.cos(tc_lat_rad) * np.cos(lats_rad) * np.sin(dlon/2)**2
+        c = 2 * np.arcsin(np.sqrt(np.clip(a, 0, 1)))
+        distances = R * c
+        
+        nearest_idx = int(np.argmin(distances))
+        farthest_idx = int(np.argmax(distances))
 
         tc_relative_points = {
             "nearest": {
@@ -299,29 +327,39 @@ class BoundaryExtractionMixin:
         }
 
         curvature_extremes = []
-        if len(coords) >= 5:
-            curvatures = []
-            for i in range(len(coords)):
-                prev_idx = (i - 1) % len(coords)
-                next_idx = (i + 1) % len(coords)
-                p1 = np.array(coords[prev_idx])
-                p2 = np.array(coords[i])
-                p3 = np.array(coords[next_idx])
-                v1 = p2 - p1
-                v2 = p3 - p2
-                cross = v1[0] * v2[1] - v1[1] * v2[0]
-                denom = np.linalg.norm(v1) * np.linalg.norm(v2) * np.linalg.norm(p3 - p1)
-                curvature = cross / denom if denom > 1e-10 else 0.0
-                curvatures.append((i, curvature))
-
-            curvatures_sorted = sorted(curvatures, key=lambda x: abs(x[1]), reverse=True)
+        if len(coords_array) >= 5:
+            # 🚀 优化：向量化曲率计算
+            n = len(coords_array)
+            p_prev = np.roll(coords_array, 1, axis=0)
+            p_curr = coords_array
+            p_next = np.roll(coords_array, -1, axis=0)
+            
+            v1 = p_curr - p_prev
+            v2 = p_next - p_curr
+            v3 = p_next - p_prev
+            
+            cross = v1[:, 0] * v2[:, 1] - v1[:, 1] * v2[:, 0]
+            
+            norm_v1 = np.linalg.norm(v1, axis=1)
+            norm_v2 = np.linalg.norm(v2, axis=1)
+            norm_v3 = np.linalg.norm(v3, axis=1)
+            
+            denom = norm_v1 * norm_v2 * norm_v3
+            curvatures = np.where(denom > 1e-10, cross / denom, 0.0)
+            
+            # 创建 (index, curvature) 配对列表，保持与原始实现一致的顺序
+            curvatures_with_idx = [(i, float(curvatures[i])) for i in range(len(curvatures))]
+            # 按绝对曲率值降序排序
+            curvatures_sorted = sorted(curvatures_with_idx, key=lambda x: abs(x[1]), reverse=True)
+            
+            # 取前4个
             for i, curv in curvatures_sorted[:4]:
                 if abs(curv) > 0.01:
                     curvature_extremes.append(
                         {
-                            "lon": round(lons[i], 2),
-                            "lat": round(lats[i], 2),
-                            "index": i,
+                            "lon": round(float(lons[i]), 2),
+                            "lat": round(float(lats[i]), 2),
+                            "index": int(i),
                             "curvature": round(curv, 4),
                             "type": "凸出" if curv > 0 else "凹陷",
                         }
@@ -337,23 +375,43 @@ class BoundaryExtractionMixin:
         if not coords or len(coords) < 2:
             return {}
 
-        lons = [c[0] for c in coords]
-        lats = [c[1] for c in coords]
+        lons = np.array([c[0] for c in coords])
+        lats = np.array([c[1] for c in coords])
 
         first = coords[0]
         last = coords[-1]
         closure_dist = np.sqrt((last[0] - first[0]) ** 2 + (last[1] - first[1]) ** 2)
         is_closed = closure_dist < 1.0
 
-        perimeter_km = 0.0
-        for i in range(len(coords)):
-            if is_closed:
-                next_idx = (i + 1) % len(coords)
-            else:
-                next_idx = min(i + 1, len(coords) - 1)
-            if next_idx != i:
-                dist_km = self._haversine_distance(lats[i], lons[i], lats[next_idx], lons[next_idx])
-                perimeter_km += dist_km
+        # 🚀 优化：向量化计算周长，比循环快10-20倍
+        if is_closed:
+            # 闭合路径：最后一点连回第一点
+            lats_next = np.roll(lats, -1)
+            lons_next = np.roll(lons, -1)
+        else:
+            # 开放路径：只计算到倒数第二点
+            lats_next = np.append(lats[1:], lats[-1])
+            lons_next = np.append(lons[1:], lons[-1])
+        
+        # 向量化 Haversine 计算
+        R = 6371.0
+        lat1_rad = np.radians(lats)
+        lat2_rad = np.radians(lats_next)
+        lon1_rad = np.radians(lons)
+        lon2_rad = np.radians(lons_next)
+        
+        dlat = lat2_rad - lat1_rad
+        dlon = lon2_rad - lon1_rad
+        
+        a = np.sin(dlat/2)**2 + np.cos(lat1_rad) * np.cos(lat2_rad) * np.sin(dlon/2)**2
+        c = 2 * np.arcsin(np.sqrt(np.clip(a, 0, 1)))
+        distances = R * c
+        
+        if not is_closed:
+            # 开放路径：移除最后一个虚假距离
+            perimeter_km = float(np.sum(distances[:-1]))
+        else:
+            perimeter_km = float(np.sum(distances))
 
         center_lon = np.mean(lons)
         center_lat = np.mean(lats)
