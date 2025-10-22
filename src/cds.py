@@ -682,8 +682,9 @@ class CDSEnvironmentExtractor:
                 lambda: self.extract_westerly_trough(time_idx, tc_lat, tc_lon),
                 lambda: self.extract_frontal_system(time_idx, tc_lat, tc_lon),
                 lambda: self.extract_monsoon_trough(time_idx, tc_lat, tc_lon),
-                lambda: self.extract_low_level_flow(ds_at_time, tc_lat, tc_lon),
-                lambda: self.extract_atmospheric_stability(ds_at_time, tc_lat, tc_lon),
+                # 移除 LowLevelFlow 和 AtmosphericStability，与 environment_extractor 对齐
+                # lambda: self.extract_low_level_flow(ds_at_time, tc_lat, tc_lon),
+                # lambda: self.extract_atmospheric_stability(ds_at_time, tc_lat, tc_lon),
             ]
 
             for extractor in system_extractors:
@@ -827,8 +828,670 @@ class CDSEnvironmentExtractor:
         dlat = lat2_rad - lat1_rad
         dlon = lon2_rad - lon1_rad
         a = np.sin(dlat / 2.0) ** 2 + np.cos(lat1_rad) * np.cos(lat2_rad) * np.sin(dlon / 2.0) ** 2
-        c = 2.0 * np.arcsin(np.sqrt(a))
+        c = 2.0 * np.arcsin(np.sqrt(np.clip(a, 0, 1)))
         return 6371.0 * c
+
+    def _create_circular_mask_haversine(self, center_lat, center_lon, radius_km):
+        """创建基于Haversine距离的圆形掩码"""
+        lon_grid, lat_grid = np.meshgrid(self.lon, self.lat)
+        lon_normalized = lon_grid.copy()
+        lon_diff = lon_grid - center_lon
+        lon_normalized = np.where(lon_diff > 180, lon_grid - 360, lon_grid)
+        lon_normalized = np.where(lon_diff < -180, lon_grid + 360, lon_normalized)
+        distances = self._haversine_distance(lat_grid, lon_normalized, center_lat, center_lon)
+        return distances <= radius_km
+
+    def _normalize_longitude(self, lon_array, center_lon):
+        """将经度标准化到中心经度附近的连续区间"""
+        lon_normalized = lon_array.copy()
+        lon_diff = lon_array - center_lon
+        lon_normalized = np.where(lon_diff > 180, lon_array - 360, lon_array)
+        lon_normalized = np.where(lon_diff < -180, lon_array + 360, lon_normalized)
+        return lon_normalized
+
+    def _adaptive_boundary_sampling(self, coords, target_points=50, method="auto"):
+        """自适应边界采样，兼容多种策略。"""
+        if len(coords) <= target_points:
+            return coords
+
+        if method == "auto":
+            perimeter_deg = self._calculate_perimeter(coords)
+            if perimeter_deg < 50:
+                method = "curvature"
+            else:
+                method = "douglas_peucker"
+
+        if method == "curvature":
+            return self._curvature_adaptive_sampling(coords, target_points)
+        if method == "perimeter":
+            return self._perimeter_proportional_sampling(coords, target_points)
+        if method == "douglas_peucker":
+            return self._douglas_peucker_sampling(coords, target_points)
+
+        step = max(1, len(coords) // target_points)
+        return coords[::step]
+
+    def _calculate_perimeter(self, coords):
+        if len(coords) < 2:
+            return 0.0
+        coords_array = np.array(coords)
+        next_coords = np.roll(coords_array, -1, axis=0)
+        deltas = next_coords - coords_array
+        distances = np.sqrt(np.sum(deltas**2, axis=1))
+        return float(np.sum(distances))
+
+    def _perimeter_proportional_sampling(self, coords, target_points):
+        if len(coords) < 2:
+            return coords
+
+        cumulative = [0.0]
+        for i in range(1, len(coords)):
+            dx = coords[i][0] - coords[i - 1][0]
+            dy = coords[i][1] - coords[i - 1][1]
+            cumulative.append(cumulative[-1] + math.hypot(dx, dy))
+
+        total = cumulative[-1]
+        if total < 1e-10:
+            return [coords[0]]
+
+        target_distances = np.linspace(0, total, target_points, endpoint=False)
+        cumulative_arr = np.array(cumulative)
+        sampled_coords = []
+        for dist in target_distances:
+            idx = int(np.argmin(np.abs(cumulative_arr - dist)))
+            sampled_coords.append(coords[idx])
+        return sampled_coords
+
+    def _douglas_peucker_sampling(self, coords, target_points):
+        if len(coords) <= target_points:
+            return coords
+
+        sampled = coords.copy()
+        while len(sampled) > target_points:
+            min_importance = float("inf")
+            remove_idx = -1
+            for i in range(1, len(sampled) - 1):
+                importance = self._point_to_line_distance(
+                    sampled[i], sampled[i - 1], sampled[i + 1]
+                )
+                if importance < min_importance:
+                    min_importance = importance
+                    remove_idx = i
+            if remove_idx > 0:
+                sampled.pop(remove_idx)
+            else:
+                break
+        return sampled
+
+    def _point_to_line_distance(self, point, line_start, line_end):
+        p = np.array(point, dtype=float)
+        a = np.array(line_start, dtype=float)
+        b = np.array(line_end, dtype=float)
+        ab = b - a
+        ap = p - a
+        if np.linalg.norm(ab) < 1e-10:
+            return float(np.linalg.norm(ap))
+        t = float(np.dot(ap, ab) / np.dot(ab, ab))
+        t = np.clip(t, 0.0, 1.0)
+        closest = a + t * ab
+        return float(np.linalg.norm(p - closest))
+
+    def _curvature_adaptive_sampling(self, coords, target_points):
+        if len(coords) < 3:
+            return coords
+
+        coords_array = np.array(coords, dtype=float)
+        p_prev = np.roll(coords_array, 1, axis=0)
+        p_curr = coords_array
+        p_next = np.roll(coords_array, -1, axis=0)
+
+        v1 = p_curr - p_prev
+        v2 = p_next - p_curr
+        v3 = p_next - p_prev
+
+        cross = np.abs(v1[:, 0] * v2[:, 1] - v1[:, 1] * v2[:, 0])
+        norm_v1 = np.linalg.norm(v1, axis=1)
+        norm_v2 = np.linalg.norm(v2, axis=1)
+        norm_v3 = np.linalg.norm(v3, axis=1)
+
+        denom = norm_v1 * norm_v2 * norm_v3
+        curvatures = np.where(denom > 1e-10, cross / denom, 0.0)
+
+        if curvatures.max() > 1e-10:
+            weights = 0.5 + (curvatures / curvatures.max())
+        else:
+            weights = np.ones_like(curvatures)
+
+        cum_weights = np.cumsum(weights)
+        cum_weights = cum_weights / cum_weights[-1]
+        target_weights = np.linspace(0, 1, target_points, endpoint=False)
+
+        sampled_indices = []
+        for tw in target_weights:
+            idx = int(np.argmin(np.abs(cum_weights - tw)))
+            if idx not in sampled_indices:
+                sampled_indices.append(idx)
+
+        sampled_indices = sorted(sampled_indices)
+        return [coords[i] for i in sampled_indices]
+
+    def _calculate_boundary_metrics(self, coords, tc_lat, tc_lon, method_used):
+        """计算边界度量指标"""
+        if not coords or len(coords) < 3:
+            return {}
+
+        coords_array = np.array(coords)
+        next_coords = np.roll(coords_array, -1, axis=0)
+        deltas = next_coords - coords_array
+        
+        distances_deg = np.sqrt(np.sum(deltas**2, axis=1))
+        perimeter_deg = float(np.sum(distances_deg))
+        
+        avg_lat = np.mean([c[1] for c in coords])
+        perimeter_km = perimeter_deg * 111.0 * math.cos(math.radians(avg_lat))
+        
+        first = coords[0]
+        last = coords[-1]
+        closure_dist = math.sqrt((last[0] - first[0])**2 + (last[1] - first[1])**2)
+        is_closed = closure_dist < 1.0
+
+        return {
+            "total_points": len(coords),
+            "perimeter_km": round(perimeter_km, 1),
+            "is_closed": is_closed,
+            "closure_distance_deg": round(closure_dist, 3),
+            "extraction_method": method_used or "unknown"
+        }
+
+    def _calculate_polygon_area_km2(self, coords):
+        """计算多边形面积（平方公里）"""
+        if not coords or len(coords) < 3:
+            return 0.0
+        
+        lons = np.array([c[0] for c in coords])
+        lats = np.array([c[1] for c in coords])
+        center_lat = np.mean(lats)
+        center_lon = np.mean(lons)
+        
+        x_m = (lons - center_lon) * 111000 * np.cos(np.radians(center_lat))
+        y_m = (lats - center_lat) * 111000
+        
+        area_m2 = 0.5 * abs(sum(x_m[i] * y_m[i + 1] - x_m[i + 1] * y_m[i] for i in range(len(x_m) - 1)))
+        area_km2 = area_m2 / 1e6
+        return round(float(area_km2), 1)
+
+    def _extract_ocean_boundary_features(self, coords, tc_lat, tc_lon, threshold):
+        if not coords or len(coords) < 3:
+            return {}
+
+        coords_array = np.array(coords, dtype=float)
+        lons = coords_array[:, 0]
+        lats = coords_array[:, 1]
+
+        north_idx = int(np.argmax(lats))
+        south_idx = int(np.argmin(lats))
+        east_idx = int(np.argmax(lons))
+        west_idx = int(np.argmin(lons))
+
+        extreme_points = {
+            "northernmost": {"lon": float(lons[north_idx]), "lat": float(lats[north_idx])},
+            "southernmost": {"lon": float(lons[south_idx]), "lat": float(lats[south_idx])},
+            "easternmost": {"lon": float(lons[east_idx]), "lat": float(lats[east_idx])},
+            "westernmost": {"lon": float(lons[west_idx]), "lat": float(lats[west_idx])},
+        }
+
+        distances = [
+            self._haversine_distance(tc_lat, tc_lon, lat_val, lon_val)
+            for lon_val, lat_val in coords
+        ]
+        nearest_idx = int(np.argmin(distances))
+        farthest_idx = int(np.argmax(distances))
+
+        tc_relative_points = {
+            "nearest_to_tc": {
+                "lon": float(lons[nearest_idx]),
+                "lat": float(lats[nearest_idx]),
+                "distance_km": round(float(distances[nearest_idx]), 1),
+                "description": "台风到暖水区边界的最短距离",
+            },
+            "farthest_from_tc": {
+                "lon": float(lons[farthest_idx]),
+                "lat": float(lats[farthest_idx]),
+                "distance_km": round(float(distances[farthest_idx]), 1),
+                "description": "暖水区延伸的最远点",
+            },
+        }
+
+        curvature_extremes = []
+        warm_eddy_centers = []
+        cold_intrusion_points = []
+
+        if len(coords) >= 5:
+            curvatures = []
+            for i in range(len(coords)):
+                prev_idx = (i - 2) % len(coords)
+                next_idx = (i + 2) % len(coords)
+                p1 = np.array([lons[prev_idx], lats[prev_idx]])
+                p2 = np.array([lons[i], lats[i]])
+                p3 = np.array([lons[next_idx], lats[next_idx]])
+                area = 0.5 * abs((p2[0] - p1[0]) * (p3[1] - p1[1]) - (p3[0] - p1[0]) * (p2[1] - p1[1]))
+                a = np.linalg.norm(p2 - p1)
+                b = np.linalg.norm(p3 - p2)
+                c = np.linalg.norm(p3 - p1)
+                curvature = 0.0
+                if a * b * c > 1e-10:
+                    curvature = 4 * area / (a * b * c)
+                curvatures.append(curvature)
+
+            curvatures = np.array(curvatures)
+            high_threshold = np.percentile(curvatures, 90)
+            indices = np.where(curvatures > high_threshold)[0]
+
+            avg_dist = float(np.mean(distances)) if distances else 0.0
+            for idx in indices[:5]:
+                point_info = {
+                    "lon": float(lons[idx]),
+                    "lat": float(lats[idx]),
+                    "curvature": round(float(curvatures[idx]), 6),
+                }
+                dist_to_tc = distances[idx]
+                if avg_dist > 0:
+                    if dist_to_tc > avg_dist * 1.1:
+                        warm_eddy_centers.append(
+                            {**point_info, "type": "warm_eddy", "description": "暖水区向外延伸的暖涡"}
+                        )
+                    elif dist_to_tc < avg_dist * 0.9:
+                        cold_intrusion_points.append(
+                            {
+                                **point_info,
+                                "type": "cold_intrusion",
+                                "description": "冷水向暖水区侵入",
+                            }
+                        )
+                curvature_extremes.append(point_info)
+
+        return {
+            "extreme_points": extreme_points,
+            "warm_eddy_centers": warm_eddy_centers[:3],
+            "cold_intrusion_points": cold_intrusion_points[:3],
+            "curvature_extremes": curvature_extremes[:5],
+            "tc_relative_points": tc_relative_points,
+            "threshold_used": threshold,
+        }
+
+    def _extract_closed_ocean_boundary_with_features(
+        self,
+        sst,
+        tc_lat,
+        tc_lon,
+        threshold=26.5,
+        lat_range=20.0,
+        lon_range=40.0,
+        target_points=50,
+    ):
+        try:
+            from skimage.measure import label as sk_label, find_contours as sk_find_contours
+
+            lat_min = max(tc_lat - lat_range / 2, self.lat.min())
+            lat_max = min(tc_lat + lat_range / 2, self.lat.max())
+            lon_min = tc_lon - lon_range / 2
+            lon_max = tc_lon + lon_range / 2
+
+            lat_mask = (self.lat >= lat_min) & (self.lat <= lat_max)
+            if lon_min < 0:
+                lon_mask = (self.lon >= lon_min + 360) | (self.lon <= lon_max)
+            elif lon_max > 360:
+                lon_mask = (self.lon >= lon_min) | (self.lon <= lon_max - 360)
+            else:
+                lon_mask = (self.lon >= lon_min) & (self.lon <= lon_max)
+
+            local_sst = sst[np.ix_(lat_mask, lon_mask)]
+            local_lat = self.lat[lat_mask]
+            local_lon = self.lon[lon_mask]
+
+            if local_sst.size == 0:
+                print("⚠️ 局部区域无SST数据")
+                return None
+
+            boundary_coords = None
+            method_used = None
+
+            try:
+                mask = (local_sst >= threshold).astype(int)
+                labeled = sk_label(mask, connectivity=2)
+                if labeled.max() == 0:
+                    raise ValueError("未找到暖水连通区域")
+
+                tc_lat_idx = np.argmin(np.abs(local_lat - tc_lat))
+                tc_lon_idx = np.argmin(np.abs(local_lon - tc_lon))
+                target_label = labeled[tc_lat_idx, tc_lon_idx]
+
+                if target_label == 0:
+                    unique, counts = np.unique(labeled[labeled > 0], return_counts=True)
+                    if unique.size > 0:
+                        target_label = unique[np.argmax(counts)]
+
+                contours = sk_find_contours((labeled == target_label).astype(float), 0.5)
+                if contours:
+                    main_contour = sorted(contours, key=len, reverse=True)[0]
+                    boundary_coords = main_contour
+                    method_used = "connected_component_labeling"
+                    print(f"✅ 方法1成功: 连通区域标注提取到{len(main_contour)}个点")
+            except Exception as exc:
+                print(f"⚠️ 连通区域方法失败: {exc}，尝试方法2")
+
+            if boundary_coords is None:
+                try:
+                    print("🔄 方法2: 扩大区域到30°x60°")
+                    expanded = self._extract_closed_ocean_boundary_with_features(
+                        sst,
+                        tc_lat,
+                        tc_lon,
+                        threshold,
+                        lat_range=30.0,
+                        lon_range=60.0,
+                        target_points=target_points,
+                    )
+                    if expanded:
+                        expanded["boundary_metrics"]["method_note"] = "使用扩大区域(30x60)"
+                        return expanded
+                except Exception as exc:
+                    print(f"⚠️ 扩大区域方法失败: {exc}，尝试方法3")
+
+            if boundary_coords is None:
+                try:
+                    print("🔄 方法3: 使用原始find_contours方法")
+                    contours = sk_find_contours(local_sst, threshold)
+                    if contours:
+                        boundary_coords = sorted(contours, key=len, reverse=True)[0]
+                        method_used = "direct_contour_extraction"
+                        print(f"✅ 方法3成功: 提取到{len(boundary_coords)}个点")
+                except Exception as exc:
+                    print(f"⚠️ 所有方法均失败: {exc}")
+                    return None
+
+            if boundary_coords is None or len(boundary_coords) == 0:
+                return None
+
+            geo_coords = []
+            for point in boundary_coords:
+                lat_idx = int(np.clip(point[0], 0, len(local_lat) - 1))
+                lon_idx = int(np.clip(point[1], 0, len(local_lon) - 1))
+                lat_val = float(local_lat[lat_idx])
+                lon_val = float(local_lon[lon_idx])
+                lon_normalized = self._normalize_longitude(np.array([lon_val]), tc_lon)[0]
+                if lon_normalized < 0:
+                    lon_normalized += 360
+                geo_coords.append([lon_normalized, lat_val])
+
+            sampled_coords = self._adaptive_boundary_sampling(
+                geo_coords, target_points=target_points, method="curvature"
+            )
+
+            if len(sampled_coords) > 2:
+                first = sampled_coords[0]
+                last = sampled_coords[-1]
+                closure_dist = math.hypot(last[0] - first[0], last[1] - first[1])
+                if closure_dist > 1.0:
+                    sampled_coords.append(first)
+                    print(f"🔒 边界闭合: 添加首点，闭合距离从{closure_dist:.2f}°降至0")
+
+            features = self._extract_ocean_boundary_features(sampled_coords, tc_lat, tc_lon, threshold)
+            metrics = self._calculate_boundary_metrics(sampled_coords, tc_lat, tc_lon, method_used)
+            metrics["warm_water_area_approx_km2"] = self._calculate_polygon_area_km2(sampled_coords)
+
+            return {
+                "boundary_coordinates": sampled_coords,
+                "boundary_features": features,
+                "boundary_metrics": metrics,
+            }
+
+        except Exception as exc:
+            print(f"⚠️ OceanHeat闭合边界提取完全失败: {exc}")
+            import traceback as _traceback  # noqa: WPS433
+
+            _traceback.print_exc()
+            return None
+
+    def _extract_boundary_features(self, coords, tc_lat, tc_lon, threshold):
+        if not coords or len(coords) < 4:
+            return {}
+
+        coords_array = np.array(coords, dtype=float)
+        lons = coords_array[:, 0]
+        lats = coords_array[:, 1]
+
+        north_idx = int(np.argmax(lats))
+        south_idx = int(np.argmin(lats))
+        east_idx = int(np.argmax(lons))
+        west_idx = int(np.argmin(lons))
+
+        extreme_points = {
+            "north": {"lon": round(float(lons[north_idx]), 2), "lat": round(float(lats[north_idx]), 2)},
+            "south": {"lon": round(float(lons[south_idx]), 2), "lat": round(float(lats[south_idx]), 2)},
+            "east": {"lon": round(float(lons[east_idx]), 2), "lat": round(float(lats[east_idx]), 2)},
+            "west": {"lon": round(float(lons[west_idx]), 2), "lat": round(float(lats[west_idx]), 2)},
+        }
+
+        distances = [
+            self._haversine_distance(tc_lat, tc_lon, lat_val, lon_val)
+            for lon_val, lat_val in coords
+        ]
+        nearest_idx = int(np.argmin(distances))
+        farthest_idx = int(np.argmax(distances))
+
+        tc_relative_points = {
+            "nearest": {
+                "lon": round(float(lons[nearest_idx]), 2),
+                "lat": round(float(lats[nearest_idx]), 2),
+                "distance_km": round(float(distances[nearest_idx]), 1),
+            },
+            "farthest": {
+                "lon": round(float(lons[farthest_idx]), 2),
+                "lat": round(float(lats[farthest_idx]), 2),
+                "distance_km": round(float(distances[farthest_idx]), 1),
+            },
+        }
+
+        curvature_analysis = []
+        if len(coords) >= 5:
+            for i in range(len(coords)):
+                prev_idx = (i - 1) % len(coords)
+                next_idx = (i + 1) % len(coords)
+                p1 = np.array([lons[prev_idx], lats[prev_idx]])
+                p2 = np.array([lons[i], lats[i]])
+                p3 = np.array([lons[next_idx], lats[next_idx]])
+                area = 0.5 * abs((p2[0] - p1[0]) * (p3[1] - p1[1]) - (p3[0] - p1[0]) * (p2[1] - p1[1]))
+                a = np.linalg.norm(p2 - p1)
+                b = np.linalg.norm(p3 - p2)
+                c = np.linalg.norm(p3 - p1)
+                curvature = 0.0
+                if a * b * c > 1e-10:
+                    curvature = 4 * area / (a * b * c)
+                curvature_analysis.append(
+                    {"index": i, "lon": round(float(lons[i]), 2), "lat": round(float(lats[i]), 2), "curvature": round(float(curvature), 6)}
+                )
+
+        return {
+            "extreme_points": extreme_points,
+            "tc_relative_points": tc_relative_points,
+            "curvature_analysis": curvature_analysis[:10],
+            "threshold": threshold,
+        }
+
+    def _extract_closed_boundary_with_features(
+        self,
+        data_field,
+        tc_lat,
+        tc_lon,
+        threshold,
+        lat_range=20.0,
+        lon_range=40.0,
+        target_points=50,
+    ):
+        try:
+            from skimage.measure import label as sk_label, find_contours as sk_find_contours
+
+            lat_min = max(tc_lat - lat_range / 2, self.lat.min())
+            lat_max = min(tc_lat + lat_range / 2, self.lat.max())
+            lon_min = tc_lon - lon_range / 2
+            lon_max = tc_lon + lon_range / 2
+
+            lat_mask = (self.lat >= lat_min) & (self.lat <= lat_max)
+            if lon_min < 0:
+                lon_mask = (self.lon >= lon_min + 360) | (self.lon <= lon_max)
+            elif lon_max > 360:
+                lon_mask = (self.lon >= lon_min) | (self.lon <= lon_max - 360)
+            else:
+                lon_mask = (self.lon >= lon_min) & (self.lon <= lon_max)
+
+            local_field = data_field[np.ix_(lat_mask, lon_mask)]
+            local_lat = self.lat[lat_mask]
+            local_lon = self.lon[lon_mask]
+
+            if local_field.size == 0:
+                print("⚠️ 局部区域无数据")
+                return None
+
+            boundary_coords = None
+            method_used = None
+
+            try:
+                mask = (local_field >= threshold).astype(int)
+                labeled = sk_label(mask, connectivity=2)
+                if labeled.max() == 0:
+                    raise ValueError("未找到连通区域")
+
+                tc_lat_idx = np.argmin(np.abs(local_lat - tc_lat))
+                tc_lon_idx = np.argmin(np.abs(local_lon - tc_lon))
+                target_label = labeled[tc_lat_idx, tc_lon_idx]
+
+                if target_label == 0:
+                    unique, counts = np.unique(labeled[labeled > 0], return_counts=True)
+                    if unique.size > 0:
+                        target_label = unique[np.argmax(counts)]
+
+                contours = sk_find_contours((labeled == target_label).astype(float), 0.5)
+                if contours:
+                    main_contour = sorted(contours, key=len, reverse=True)[0]
+                    boundary_coords = main_contour
+                    method_used = "connected_component_labeling"
+            except Exception as exc:
+                print(f"⚠️ 连通区域方法失败: {exc}，尝试方法2")
+
+            if boundary_coords is None:
+                try:
+                    expanded = self._extract_closed_boundary_with_features(
+                        data_field,
+                        tc_lat,
+                        tc_lon,
+                        threshold,
+                        lat_range=30.0,
+                        lon_range=60.0,
+                        target_points=target_points,
+                    )
+                    if expanded:
+                        expanded["boundary_metrics"]["method_note"] = "使用扩大区域(30x60)"
+                        return expanded
+                except Exception as exc:
+                    print(f"⚠️ 扩大区域方法失败: {exc}，尝试方法3")
+
+            if boundary_coords is None:
+                try:
+                    contours = sk_find_contours(local_field, threshold)
+                    if contours:
+                        boundary_coords = sorted(contours, key=len, reverse=True)[0]
+                        method_used = "direct_contour_extraction"
+                except Exception as exc:
+                    print(f"⚠️ 所有方法均失败: {exc}")
+                    return None
+
+            if boundary_coords is None or len(boundary_coords) == 0:
+                return None
+
+            geo_coords = []
+            for point in boundary_coords:
+                lat_idx = int(np.clip(point[0], 0, len(local_lat) - 1))
+                lon_idx = int(np.clip(point[1], 0, len(local_lon) - 1))
+                lat_val = float(local_lat[lat_idx])
+                lon_val = float(local_lon[lon_idx])
+                lon_normalized = self._normalize_longitude(np.array([lon_val]), tc_lon)[0]
+                if lon_normalized < 0:
+                    lon_normalized += 360
+                geo_coords.append([lon_normalized, lat_val])
+
+            sampled_coords = self._adaptive_boundary_sampling(geo_coords, target_points=target_points)
+
+            if len(sampled_coords) > 2:
+                first = sampled_coords[0]
+                last = sampled_coords[-1]
+                closure_dist = math.hypot(last[0] - first[0], last[1] - first[1])
+                if closure_dist > 1.0:
+                    sampled_coords.append(first)
+
+            features = self._extract_boundary_features(sampled_coords, tc_lat, tc_lon, threshold)
+            metrics = self._calculate_boundary_metrics(sampled_coords, tc_lat, tc_lon, method_used)
+
+            return {
+                "boundary_coordinates": sampled_coords,
+                "boundary_features": features,
+                "boundary_metrics": metrics,
+            }
+        except Exception as exc:
+            print(f"⚠️ 闭合边界提取完全失败: {exc}")
+            import traceback as _traceback  # noqa: WPS433
+
+            _traceback.print_exc()
+            return None
+
+    def _get_contour_coords_local(self, data_field, level, lat_array, lon_array, center_lon, max_points=100):
+        try:
+            contours = find_contours(data_field, level)
+            if not contours:
+                return None
+            main_contour = sorted(contours, key=len, reverse=True)[0]
+            contour_lat_idx = np.clip(main_contour[:, 0].astype(int), 0, len(lat_array) - 1)
+            contour_lon_idx = np.clip(main_contour[:, 1].astype(int), 0, len(lon_array) - 1)
+            contour_lon = lon_array[contour_lon_idx]
+            contour_lat = lat_array[contour_lat_idx]
+            contour_lon_normalized = self._normalize_longitude(contour_lon, center_lon)
+            step = max(1, len(main_contour) // max_points)
+            coords = []
+            for lon_val, lat_val in zip(contour_lon_normalized[::step], contour_lat[::step]):
+                if lon_val < 0:
+                    lon_val += 360
+                coords.append([round(float(lon_val), 2), round(float(lat_val), 2)])
+            return coords
+        except Exception:
+            return None
+
+    def _extract_local_boundary_coords(
+        self, data_field, tc_lat, tc_lon, threshold=5880, radius_deg=20.0, max_points=50
+    ):
+        try:
+            lat_min = max(tc_lat - radius_deg, self.lat.min())
+            lat_max = min(tc_lat + radius_deg, self.lat.max())
+            lon_min = tc_lon - radius_deg
+            lon_max = tc_lon + radius_deg
+
+            lat_mask = (self.lat >= lat_min) & (self.lat <= lat_max)
+            if lon_min < 0:
+                lon_mask = (self.lon >= lon_min + 360) | (self.lon <= lon_max)
+            elif lon_max > 360:
+                lon_mask = (self.lon >= lon_min) | (self.lon <= lon_max - 360)
+            else:
+                lon_mask = (self.lon >= lon_min) & (self.lon <= lon_max)
+
+            local_field = data_field[np.ix_(lat_mask, lon_mask)]
+            local_lat = self.lat[lat_mask]
+            local_lon = self.lon[lon_mask]
+
+            return self._get_contour_coords_local(
+                local_field, threshold, local_lat, local_lon, tc_lon, max_points
+            )
+        except Exception as exc:
+            print(f"⚠️ 局部边界提取失败: {exc}")
+            return None
 
     def _calculate_distance(self, lat1, lon1, lat2, lon2):
         return float(self._haversine_distance(lat1, lon1, lat2, lon2))
@@ -899,6 +1562,170 @@ class CDSEnvironmentExtractor:
         speed = float(np.sqrt(u_steering**2 + v_steering**2))
         direction = (float(np.degrees(np.arctan2(u_steering, v_steering))) + 180.0) % 360.0
         return speed, direction, float(u_steering), float(v_steering)
+
+    def _identify_subtropical_high_regional(self, z500, tc_lat, tc_lon, time_idx):  # noqa: ARG002
+        try:
+            lat_range = 20.0
+            lon_range = 40.0
+
+            lat_min = max(tc_lat - lat_range / 2, self.lat.min())
+            lat_max = min(tc_lat + lat_range / 2, self.lat.max())
+            lon_min = tc_lon - lon_range / 2
+            lon_max = tc_lon + lon_range / 2
+
+            lat_mask = (self.lat >= lat_min) & (self.lat <= lat_max)
+            if lon_min < 0:
+                lon_mask = (self.lon >= lon_min + 360) | (self.lon <= lon_max)
+            elif lon_max > 360:
+                lon_mask = (self.lon >= lon_min) | (self.lon <= lon_max - 360)
+            else:
+                lon_mask = (self.lon >= lon_min) & (self.lon <= lon_max)
+
+            region_z500 = z500[np.ix_(lat_mask, lon_mask)]
+            if region_z500.size == 0:
+                return None
+
+            z500_mean = np.nanmean(region_z500)
+            threshold_percentile = np.nanpercentile(region_z500, 75)
+            threshold_std = z500_mean + np.nanstd(region_z500)
+            dynamic_threshold = min(threshold_percentile, threshold_std)
+            dynamic_threshold = max(dynamic_threshold, 5860)
+
+            high_mask = region_z500 > dynamic_threshold
+            if not np.any(high_mask):
+                return None
+
+            labeled_array, num_features = label(high_mask)
+            if num_features == 0:
+                return None
+
+            max_area = 0
+            best_idx = -1
+            for label_idx in range(1, num_features + 1):
+                feature_mask = labeled_array == label_idx
+                area = np.sum(feature_mask)
+                if area > max_area:
+                    max_area = area
+                    best_idx = label_idx
+
+            if best_idx == -1:
+                return None
+
+            target_mask = labeled_array == best_idx
+            com_y, com_x = center_of_mass(target_mask)
+
+            local_lat = self.lat[lat_mask]
+            local_lon = self.lon[lon_mask]
+            pos_lat = float(local_lat[int(com_y)])
+            pos_lon = float(local_lon[int(com_x)])
+            intensity_val = float(np.nanmax(region_z500[target_mask]))
+
+            return {
+                "position": {
+                    "center_of_mass": {
+                        "lat": round(pos_lat, 2),
+                        "lon": round(pos_lon, 2),
+                    }
+                },
+                "intensity": {"value": round(intensity_val, 1), "unit": "gpm"},
+                "shape": {},
+                "extraction_info": {
+                    "method": "regional_processing",
+                    "region_extent": {
+                        "lat_range": [float(lat_min), float(lat_max)],
+                        "lon_range": [float(lon_min), float(lon_max)],
+                    },
+                    "dynamic_threshold": round(float(dynamic_threshold), 1),
+                },
+            }
+        except Exception as exc:
+            print(f"⚠️ 区域化副高识别失败: {exc}")
+            return None
+
+    def _calculate_steering_flow_layered(self, time_idx, tc_lat, tc_lon, radius_deg=5.0):
+        try:
+            levels = [850, 700, 500, 300]
+            weights = [0.3, 0.3, 0.2, 0.2]
+
+            u_weighted = 0.0
+            v_weighted = 0.0
+            total_weight = 0.0
+
+            region_mask = self._create_region_mask(tc_lat, tc_lon, radius_deg)
+
+            for level, weight in zip(levels, weights):
+                u_level = self._get_data_at_level("u", level, time_idx)
+                v_level = self._get_data_at_level("v", level, time_idx)
+                if u_level is None or v_level is None:
+                    continue
+                u_mean = np.nanmean(np.where(region_mask, u_level, np.nan))
+                v_mean = np.nanmean(np.where(region_mask, v_level, np.nan))
+                if not (np.isfinite(u_mean) and np.isfinite(v_mean)):
+                    continue
+                u_weighted += weight * u_mean
+                v_weighted += weight * v_mean
+                total_weight += weight
+
+            if total_weight == 0:
+                return None
+
+            u_steering = u_weighted / total_weight
+            v_steering = v_weighted / total_weight
+            speed = float(np.sqrt(u_steering**2 + v_steering**2))
+            direction = (float(np.degrees(np.arctan2(u_steering, v_steering))) + 180.0) % 360.0
+
+            return {
+                "speed": speed,
+                "direction": direction,
+                "u": float(u_steering),
+                "v": float(v_steering),
+                "method": "layer_averaged_wind_850-300hPa",
+            }
+        except Exception as exc:
+            print(f"⚠️ 层平均引导气流计算失败: {exc}")
+            return None
+
+    def _extract_ridge_line(self, z500, tc_lat, tc_lon, threshold=5880):
+        try:
+            contours = find_contours(z500, threshold)
+            if not contours:
+                return None
+
+            main_contour = sorted(contours, key=len, reverse=True)[0]
+            contour_lat_idx = np.clip(main_contour[:, 0].astype(int), 0, len(self.lat) - 1)
+            contour_lon_idx = np.clip(main_contour[:, 1].astype(int), 0, len(self.lon) - 1)
+            contour_lats = self.lat[contour_lat_idx]
+            contour_lons = self.lon[contour_lon_idx]
+
+            contour_lons_normalized = self._normalize_longitude(contour_lons, tc_lon)
+            east_idx = int(np.argmax(contour_lons_normalized))
+            west_idx = int(np.argmin(contour_lons_normalized))
+
+            east_lat = float(contour_lats[east_idx])
+            east_lon = float(contour_lons[east_idx])
+            west_lat = float(contour_lats[west_idx])
+            west_lon = float(contour_lons[west_idx])
+
+            _, east_rel = self._calculate_bearing(tc_lat, tc_lon, east_lat, east_lon)
+            _, west_rel = self._calculate_bearing(tc_lat, tc_lon, west_lat, west_lon)
+
+            return {
+                "east_end": {
+                    "latitude": round(east_lat, 2),
+                    "longitude": round(east_lon, 2),
+                    "relative_position": east_rel,
+                },
+                "west_end": {
+                    "latitude": round(west_lat, 2),
+                    "longitude": round(west_lon, 2),
+                    "relative_position": west_rel,
+                },
+                "threshold_gpm": threshold,
+                "description": f"{threshold}gpm 等值线从{west_rel}延伸至{east_rel}",
+            }
+        except Exception as exc:
+            print(f"⚠️ 脊线提取失败: {exc}")
+            return None
 
     def _get_contour_coords(self, data_field, level, max_points=100):
         try:
@@ -1081,105 +1908,132 @@ class CDSEnvironmentExtractor:
         }
 
     def extract_steering_system(self, time_idx, tc_lat, tc_lon):
-        """提取副热带高压及引导气流，匹配extractSyst结构"""
+        """提取副热带高压及引导气流，匹配 extractSyst 结构。"""
         try:
             z500 = self._get_data_at_level("z", 500, time_idx)
             if z500 is None:
                 return None
 
             field_values = np.asarray(z500, dtype=float)
-            if np.nanmean(field_values) > 10000:
-                field_values = field_values / 9.80665
+            # 不进行单位转换，保持与environment_extractor一致（使用geopotential原始值）
+            # if np.nanmean(field_values) > 10000:
+            #     field_values = field_values / 9.80665
 
-            threshold = 5880
-            subtropical_high = self._identify_pressure_system(
-                field_values, tc_lat, tc_lon, "high", threshold
-            )
-            if not subtropical_high:
-                return None
+            subtropical_high_obj = self._identify_subtropical_high_regional(field_values, tc_lat, tc_lon, time_idx)
+            if not subtropical_high_obj:
+                # 阈值调整: 5880 gpm * 9.80665 ≈ 57651 (geopotential)
+                subtropical_high_obj = self._identify_pressure_system(field_values, tc_lat, tc_lon, "high", 57651)
+                if not subtropical_high_obj:
+                    return None
 
-            enhanced_shape = self._get_enhanced_shape_info(
-                field_values, threshold, "high", tc_lat, tc_lon
-            )
+            enhanced_shape = self._get_enhanced_shape_info(field_values, 57651, "high", tc_lat, tc_lon)
 
-            steering_speed, steering_direction, u_steering, v_steering = self._calculate_steering_flow(
-                field_values, tc_lat, tc_lon
-            )
+            steering_result = self._calculate_steering_flow_layered(time_idx, tc_lat, tc_lon)
+            if not steering_result:
+                speed, direction, u_steering, v_steering = self._calculate_steering_flow(field_values, tc_lat, tc_lon)
+                steering_result = {
+                    "speed": speed,
+                    "direction": direction,
+                    "u": u_steering,
+                    "v": v_steering,
+                    "method": "geostrophic_wind",
+                }
 
-            intensity_val = subtropical_high["intensity"]["value"]
-            if intensity_val > 5900:
+            ridge_info = self._extract_ridge_line(field_values, tc_lat, tc_lon)
+
+            intensity_val = subtropical_high_obj["intensity"]["value"]
+            # 阈值调整: 原来是gpm，现在是geopotential（约乘以9.8）
+            if intensity_val > 57800:  # ~5900 gpm
                 level = "强"
-            elif intensity_val > 5880:
+            elif intensity_val > 57651:  # ~5880 gpm
                 level = "中等"
             else:
                 level = "弱"
-            subtropical_high["intensity"]["level"] = level
+            subtropical_high_obj["intensity"]["level"] = level
 
             if enhanced_shape:
-                subtropical_high.setdefault("shape", {}).update(
+                shape_section = subtropical_high_obj.setdefault("shape", {})
+                shape_section.update(
                     {
                         "detailed_analysis": enhanced_shape["detailed_analysis"],
-                        "area_km2": enhanced_shape["area_km2"],
-                        "shape_type": enhanced_shape["shape_type"],
-                        "orientation": enhanced_shape["orientation"],
-                        "complexity": enhanced_shape["complexity"],
+                        "shape_type": enhanced_shape.get("shape_type"),
+                        "orientation": enhanced_shape.get("orientation"),
+                        "complexity": enhanced_shape.get("complexity"),
                     }
                 )
                 coord_info = enhanced_shape.get("coordinate_info")
                 if coord_info:
-                    subtropical_high["shape"]["coordinate_details"] = coord_info
-                else:
-                    subtropical_high.setdefault("shape", {})
+                    shape_section["coordinate_details"] = coord_info
 
-            system_coords = self._get_system_coordinates(field_values, threshold, "high", max_points=15)
-            if system_coords:
-                subtropical_high["shape"]["coordinates"] = system_coords
-                subtropical_high["shape"]["coordinate_description"] = self._generate_coordinate_description(
-                    system_coords, "副热带高压"
+            extraction_info = subtropical_high_obj.get("extraction_info", {})
+            dynamic_threshold = extraction_info.get("dynamic_threshold", 57651)  # 调整为geopotential值
+            boundary_result = self._extract_closed_boundary_with_features(
+                field_values,
+                tc_lat,
+                tc_lon,
+                threshold=dynamic_threshold,
+                lat_range=20.0,
+                lon_range=40.0,
+                target_points=50,
+            )
+
+            if boundary_result:
+                subtropical_high_obj["boundary_coordinates"] = boundary_result["boundary_coordinates"]
+                subtropical_high_obj["boundary_features"] = boundary_result["boundary_features"]
+                subtropical_high_obj["boundary_metrics"] = boundary_result["boundary_metrics"]
+                print(
+                    f"✅ 边界提取成功: {boundary_result['boundary_metrics']['total_points']}点, "
+                    f"{'闭合' if boundary_result['boundary_metrics']['is_closed'] else '开放'}, "
+                    f"方法: {boundary_result['boundary_metrics']['extraction_method']}"
                 )
+            else:
+                print("⚠️ 新方法失败，使用旧方法提取边界")
+                fallback_coords = self._extract_local_boundary_coords(
+                    field_values, tc_lat, tc_lon, threshold=dynamic_threshold, radius_deg=20.0
+                )
+                if fallback_coords:
+                    subtropical_high_obj["boundary_coordinates"] = fallback_coords
+                    subtropical_high_obj["boundary_note"] = "使用旧方法（新方法失败）"
 
-            contour_coords = self._get_contour_coords(field_values, threshold, max_points=120)
-            if contour_coords:
-                subtropical_high["shape"]["contour_5880gpm"] = contour_coords
+            high_pos = subtropical_high_obj["position"]["center_of_mass"]
+            bearing, rel_pos_desc = self._calculate_bearing(tc_lat, tc_lon, high_pos["lat"], high_pos["lon"])
+            distance = self._calculate_distance(tc_lat, tc_lon, high_pos["lat"], high_pos["lon"])
 
-            center = subtropical_high["position"].get("center_of_mass", {})
-            bearing, rel_dir_text = self._calculate_bearing(
-                tc_lat, tc_lon, center.get("lat", tc_lat), center.get("lon", tc_lon)
-            )
-            distance = self._calculate_distance(
-                tc_lat, tc_lon, center.get("lat", tc_lat), center.get("lon", tc_lon)
-            )
+            steering_speed = steering_result["speed"]
+            steering_direction = steering_result["direction"]
+            u_steering = steering_result["u"]
+            v_steering = steering_result["v"]
 
             desc = (
-                f"一个强度为“{level}”的副热带高压系统位于台风的{rel_dir_text}，其主体形态稳定，"
-                f"为台风提供了稳定的{steering_direction:.0f}°方向、速度为{steering_speed:.1f} m/s的引导气流。"
+                f"一个强度为“{level}”的副热带高压系统位于台风的{rel_pos_desc}，"
+                f"其主体形态稳定，为台风提供了稳定的{steering_direction:.0f}°方向、"
+                f"速度为{steering_speed:.1f} m/s的引导气流。"
             )
 
-            subtropical_high.update(
+            # 更新position，只保留与environment_extractor一致的字段
+            subtropical_high_obj["position"]["relative_to_tc"] = rel_pos_desc
+            # 移除 description, distance_km, bearing_deg 以与 environment_extractor 对齐
+            
+            subtropical_high_obj.update(
                 {
                     "system_name": "SubtropicalHigh",
                     "description": desc,
-                    "position": {
-                        "description": "副热带高压中心",
-                        "center_of_mass": {
-                            "lat": round(center.get("lat", tc_lat), 2),
-                            "lon": round(center.get("lon", tc_lon), 2),
-                        },
-                        "relative_to_tc": rel_dir_text,
-                        "distance_km": round(distance, 1),
-                        "bearing_deg": round(bearing, 1),
-                    },
                     "properties": {
                         "influence": "主导台风未来路径",
                         "steering_flow": {
                             "speed_mps": round(steering_speed, 2),
                             "direction_deg": round(steering_direction, 1),
                             "vector_mps": {"u": round(u_steering, 2), "v": round(v_steering, 2)},
+                            "calculation_method": steering_result.get("method", "unknown"),
                         },
                     },
                 }
             )
-            return subtropical_high
+
+            if ridge_info:
+                subtropical_high_obj["properties"]["ridge_line"] = ridge_info
+
+            return subtropical_high_obj
         except Exception as exc:
             print(f"⚠️ 引导系统提取失败: {exc}")
             return None
@@ -1189,54 +2043,120 @@ class CDSEnvironmentExtractor:
         return self.extract_steering_system(time_idx, tc_lat, tc_lon)
 
     def extract_ocean_heat_content(self, time_idx, tc_lat, tc_lon, radius_deg=2.0):
-        """提取海洋热含量及暖水边界信息"""
+        """提取海洋热含量及暖水边界信息，向 extractSyst 对齐。"""
         try:
             sst = self._get_sst_field(time_idx)
             if sst is None:
                 return None
 
-            region_mask = self._create_region_mask(tc_lat, tc_lon, radius_deg)
-            if not np.any(region_mask):
+            radius_km = radius_deg * 111.0
+            circular_mask = self._create_circular_mask_haversine(tc_lat, tc_lon, radius_km)
+            if not np.any(circular_mask):
                 return None
 
-            mean_temp = float(np.nanmean(np.where(region_mask, sst, np.nan)))
-            if not np.isfinite(mean_temp):
+            sst_mean = float(np.nanmean(np.where(circular_mask, sst, np.nan)))
+            if not np.isfinite(sst_mean):
                 return None
 
-            if mean_temp > 29:
+            if sst_mean > 29:
                 level, impact = "极高", "为爆发性增强提供顶级能量"
-            elif mean_temp > 28:
+            elif sst_mean > 28:
                 level, impact = "高", "非常有利于加强"
-            elif mean_temp > 26.5:
+            elif sst_mean > 26.5:
                 level, impact = "中等", "足以维持强度"
             else:
                 level, impact = "低", "能量供应不足，将导致减弱"
 
-            contour_26_5 = self._get_contour_coords(sst, 26.5)
-            enhanced_shape = self._get_enhanced_shape_info(sst, 26.5, "high", tc_lat, tc_lon)
-
             desc = (
-                f"台风下方海域的平均海表温度为{mean_temp:.1f}°C，海洋热含量等级为“{level}”，{impact}。"
+                f"台风下方海域的平均海表温度为{sst_mean:.1f}°C，海洋热含量等级为“{level}”，"
+                f"{impact}。"
             )
+            desc_base = desc.rstrip("。")
+            extra_notes = []
 
             shape_info = {
                 "description": "26.5°C是台风发展的最低海温门槛，此线是生命线",
-                "warm_water_boundary_26.5C": contour_26_5,
+                "boundary_type": "closed_contour_with_features",
+                "extraction_radius_deg": radius_deg * 3,
             }
 
-            if enhanced_shape:
-                shape_info.update(
-                    {
-                        "warm_water_area_km2": enhanced_shape["area_km2"],
-                        "warm_region_shape": enhanced_shape["shape_type"],
-                        "warm_region_orientation": enhanced_shape["orientation"],
-                        "detailed_analysis": enhanced_shape["detailed_analysis"],
-                    }
+            boundary_result = self._extract_closed_ocean_boundary_with_features(
+                sst,
+                tc_lat,
+                tc_lon,
+                threshold=26.5,
+                lat_range=radius_deg * 6,
+                lon_range=radius_deg * 12,
+                target_points=50,
+            )
+
+            if boundary_result:
+                shape_info["warm_water_boundary_26.5C"] = boundary_result["boundary_coordinates"]
+                shape_info["boundary_features"] = boundary_result["boundary_features"]
+                shape_info["boundary_metrics"] = boundary_result["boundary_metrics"]
+
+                metrics = boundary_result["boundary_metrics"]
+                if "warm_water_area_approx_km2" in metrics:
+                    area_val = metrics["warm_water_area_approx_km2"]
+                    shape_info["warm_water_area_km2"] = area_val
+                    extra_notes.append(f"暖水区域面积约{area_val:.0f}km²")
+
+                if metrics.get("is_closed"):
+                    extra_notes.append(
+                        f"边界完整闭合（{metrics['total_points']}个采样点，"
+                        f"周长{metrics['perimeter_km']:.0f}km）"
+                    )
+
+                tc_features = boundary_result["boundary_features"].get("tc_relative_points", {})
+                if "nearest_to_tc" in tc_features:
+                    nearest = tc_features["nearest_to_tc"]
+                    extra_notes.append(f"台风距暖水区边界最近{nearest['distance_km']:.0f}km")
+
+                warm_eddies = boundary_result["boundary_features"].get("warm_eddy_centers", [])
+                if warm_eddies:
+                    extra_notes.append(f"检测到{len(warm_eddies)}个暖涡特征")
+            else:
+                print("⚠️ 闭合边界提取失败，回退到旧方法")
+                lat_idx, lon_idx = self._loc_idx(tc_lat, tc_lon)
+                radius_points = max(1, int(radius_deg * 3 / max(self.lat_spacing, 1e-6)))
+                lat_start = max(0, lat_idx - radius_points)
+                lat_end = min(len(self.lat), lat_idx + radius_points + 1)
+                lon_start = max(0, lon_idx - radius_points)
+                lon_end = min(len(self.lon), lon_idx + radius_points + 1)
+
+                sst_local = sst[lat_start:lat_end, lon_start:lon_end]
+                local_lat = self.lat[lat_start:lat_end]
+                local_lon = self.lon[lon_start:lon_end]
+
+                contour_26_5 = self._get_contour_coords_local(
+                    sst_local, 26.5, local_lat, local_lon, tc_lon
                 )
-                desc += (
-                    f" 暖水区域面积约{enhanced_shape['area_km2']:.0f}km²，呈{enhanced_shape['shape_type']}，"
-                    f"{enhanced_shape['orientation']}。"
-                )
+                shape_info["warm_water_boundary_26.5C"] = contour_26_5
+                shape_info["boundary_type"] = "fallback_local_region"
+
+                enhanced_shape = self._get_enhanced_shape_info(sst, 26.5, "high", tc_lat, tc_lon)
+                if enhanced_shape:
+                    shape_info.update(
+                        {
+                            "warm_water_area_km2": enhanced_shape["area_km2"],
+                            "warm_region_shape": enhanced_shape.get("shape_type"),
+                            "warm_region_orientation": enhanced_shape.get("orientation"),
+                            "detailed_analysis": enhanced_shape["detailed_analysis"],
+                        }
+                    )
+                    area_note = f"暖水区域面积约{enhanced_shape['area_km2']:.0f}km²"
+                    shape_type = enhanced_shape.get("shape_type")
+                    orientation = enhanced_shape.get("orientation")
+                    if shape_type:
+                        area_note += f"，呈{shape_type}"
+                    if orientation:
+                        area_note += f"，{orientation}"
+                    extra_notes.append(area_note)
+
+            if extra_notes:
+                desc = desc_base + "。" + "，".join(extra_notes) + "。"
+            else:
+                desc = desc_base + "。"
 
             return {
                 "system_name": "OceanHeatContent",
@@ -1246,7 +2166,7 @@ class CDSEnvironmentExtractor:
                     "lat": round(tc_lat, 2),
                     "lon": round(tc_lon, 2),
                 },
-                "intensity": {"value": round(mean_temp, 2), "unit": "°C", "level": level},
+                "intensity": {"value": round(sst_mean, 2), "unit": "°C", "level": level},
                 "shape": shape_info,
                 "properties": {"impact": impact},
             }
@@ -1266,51 +2186,112 @@ class CDSEnvironmentExtractor:
                 return None
 
             with np.errstate(divide="ignore", invalid="ignore"):
+                a = 6371000.0
                 gy_u, gx_u = self._raw_gradients(u200)
-                gy_v, gx_v = self._raw_gradients(v200)
-                du_dx = gx_u / (self.lon_spacing * 111000.0 * self._coslat_safe[:, np.newaxis])
-                dv_dy = gy_v / (self.lat_spacing * 111000.0)
-                divergence = du_dx + dv_dy
+                coslat = self._coslat_safe[:, np.newaxis]
+                v_coslat = v200 * coslat
+                gy_v_coslat, gx_v_coslat = self._raw_gradients(v_coslat)
+                dlambda = np.deg2rad(self.lon_spacing)
+                dphi = np.deg2rad(self.lat_spacing)
+                du_dlambda = gx_u / dlambda
+                dv_coslat_dphi = gy_v_coslat / dphi
+                divergence = (du_dlambda / (a * coslat) + dv_coslat_dphi / a)
 
             if not np.any(np.isfinite(divergence)):
                 return None
+            divergence = np.where(np.isfinite(divergence), divergence, np.nan)
 
-            lat_idx, lon_idx = self._loc_idx(tc_lat, tc_lon)
-            div_val = divergence[lat_idx, lon_idx]
-            if not np.isfinite(div_val):
-                sub = divergence[max(0, lat_idx - 1) : lat_idx + 2, max(0, lon_idx - 1) : lon_idx + 2]
-                finite = sub[np.isfinite(sub)]
-                if finite.size == 0:
-                    return None
-                div_val = float(np.nanmean(finite))
-            div_val = float(np.clip(div_val, -5e-4, 5e-4))
-            div_scaled = div_val * 1e5
+            radius_km = 500
+            circular_mask = self._create_circular_mask_haversine(tc_lat, tc_lon, radius_km)
+            divergence_masked = np.where(circular_mask, divergence, np.nan)
+            div_val_raw = float(np.nanmean(divergence_masked))
+            if not np.isfinite(div_val_raw):
+                return None
 
-            if div_scaled > 5:
+            if np.all(np.isnan(divergence_masked)):
+                return None
+
+            max_div_idx = np.nanargmax(divergence_masked)
+            max_lat_idx, max_lon_idx = np.unravel_index(max_div_idx, divergence_masked.shape)
+            max_div_lat = float(self.lat[max_lat_idx])
+            max_div_lon = float(self.lon[max_lon_idx])
+            max_div_value = float(np.clip(divergence[max_lat_idx, max_lon_idx], -5e-4, 5e-4))
+
+            distance_to_max = self._haversine_distance(tc_lat, tc_lon, max_div_lat, max_div_lon)
+
+            def _bearing(lat1, lon1, lat2, lon2):
+                lat1_rad = np.deg2rad(lat1)
+                lat2_rad = np.deg2rad(lat2)
+                dlon_rad = np.deg2rad(lon2 - lon1)
+                x = np.sin(dlon_rad) * np.cos(lat2_rad)
+                y = np.cos(lat1_rad) * np.sin(lat2_rad) - np.sin(lat1_rad) * np.cos(lat2_rad) * np.cos(dlon_rad)
+                bearing = np.rad2deg(np.arctan2(x, y))
+                return (bearing + 360) % 360
+
+            bearing = _bearing(tc_lat, tc_lon, max_div_lat, max_div_lon)
+            direction_names = ["北", "东北", "东", "东南", "南", "西南", "西", "西北"]
+            direction_idx = int((bearing + 22.5) // 45) % 8
+            direction = direction_names[direction_idx]
+
+            div_val_raw = float(np.clip(div_val_raw, -5e-4, 5e-4))
+            div_value = div_val_raw * 1e5
+            max_div_value_scaled = max_div_value * 1e5
+
+            if div_value > 5:
                 level, impact = "强", "极其有利于台风发展和加强"
-            elif div_scaled > 2:
+            elif div_value > 2:
                 level, impact = "中等", "有利于台风维持和发展"
-            elif div_scaled > -2:
+            elif div_value > -2:
                 level, impact = "弱", "对台风发展影响较小"
             else:
                 level, impact = "负值", "不利于台风发展"
 
+            offset_note = ""
+            if distance_to_max > 100:
+                offset_note = (
+                    f"最大辐散中心位于台风中心{direction}方向约{distance_to_max:.0f}公里处，"
+                    f"强度为{max_div_value_scaled:.1f}×10⁻⁵ s⁻¹，"
+                )
+                if distance_to_max > 200:
+                    offset_note += "辐散中心明显偏移可能影响台风的对称结构。"
+                else:
+                    offset_note += "辐散中心略有偏移。"
+
             desc = (
-                f"台风上方200hPa高度的散度值为{div_scaled:.1f}×10⁻⁵ s⁻¹，"
-                f"高空辐散强度为'{level}'，{impact}。"
+                f"台风中心周围500公里范围内200hPa高度的平均散度值为{div_value:.1f}×10⁻⁵ s⁻¹，"
+                f"高空辐散强度为“{level}”，{impact}。"
             )
+            if offset_note:
+                desc += offset_note
 
             return {
                 "system_name": "UpperLevelDivergence",
                 "description": desc,
                 "position": {
-                    "description": "台风中心上方200hPa高度",
-                    "lat": round(tc_lat, 2),
-                    "lon": round(tc_lon, 2),
+                    "description": f"台风中心周围{radius_km}公里范围内200hPa高度",
+                    "center_lat": round(tc_lat, 2),
+                    "center_lon": round(tc_lon, 2),
+                    "radius_km": radius_km,
                 },
-                "intensity": {"value": round(div_scaled, 2), "unit": "×10⁻⁵ s⁻¹", "level": level},
+                "intensity": {
+                    "average_value": round(div_value, 2),
+                    "max_value": round(max_div_value_scaled, 2),
+                    "unit": "×10⁻⁵ s⁻¹",
+                    "level": level,
+                },
+                "divergence_center": {
+                    "lat": round(max_div_lat, 2),
+                    "lon": round(max_div_lon, 2),
+                    "distance_to_tc_km": round(distance_to_max, 1),
+                    "direction": direction,
+                    "bearing_deg": round(bearing, 1),
+                },
                 "shape": {"description": "高空辐散中心的空间分布"},
-                "properties": {"impact": impact, "favorable_development": div_scaled > 0},
+                "properties": {
+                    "impact": impact,
+                    "favorable_development": div_value > 0,
+                    "center_offset": distance_to_max > 100,
+                },
             }
         except Exception as exc:
             print(f"⚠️ 高空辐散提取失败: {exc}")
@@ -1323,44 +2304,143 @@ class CDSEnvironmentExtractor:
             if u850 is None or v850 is None:
                 return None
 
+            # 使用与environment_extractor相同的算法：计算辐散->辐合
+            a = 6371000
+            lat_rad = np.deg2rad(self.lat)
+            lon_rad = np.deg2rad(self.lon)
+
             gy_u, gx_u = self._raw_gradients(u850)
             gy_v, gx_v = self._raw_gradients(v850)
-            du_dy = gy_u / (self.lat_spacing * 111000.0)
-            dv_dx = gx_v / (self.lon_spacing * 111000.0 * self._coslat_safe[:, np.newaxis])
-            vorticity = dv_dx - du_dy
 
-            tropical_mask = (self.lat >= 0) & (self.lat <= 20)
+            dlat = self.lat_spacing * np.pi / 180
+            dlon = self.lon_spacing * np.pi / 180
+            cos_lat = self._coslat_safe[:, np.newaxis]
+
+            du_dlon = gx_u / dlon
+            dv_dlat = gy_v / dlat
+
+            divergence = (1 / (a * cos_lat)) * du_dlon + (1 / a) * (dv_dlat * cos_lat - v850 * np.sin(lat_rad)[:, np.newaxis])
+
+            # 根据半球选择搜索范围
+            if tc_lat >= 0:
+                lat_min, lat_max = 5, 20
+                hemisphere = "北半球"
+            else:
+                lat_min, lat_max = -20, -5
+                hemisphere = "南半球"
+
+            tropical_mask = (self.lat >= lat_min) & (self.lat <= lat_max)
             if not np.any(tropical_mask):
                 return None
 
-            tropical_vort = vorticity[tropical_mask, :]
-            rel_idx = np.nanargmax(tropical_vort)
-            lat_idx = rel_idx // tropical_vort.shape[1]
-            itcz_lat = float(self.lat[tropical_mask][lat_idx])
+            convergence = -divergence
+            tropical_conv = convergence[tropical_mask, :]
+            conv_by_lat = np.nanmean(tropical_conv, axis=1)
+            if not np.any(np.isfinite(conv_by_lat)):
+                return None
 
+            max_conv_idx = np.nanargmax(conv_by_lat)
+            itcz_lat = self.lat[tropical_mask][max_conv_idx]
+            max_convergence = conv_by_lat[max_conv_idx] * 1e5
+
+            # 查找经度范围
+            lat_idx = self._loc_idx(itcz_lat, tc_lon)[0]
+            conv_at_lat = convergence[lat_idx, :]
+
+            conv_threshold = (
+                np.nanpercentile(conv_at_lat[conv_at_lat > 0], 50) if np.any(conv_at_lat > 0) else 0
+            )
+            strong_conv_mask = conv_at_lat > conv_threshold
+
+            lon_ranges = []
+            in_range = False
+            start_lon = None
+            for i, is_strong in enumerate(strong_conv_mask):
+                if is_strong and not in_range:
+                    start_lon = self.lon[i]
+                    in_range = True
+                elif not is_strong and in_range:
+                    lon_ranges.append((start_lon, self.lon[i - 1]))
+                    in_range = False
+            if in_range:
+                lon_ranges.append((start_lon, self.lon[-1]))
+
+            best_range = None
+            min_dist = float("inf")
+            for lon_start, lon_end in lon_ranges:
+                if lon_start <= tc_lon <= lon_end:
+                    best_range = (lon_start, lon_end)
+                    break
+                dist = min(abs(tc_lon - lon_start), abs(tc_lon - lon_end))
+                if dist < min_dist:
+                    min_dist = dist
+                    best_range = (lon_start, lon_end)
+
+            distance_km = self._haversine_distance(tc_lat, tc_lon, itcz_lat, tc_lon)
             distance_deg = abs(tc_lat - itcz_lat)
-            if distance_deg < 5:
+
+            if distance_km < 500:
                 influence = "直接影响台风发展"
-            elif distance_deg < 10:
+                impact_level = "强"
+            elif distance_km < 1000:
                 influence = "对台风路径有显著影响"
+                impact_level = "中"
             else:
                 influence = "对台风影响较小"
+                impact_level = "弱"
+
+            if max_convergence > 5:
+                conv_level = "强"
+                conv_desc = "辐合活跃，有利于对流发展"
+            elif max_convergence > 2:
+                conv_level = "中等"
+                conv_desc = "辐合中等，对对流有一定支持"
+            else:
+                conv_level = "弱"
+                conv_desc = "辐合较弱"
+
+            lon_range_str = f"{best_range[0]:.1f}°E-{best_range[1]:.1f}°E" if best_range else "跨经度带"
 
             desc = (
-                f"热带辐合带当前位于约{itcz_lat:.1f}°N附近，与台风中心距离{distance_deg:.1f}度，{influence}。"
+                f"{hemisphere}热带辐合带位于约{itcz_lat:.1f}°{'N' if itcz_lat >= 0 else 'S'}附近，"
+                f"经度范围{lon_range_str}，"
+                f"辐合强度{max_convergence:.2f}×10⁻⁵ s⁻¹（{conv_level}）。"
+                f"与台风中心距离{distance_km:.0f}公里（{distance_deg:.1f}度），{influence}。"
             )
 
-            return {
+            result = {
                 "system_name": "InterTropicalConvergenceZone",
                 "description": desc,
-                "position": {"description": "热带辐合带位置", "lat": round(itcz_lat, 1), "lon": "跨经度带"},
-                "intensity": {"description": "基于850hPa涡度确定的活跃程度"},
-                "shape": {"description": "东西向延伸的辐合带"},
+                "position": {
+                    "description": "热带辐合带中心位置",
+                    "lat": round(itcz_lat, 2),
+                    "lon": tc_lon,
+                    "lon_range": lon_range_str,
+                },
+                "intensity": {
+                    "value": round(max_convergence, 2),
+                    "unit": "×10⁻⁵ s⁻¹",
+                    "level": conv_level,
+                    "description": conv_desc,
+                },
+                "shape": {"description": "东西向延伸的辐合带", "type": "convergence_line"},
                 "properties": {
-                    "distance_to_tc_deg": round(distance_deg, 1),
+                    "distance_to_tc_km": round(distance_km, 1),
+                    "distance_to_tc_deg": round(distance_deg, 2),
                     "influence": influence,
+                    "impact_level": impact_level,
+                    "hemisphere": hemisphere,
+                    "convergence_strength": conv_level,
                 },
             }
+
+            if best_range:
+                sample_lons = [best_range[0], (best_range[0] + best_range[1]) / 2, best_range[1]]
+                boundary_coords = [[lon, itcz_lat] for lon in sample_lons]
+                result["boundary_coordinates"] = boundary_coords
+
+            return result
+
         except Exception as exc:
             print(f"⚠️ ITCZ 提取失败: {exc}")
             return None
@@ -1372,59 +2452,163 @@ class CDSEnvironmentExtractor:
                 return None
 
             field_values = np.asarray(z500, dtype=float)
-            if np.nanmean(field_values) > 10000:
-                field_values = field_values / 9.80665
+            # 不进行单位转换，保持与environment_extractor一致（使用geopotential原始值）
+            # if np.nanmean(field_values) > 10000:
+            #     field_values = field_values / 9.80665
+
+            # 使用与environment_extractor相同的算法：基于高度距平
+            z500_zonal_mean = np.nanmean(field_values, axis=1, keepdims=True)
+            z500_anomaly = field_values - z500_zonal_mean
 
             mid_lat_mask = (self.lat >= 20) & (self.lat <= 60)
             if not np.any(mid_lat_mask):
                 return None
 
-            z500_mid = field_values[mid_lat_mask, :]
-            trough_threshold = np.percentile(z500_mid, 25)
-            trough = self._identify_pressure_system(
-                field_values, tc_lat, tc_lon, "low", trough_threshold
-            )
-            if not trough:
+            z500_anomaly_mid = z500_anomaly.copy()
+            z500_anomaly_mid[~mid_lat_mask, :] = np.nan
+
+            negative_anomaly = z500_anomaly_mid < 0
+            if not np.any(negative_anomaly):
                 return None
 
-            center = trough["position"]["center_of_mass"]
-            bearing, rel_desc = self._calculate_bearing(tc_lat, tc_lon, center["lat"], center["lon"])
-            distance = self._calculate_distance(tc_lat, tc_lon, center["lat"], center["lon"])
+            neg_values = z500_anomaly_mid[negative_anomaly]
+            if len(neg_values) == 0:
+                return None
+
+            trough_threshold_anomaly = np.percentile(neg_values, 25)
+
+            # 局部搜索
+            search_radius_deg = 30
+            lat_idx, lon_idx = self._loc_idx(tc_lat, tc_lon)
+            radius_points = int(search_radius_deg / self.lat_spacing)
+            lat_start = max(0, lat_idx - radius_points)
+            lat_end = min(len(self.lat), lat_idx + radius_points + 1)
+            lon_start = max(0, lon_idx - radius_points)
+            lon_end = min(len(self.lon), lon_idx + radius_points + 1)
+
+            local_mask = np.zeros_like(z500_anomaly, dtype=bool)
+            local_mask[lat_start:lat_end, lon_start:lon_end] = True
+            local_mask = local_mask & mid_lat_mask[:, np.newaxis]
+
+            trough_mask = (z500_anomaly < trough_threshold_anomaly) & local_mask
+            if not np.any(trough_mask):
+                return None
+
+            # 提取槽轴和槽底
+            trough_axis = []
+            trough_lons = []
+            trough_lats = []
+
+            lon_indices = np.where(np.any(trough_mask, axis=0))[0]
+            if len(lon_indices) < 2:
+                return None
+
+            for lon_idx_local in lon_indices:
+                col = z500_anomaly[:, lon_idx_local]
+                col_mask = trough_mask[:, lon_idx_local]
+                if not np.any(col_mask):
+                    continue
+                masked_col = np.where(col_mask, col, np.nan)
+                if not np.any(np.isfinite(masked_col)):
+                    continue
+                min_lat_idx = np.nanargmin(masked_col)
+                trough_lats.append(float(self.lat[min_lat_idx]))
+                trough_lons.append(float(self.lon[lon_idx_local]))
+                trough_axis.append([float(self.lon[lon_idx_local]), float(self.lat[min_lat_idx])])
+
+            if len(trough_axis) < 2:
+                return None
+
+            # 找槽底（高度距平最小点）
+            min_anomaly_idx = np.nanargmin(z500_anomaly[trough_mask])
+            trough_mask_indices = np.where(trough_mask)
+            trough_bottom_lat_idx = trough_mask_indices[0][min_anomaly_idx]
+            trough_bottom_lon_idx = trough_mask_indices[1][min_anomaly_idx]
+
+            trough_bottom_lat = float(self.lat[trough_bottom_lat_idx])
+            trough_bottom_lon = float(self.lon[trough_bottom_lon_idx])
+            trough_bottom_anomaly = float(z500_anomaly[trough_bottom_lat_idx, trough_bottom_lon_idx])
+
+            trough_center_lat = np.mean(trough_lats)
+            trough_center_lon = np.mean(trough_lons)
+
+            bearing, rel_pos_desc = self._calculate_bearing(tc_lat, tc_lon, trough_center_lat, trough_center_lon)
+            distance = self._calculate_distance(tc_lat, tc_lon, trough_center_lat, trough_center_lon)
+
+            distance_bottom = self._haversine_distance(tc_lat, tc_lon, trough_bottom_lat, trough_bottom_lon)
+            bearing_bottom, _ = self._calculate_bearing(tc_lat, tc_lon, trough_bottom_lat, trough_bottom_lon)
+
+            trough_intensity = abs(trough_bottom_anomaly)
+
+            trough_intensity = abs(trough_bottom_anomaly)
+
+            if trough_intensity > 1500:  # geopotential单位，约150 gpm
+                strength = "强"
+            elif trough_intensity > 800:  # 约80 gpm
+                strength = "中等"
+            else:
+                strength = "弱"
 
             if distance < 1000:
-                influence = "直接影响台风路径和强度"
+                if distance_bottom < 500:
+                    influence = "槽前西南气流直接影响台风路径和强度，可能促进台风向东北方向移动"
+                else:
+                    influence = "直接影响台风路径和强度"
             elif distance < 2000:
-                influence = "对台风有间接影响"
+                influence = "对台风有间接影响，可能通过引导气流影响台风移动"
             else:
                 influence = "影响较小"
 
-            coords = self._get_system_coordinates(field_values, trough_threshold, "low", max_points=12)
-            shape_info = {"description": "南北向延伸的槽线系统"}
-            if coords:
-                shape_info.update(
-                    {
-                        "coordinates": coords,
-                        "extent_desc": f"纬度跨度{coords['span_deg'][1]:.1f}°，经度跨度{coords['span_deg'][0]:.1f}°",
-                    }
-                )
-
             desc = (
-                f"在台风{rel_desc}约{distance:.0f}公里处存在西风槽系统，{influence}。"
+                f"在台风{rel_pos_desc}约{distance:.0f}公里处存在{strength}西风槽系统，"
+                f"槽底位于({trough_bottom_lat:.1f}°N, {trough_bottom_lon:.1f}°E)，"
+                f"距台风中心{distance_bottom:.0f}公里。"
             )
-            if coords:
-                desc += (
-                    f" 槽线主体跨越纬度{coords['span_deg'][1]:.1f}°，经度{coords['span_deg'][0]:.1f}°。"
-                )
+
+            desc += f"槽轴呈南北向延伸，跨越{len(trough_axis)}个采样点。"
+            desc += influence + "。"
+
+            shape_info = {
+                "description": "南北向延伸的槽线系统",
+                "trough_axis": trough_axis,
+                "trough_bottom": [trough_bottom_lon, trough_bottom_lat],
+                "axis_extent": {
+                    "lat_range": [min(trough_lats), max(trough_lats)],
+                    "lon_range": [min(trough_lons), max(trough_lons)],
+                    "lat_span_deg": max(trough_lats) - min(trough_lats),
+                    "lon_span_deg": max(trough_lons) - min(trough_lons),
+                },
+            }
 
             return {
                 "system_name": "WesterlyTrough",
                 "description": desc,
-                "position": trough["position"],
-                "intensity": trough["intensity"],
+                "position": {
+                    "description": "槽的质心位置（槽轴平均）",
+                    "center_of_mass": {
+                        "lat": round(trough_center_lat, 2),
+                        "lon": round(trough_center_lon, 2),
+                    },
+                    "trough_bottom": {
+                        "lat": round(trough_bottom_lat, 2),
+                        "lon": round(trough_bottom_lon, 2),
+                        "description": "槽底（高度距平最小点）",
+                    },
+                },
+                "intensity": {
+                    "value": round(trough_intensity, 1),
+                    "unit": "gpm",
+                    "description": "500hPa高度距平绝对值",
+                    "level": strength,
+                    "z500_anomaly_at_bottom": round(trough_bottom_anomaly, 1),
+                },
                 "shape": shape_info,
                 "properties": {
                     "distance_to_tc_km": round(distance, 0),
+                    "distance_bottom_to_tc_km": round(distance_bottom, 0),
                     "bearing_from_tc": round(bearing, 1),
+                    "bearing_bottom_from_tc": round(bearing_bottom, 1),
+                    "azimuth": f"台风{rel_pos_desc}",
                     "influence": influence,
                 },
             }
@@ -1435,39 +2619,160 @@ class CDSEnvironmentExtractor:
     def extract_frontal_system(self, time_idx, tc_lat, tc_lon):
         try:
             t850 = self._get_data_at_level("t", 850, time_idx)
-            t700 = self._get_data_at_level("t", 700, time_idx)
-            if t850 is None or t700 is None:
+            t500 = self._get_data_at_level("t", 500, time_idx)
+            t1000 = self._get_data_at_level("t", 1000, time_idx)
+            u925 = self._get_data_at_level("u", 925, time_idx)
+            v925 = self._get_data_at_level("v", 925, time_idx)
+
+            if t850 is None or t500 is None:
                 return None
 
+            # 温度单位转换
             if np.nanmean(t850) > 200:
                 t850 = t850 - 273.15
-            if np.nanmean(t700) > 200:
-                t700 = t700 - 273.15
+            if np.nanmean(t500) > 200:
+                t500 = t500 - 273.15
+            if t1000 is not None and np.nanmean(t1000) > 200:
+                t1000 = t1000 - 273.15
 
-            temp_gradient = np.sqrt(
-                (np.gradient(t850, axis=0) / self.lat_spacing) ** 2
-                + (np.gradient(t850, axis=1) / self.lon_spacing) ** 2
+            # 计算厚度
+            if t1000 is not None:
+                thickness = t1000 - t500
+            else:
+                thickness = t850 - t500
+
+            # 使用与environment_extractor相同的综合frontal_index算法
+            with np.errstate(divide="ignore", invalid="ignore"):
+                gy_thick, gx_thick = self._raw_gradients(thickness)
+                dthick_dy = gy_thick / (self.lat_spacing * 111000)
+                dthick_dx = gx_thick / (self.lon_spacing * 111000 * self._coslat_safe[:, np.newaxis])
+                thickness_gradient = np.sqrt(dthick_dx**2 + dthick_dy**2)
+
+            with np.errstate(divide="ignore", invalid="ignore"):
+                gy_t, gx_t = self._raw_gradients(t850)
+                dt_dy = gy_t / (self.lat_spacing * 111000)
+                dt_dx = gx_t / (self.lon_spacing * 111000 * self._coslat_safe[:, np.newaxis])
+                temp_gradient = np.sqrt(dt_dx**2 + dt_dy**2)
+
+            with np.errstate(divide="ignore", invalid="ignore"):
+                gy_tgrad, gx_tgrad = self._raw_gradients(temp_gradient)
+                frontogenesis = np.sqrt(gy_tgrad**2 + gx_tgrad**2)
+
+            wind_convergence = None
+            if u925 is not None and v925 is not None:
+                with np.errstate(divide="ignore", invalid="ignore"):
+                    gy_v, gx_u = self._raw_gradients(v925)[0], self._raw_gradients(u925)[1]
+                    du_dx = gx_u / (self.lon_spacing * 111000 * self._coslat_safe[:, np.newaxis])
+                    dv_dy = gy_v / (self.lat_spacing * 111000)
+                    wind_convergence = -(du_dx + dv_dy)
+
+            # 清理NaN
+            for field in [thickness_gradient, temp_gradient, frontogenesis]:
+                if field is not None:
+                    field[~np.isfinite(field)] = np.nan
+            if wind_convergence is not None:
+                wind_convergence[~np.isfinite(wind_convergence)] = np.nan
+
+            # 归一化
+            def normalize_field(field):
+                if field is None or not np.any(np.isfinite(field)):
+                    return np.zeros_like(thickness_gradient)
+                valid = field[np.isfinite(field)]
+                if len(valid) == 0:
+                    return np.zeros_like(field)
+                p5, p95 = np.percentile(valid, [5, 95])
+                if p95 <= p5:
+                    return np.zeros_like(field)
+                return np.clip((field - p5) / (p95 - p5), 0, 1)
+
+            norm_thickness_grad = normalize_field(thickness_gradient)
+            norm_temp_grad = normalize_field(temp_gradient)
+            norm_frontogenesis = normalize_field(frontogenesis)
+            norm_convergence = (
+                normalize_field(wind_convergence) if wind_convergence is not None else np.zeros_like(norm_thickness_grad)
             )
 
-            threshold = np.percentile(temp_gradient, 75)
-            frontal_mask = temp_gradient > threshold
-            if not np.any(frontal_mask):
+            # 综合frontal_index
+            frontal_index = (
+                0.5 * norm_thickness_grad + 0.25 * norm_temp_grad + 0.15 * norm_frontogenesis + 0.10 * norm_convergence
+            )
+
+            # 局部搜索
+            search_radius_km = 1000
+            search_mask = self._create_circular_mask_haversine(tc_lat, tc_lon, search_radius_km)
+            frontal_index_local = np.where(search_mask, frontal_index, np.nan)
+
+            if not np.any(np.isfinite(frontal_index_local)):
                 return None
 
-            coords = self._get_system_coordinates(temp_gradient, threshold, "high", max_points=20)
-            coord_desc = self._generate_coordinate_description(coords, "锋面系统") if coords else ""
+            valid_values = frontal_index_local[np.isfinite(frontal_index_local)]
+            if len(valid_values) < 10:
+                return None
 
+            front_threshold = np.percentile(valid_values, 85)
+            front_mask = frontal_index_local > front_threshold
+            if not np.any(front_mask):
+                return None
+
+            # 找锋面位置
+            max_idx = np.unravel_index(np.nanargmax(frontal_index_local), frontal_index_local.shape)
+            front_lat = self.lat[max_idx[0]]
+            front_lon = self.lon[max_idx[1]]
+
+            front_temp_gradient = temp_gradient[max_idx]
+            if not np.isfinite(front_temp_gradient) or front_temp_gradient <= 0:
+                return None
+            front_temp_gradient = float(np.clip(front_temp_gradient, 0, 5e-4))
+
+            if front_temp_gradient > 3e-5:
+                level = "强"
+            elif front_temp_gradient > 1.5e-5:
+                level = "中等"
+            else:
+                level = "弱"
+
+            distance_to_tc = self._haversine_distance(tc_lat, tc_lon, front_lat, front_lon)
+
+            # 判断锋面类型
+            front_type = "准静止锋"
+            if max_idx[0] > 0 and max_idx[0] < len(self.lat) - 1:
+                t_north = t850[max_idx[0] - 1, max_idx[1]]
+                t_south = t850[max_idx[0] + 1, max_idx[1]]
+                if np.isfinite(t_north) and np.isfinite(t_south):
+                    if t_south > t_north + 2:
+                        front_type = "冷锋"
+                    elif t_north > t_south + 2:
+                        front_type = "暖锋"
+
+            strength_1e5 = front_temp_gradient * 1e5
             desc = (
-                f"在台风附近存在显著温度梯度的锋面系统，沿锋区温差明显，可能影响台风路径。{coord_desc}"
+                f"台风周围{distance_to_tc:.0f}km处存在{front_type}，强度为'{level}'，"
+                f"温度梯度达到{strength_1e5:.1f}×10⁻⁵ °C/m。"
+                f"锋面位于{front_lat:.2f}°N, {front_lon:.2f}°E，"
+                f"可能影响台风的移动路径和强度变化。"
             )
 
             return {
                 "system_name": "FrontalSystem",
                 "description": desc,
-                "position": {"description": "锋面大致位置", "lat": tc_lat, "lon": tc_lon},
-                "intensity": {"description": "基于温度梯度的锋面强度"},
-                "shape": {"description": "沿温度梯度形成的锋区", "coordinates": coords},
-                "properties": {"temperature_gradient": round(float(threshold), 2)},
+                "position": {
+                    "description": f"锋面位置（距台风中心{distance_to_tc:.0f}km）",
+                    "lat": float(front_lat),
+                    "lon": float(front_lon),
+                },
+                "intensity": {
+                    "value": round(strength_1e5, 2),
+                    "unit": "×10⁻⁵ °C/m",
+                    "level": level,
+                    "frontal_index": round(float(np.nanmax(frontal_index_local)), 3),
+                },
+                "shape": {"description": f"线性的{front_type}带，基于厚度场梯度识别", "type": front_type},
+                "properties": {
+                    "impact": "影响台风路径和结构",
+                    "distance_to_tc_km": round(float(distance_to_tc), 1),
+                    "front_type": front_type,
+                    "search_radius_km": search_radius_km,
+                },
             }
         except Exception as exc:
             print(f"⚠️ 锋面系统提取失败: {exc}")
@@ -1480,56 +2785,167 @@ class CDSEnvironmentExtractor:
             if u850 is None or v850 is None:
                 return None
 
+            # 使用与environment_extractor相同的算法
+            if tc_lat >= 0:
+                lat_min, lat_max = 5, 25
+                hemisphere = "北半球"
+            else:
+                lat_min, lat_max = -25, -5
+                hemisphere = "南半球"
+
+            search_radius_km = 1500
+            lat_mask = (self.lat >= lat_min) & (self.lat <= lat_max)
+
+            # 创建距离mask
+            distance_mask = np.zeros((len(self.lat), len(self.lon)), dtype=bool)
+            for i, lat in enumerate(self.lat):
+                if not lat_mask[i]:
+                    continue
+                for j, lon in enumerate(self.lon):
+                    dist = self._haversine_distance(tc_lat, tc_lon, lat, lon)
+                    if dist <= search_radius_km:
+                        distance_mask[i, j] = True
+
+            if not np.any(distance_mask):
+                return None
+
+            # 计算涡度
             gy_u, gx_u = self._raw_gradients(u850)
             gy_v, gx_v = self._raw_gradients(v850)
             du_dy = gy_u / (self.lat_spacing * 111000.0)
             dv_dx = gx_v / (self.lon_spacing * 111000.0 * self._coslat_safe[:, np.newaxis])
             relative_vorticity = dv_dx - du_dy
+            with np.errstate(invalid="ignore"):
+                relative_vorticity[~np.isfinite(relative_vorticity)] = np.nan
 
-            monsoon_threshold = np.nanpercentile(relative_vorticity, 85)
-            if monsoon_threshold <= 0:
+            # 南半球取反
+            if hemisphere == "南半球":
+                relative_vorticity = -relative_vorticity
+
+            masked_vort = np.where(distance_mask, relative_vorticity, np.nan)
+            if not np.any(np.isfinite(masked_vort)):
                 return None
 
-            monsoon_mask = relative_vorticity > monsoon_threshold
-            lat_idx, lon_idx = self._loc_idx(tc_lat, tc_lon)
-            search_radius = 30
-            sub = monsoon_mask[
-                max(0, lat_idx - search_radius) : lat_idx + search_radius,
-                max(0, lon_idx - search_radius) : lon_idx + search_radius,
-            ]
-            if not np.any(sub):
+            vort_threshold = np.nanpercentile(masked_vort[masked_vort > 0], 75) if np.any(masked_vort > 0) else 0
+            if vort_threshold <= 0:
                 return None
 
-            finite_vort = relative_vorticity[monsoon_mask]
-            finite_vort = finite_vort[np.isfinite(finite_vort)]
-            if finite_vort.size == 0:
+            trough_mask = masked_vort > vort_threshold
+            if not np.any(trough_mask):
                 return None
-            max_vorticity = float(np.clip(np.max(finite_vort), 0, 2e-3)) * 1e5
+
+            # 找槽底（最大涡度点）
+            max_vort_idx = np.unravel_index(np.nanargmax(masked_vort), masked_vort.shape)
+            trough_bottom_lat = self.lat[max_vort_idx[0]]
+            trough_bottom_lon = self.lon[max_vort_idx[1]]
+            max_vorticity = masked_vort[max_vort_idx] * 1e5
+
+            # 沿槽底纬度找槽轴
+            trough_lat_idx = max_vort_idx[0]
+            vort_along_axis = masked_vort[trough_lat_idx, :]
+            axis_threshold = vort_threshold * 0.7
+            axis_mask = vort_along_axis > axis_threshold
+
+            axis_lons = self.lon[axis_mask]
+            if len(axis_lons) > 0:
+                axis_lon_start = axis_lons[0]
+                axis_lon_end = axis_lons[-1]
+                axis_length_deg = axis_lon_end - axis_lon_start
+                axis_length_km = axis_length_deg * 111 * np.cos(np.deg2rad(trough_bottom_lat))
+            else:
+                axis_lon_start = trough_bottom_lon
+                axis_lon_end = trough_bottom_lon
+                axis_length_km = 0
+
+            # 低层风场分析
+            u_at_trough = u850[trough_lat_idx, :]
+            mean_u = np.nanmean(u_at_trough[axis_mask]) if np.any(axis_mask) else 0
+
+            if mean_u > 2:
+                wind_pattern = "西风为主"
+                monsoon_confidence = "高"
+            elif mean_u > 0:
+                wind_pattern = "弱西风"
+                monsoon_confidence = "中"
+            else:
+                wind_pattern = "东风分量"
+                monsoon_confidence = "低"
+
+            distance_to_trough = self._haversine_distance(tc_lat, tc_lon, trough_bottom_lat, trough_bottom_lon)
+            bearing, direction = self._calculate_bearing(tc_lat, tc_lon, trough_bottom_lat, trough_bottom_lon)
+
+            if distance_to_trough < 500:
+                influence = "台风位于季风槽内或紧邻，受水汽输送直接影响"
+                impact_level = "强"
+            elif distance_to_trough < 1000:
+                influence = "台风受季风槽环流影响，水汽条件较好"
+                impact_level = "中"
+            else:
+                influence = "季风槽对台风影响有限"
+                impact_level = "弱"
 
             if max_vorticity > 10:
-                level, impact = "活跃", "为台风发展提供有利环境"
+                vort_level = "强"
+                vort_desc = "季风槽活跃，有利于台风发展"
             elif max_vorticity > 5:
-                level, impact = "中等", "对台风发展有一定支持"
+                vort_level = "中等"
+                vort_desc = "季风槽中等强度"
             else:
-                level, impact = "弱", "对台风影响有限"
+                vort_level = "弱"
+                vort_desc = "季风槽较弱"
 
             desc = (
-                f"台风周围存在活跃程度为'{level}'的季风槽系统，最大相对涡度为{max_vorticity:.1f}×10⁻⁵ s⁻¹，"
-                f"{impact}。"
+                f"在台风{direction}约{distance_to_trough:.0f}公里处检测到{hemisphere}季风槽，"
+                f"槽底位于{trough_bottom_lat:.1f}°{'N' if trough_bottom_lat >= 0 else 'S'}, "
+                f"{trough_bottom_lon:.1f}°E，"
+                f"槽轴长度约{axis_length_km:.0f}公里，"
+                f"最大涡度{max_vorticity:.1f}×10⁻⁵ s⁻¹（{vort_level}），"
+                f"低层{wind_pattern}。{influence}。"
             )
 
-            return {
+            result = {
                 "system_name": "MonsoonTrough",
                 "description": desc,
-                "position": {"description": "台风周围的季风槽区域", "lat": tc_lat, "lon": tc_lon},
-                "intensity": {
-                    "value": round(max_vorticity, 1),
-                    "unit": "×10⁻⁵ s⁻¹",
-                    "level": level,
+                "position": {
+                    "description": "季风槽槽底位置",
+                    "lat": round(trough_bottom_lat, 2),
+                    "lon": round(trough_bottom_lon, 2),
                 },
-                "shape": {"description": "东西向延伸的低压槽"},
-                "properties": {"impact": impact, "vorticity_support": max_vorticity > 5},
+                "intensity": {
+                    "value": round(max_vorticity, 2),
+                    "unit": "×10⁻⁵ s⁻¹",
+                    "level": vort_level,
+                    "description": vort_desc,
+                },
+                "shape": {
+                    "description": f"东西向延伸的低压槽，长度约{axis_length_km:.0f}公里",
+                    "type": "trough_axis",
+                    "axis_length_km": round(axis_length_km, 1),
+                },
+                "properties": {
+                    "distance_to_tc_km": round(distance_to_trough, 1),
+                    "direction_from_tc": direction,
+                    "bearing": round(bearing, 1),
+                    "influence": influence,
+                    "impact_level": impact_level,
+                    "hemisphere": hemisphere,
+                    "vorticity_level": vort_level,
+                    "zonal_wind_pattern": wind_pattern,
+                    "monsoon_confidence": monsoon_confidence,
+                    "axis_lon_range": f"{axis_lon_start:.1f}°E - {axis_lon_end:.1f}°E",
+                },
             }
+
+            if axis_length_km > 0:
+                boundary_coords = [
+                    [axis_lon_start, trough_bottom_lat],
+                    [trough_bottom_lon, trough_bottom_lat],
+                    [axis_lon_end, trough_bottom_lat],
+                ]
+                result["boundary_coordinates"] = boundary_coords
+
+            return result
+
         except Exception as exc:
             print(f"⚠️ 季风槽提取失败: {exc}")
             return None
@@ -1606,8 +3022,8 @@ class CDSEnvironmentExtractor:
             print(f"⚠️ 提取大气稳定性失败: {e}")
             return None
 
-    def extract_vertical_wind_shear(self, time_idx, tc_lat, tc_lon):
-        """提取垂直风切变，复用extractSyst语义"""
+    def extract_vertical_wind_shear(self, time_idx, tc_lat, tc_lon, radius_km=500):
+        """提取垂直风切变，复用 extractSyst 语义并使用圆域平均。"""
         try:
             u200 = self._get_data_at_level("u", 200, time_idx)
             v200 = self._get_data_at_level("v", 200, time_idx)
@@ -1616,9 +3032,17 @@ class CDSEnvironmentExtractor:
             if any(x is None for x in (u200, v200, u850, v850)):
                 return None
 
-            lat_idx, lon_idx = self._loc_idx(tc_lat, tc_lon)
-            shear_u = float(u200[lat_idx, lon_idx] - u850[lat_idx, lon_idx])
-            shear_v = float(v200[lat_idx, lon_idx] - v850[lat_idx, lon_idx])
+            circular_mask = self._create_circular_mask_haversine(tc_lat, tc_lon, radius_km)
+            if not np.any(circular_mask):
+                return None
+
+            u200_mean = float(np.nanmean(np.where(circular_mask, u200, np.nan)))
+            v200_mean = float(np.nanmean(np.where(circular_mask, v200, np.nan)))
+            u850_mean = float(np.nanmean(np.where(circular_mask, u850, np.nan)))
+            v850_mean = float(np.nanmean(np.where(circular_mask, v850, np.nan)))
+
+            shear_u = u200_mean - u850_mean
+            shear_v = v200_mean - v850_mean
             shear_mag = float(np.sqrt(shear_u**2 + shear_v**2))
 
             if shear_mag < 5:
@@ -1628,12 +3052,13 @@ class CDSEnvironmentExtractor:
             else:
                 level, impact = "强", "显著抑制发展"
 
-            direction_from = (np.degrees(np.arctan2(shear_u, shear_v)) + 180.0) % 360.0
+            direction_from = np.degrees(np.arctan2(-shear_u, -shear_v)) % 360.0
             wind_desc, dir_text = self._bearing_to_desc(direction_from)
 
             desc = (
-                f"台风核心区正受到来自{wind_desc}方向、强度为“{level}”的垂直风切变影响，"
-                f"当前风切变环境对台风的发展{impact.split(' ')[-1]}。"
+                f"台风中心{radius_km}公里范围内的垂直风切变来自{wind_desc}方向，"
+                f"强度为“{level}”（{shear_mag:.1f} m/s），"
+                f"当前风切变环境对台风的发展{impact}。"
             )
 
             vector_coords = self._get_vector_coords(tc_lat, tc_lon, shear_u, shear_v)
@@ -1642,16 +3067,18 @@ class CDSEnvironmentExtractor:
                 "system_name": "VerticalWindShear",
                 "description": desc,
                 "position": {
-                    "description": "在台风中心点计算的200-850hPa风矢量差",
+                    "description": f"台风中心{radius_km}km圆域平均的200-850hPa风矢量差",
                     "lat": round(tc_lat, 2),
                     "lon": round(tc_lon, 2),
+                    "radius_km": radius_km,
                 },
                 "intensity": {"value": round(shear_mag, 2), "unit": "m/s", "level": level},
-                "shape": {"description": f"来自{wind_desc}的切变矢量", "vector_coordinates": vector_coords},
+                "shape": {"description": f"一个从{wind_desc}指向的切变矢量", "vector_coordinates": vector_coords},
                 "properties": {
                     "direction_from_deg": round(direction_from, 1),
                     "impact": impact,
                     "shear_vector_mps": {"u": round(shear_u, 2), "v": round(shear_v, 2)},
+                    "calculation_method": f"面积平均于{radius_km}km圆域",
                 },
             }
         except Exception as e:
