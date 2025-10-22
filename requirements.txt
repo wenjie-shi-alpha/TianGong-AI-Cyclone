@@ -8,5 +8,4 @@ scipy
 scikit-image
 trackpy
 xarray
-openai
 pytest
