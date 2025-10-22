@@ -25,6 +25,11 @@ class _SimpleBatch:
     surf_vars: Dict[str, np.ndarray]
     static_vars: Dict[str, np.ndarray]
     metadata: _Metadata
+    # Optional fields for warm core and vorticity checks
+    t_200hpa: np.ndarray | None = None
+    t_850hpa: np.ndarray | None = None
+    u_850hpa: np.ndarray | None = None
+    v_850hpa: np.ndarray | None = None
 
     def to(self, _: str) -> "_SimpleBatch":
         """Interface compatibility stub; no device movement is required."""
