@@ -483,10 +483,19 @@ class CDSEnvironmentExtractor:
             self._downloaded_files.append(str(output_file))
             return str(output_file)
 
-        print(f"📥 下载ERA5数据: {start_date} 到 {end_date}")
+        print(f"📥 下载ERA5单层数据: {start_date} 到 {end_date}")
 
         try:
             date_range = pd.date_range(start=start_date, end=end_date, freq='D')
+            
+            # 提取所有唯一的年、月、日
+            years = sorted(list(set(date_range.year.astype(str))))
+            months = sorted(list(set(date_range.month.astype(str).str.zfill(2))))
+            days = sorted(list(set(date_range.day.astype(str).str.zfill(2))))
+            
+            print(f"   年份: {years}")
+            print(f"   月份: {months}")
+            print(f"   请求天数: {len(days)} 天")
             
             self.cds_client.retrieve(
                 'reanalysis-era5-single-levels',
@@ -498,9 +507,9 @@ class CDSEnvironmentExtractor:
                         '10m_v_component_of_wind', '2m_temperature',
                         'sea_surface_temperature', 'total_column_water_vapour'
                     ],
-                    'year': sorted(list(set(date_range.year))),
-                    'month': sorted(list(set(date_range.month))),
-                    'day': sorted(list(set(date_range.day))),
+                    'year': years,
+                    'month': months,
+                    'day': days,
                     'time': [
                         '00:00', '06:00', '12:00', '18:00'
                     ],
@@ -508,12 +517,12 @@ class CDSEnvironmentExtractor:
                 str(output_file)
             )
 
-            print(f"✅ ERA5数据下载完成: {output_file}")
+            print(f"✅ ERA5单层数据下载完成: {output_file}")
             self._downloaded_files.append(str(output_file))
             return str(output_file)
 
         except Exception as e:
-            print(f"❌ ERA5数据下载失败: {e}")
+            print(f"❌ ERA5单层数据下载失败: {e}")
             return None
 
     def download_era5_pressure_data(self, start_date, end_date, levels=("850","500","200")):
@@ -530,6 +539,15 @@ class CDSEnvironmentExtractor:
         try:
             date_range = pd.date_range(start=start_date, end=end_date, freq='D')
             
+            # 提取所有唯一的年、月、日
+            years = sorted(list(set(date_range.year.astype(str))))
+            months = sorted(list(set(date_range.month.astype(str).str.zfill(2))))
+            days = sorted(list(set(date_range.day.astype(str).str.zfill(2))))
+            
+            print(f"   年份: {years}")
+            print(f"   月份: {months}")
+            print(f"   请求天数: {len(days)} 天")
+            
             self.cds_client.retrieve(
                 'reanalysis-era5-pressure-levels',
                 {
@@ -540,9 +558,9 @@ class CDSEnvironmentExtractor:
                         'geopotential', 'temperature', 'relative_humidity'
                     ],
                     'pressure_level': list(levels),
-                    'year': sorted(list(set(date_range.year))),
-                    'month': sorted(list(set(date_range.month))),
-                    'day': sorted(list(set(date_range.day))),
+                    'year': years,
+                    'month': months,
+                    'day': days,
                     'time': ['00:00', '06:00', '12:00', '18:00'],
                 },
                 str(output_file)
@@ -3187,42 +3205,114 @@ class CDSEnvironmentExtractor:
             print(f"⚠️ 处理单个路径点失败: {exc}")
             raise
 
-    def process_all_tracks(self):
+    def download_all_data(self):
         """
-        按月下载、处理、保存和清理数据，支持并行计算。
+        第一步：按年份下载所有需要的ERA5数据
         """
-        # 按年月分组
+        # 获取整个数据集的时间范围
+        start_date = self.tracks_df['time'].min()
+        end_date = self.tracks_df['time'].max()
+        
+        print(f"🗓️ 数据时间范围: {start_date.strftime('%Y-%m-%d')} 到 {end_date.strftime('%Y-%m-%d')}")
+        print(f"📊 共 {len(self.tracks_df)} 个路径点")
+        
+        # 按年份分组下载
+        years = sorted(list(set(self.tracks_df['time'].dt.year)))
+        print(f"📅 将按年份下载，共 {len(years)} 年: {years}")
+        
+        downloaded_files = {
+            'single_files': [],
+            'pressure_files': []
+        }
+        
+        for year in years:
+            print(f"\n{'='*25} 下载 {year} 年数据 {'='*25}")
+            
+            # 获取该年的数据范围
+            year_data = self.tracks_df[self.tracks_df['time'].dt.year == year]
+            year_start = year_data['time'].min().strftime('%Y-%m-%d')
+            year_end = year_data['time'].max().strftime('%Y-%m-%d')
+            
+            print(f"   时间范围: {year_start} 到 {year_end}")
+            print(f"   路径点数: {len(year_data)}")
+            
+            # 下载该年的单层数据
+            single_file = self.download_era5_data(year_start, year_end)
+            if single_file:
+                downloaded_files['single_files'].append(single_file)
+            else:
+                print(f"⚠️ {year} 年单层数据下载失败")
+            
+            # 下载该年的等压面数据
+            pressure_file = self.download_era5_pressure_data(year_start, year_end)
+            if pressure_file:
+                downloaded_files['pressure_files'].append(pressure_file)
+            else:
+                print(f"⚠️ {year} 年等压面数据下载失败")
+        
+        if not downloaded_files['single_files']:
+            raise RuntimeError("❌ 没有成功下载任何单层数据")
+        
+        print(f"\n✅ 所有数据下载完成！")
+        print(f"   单层数据文件: {len(downloaded_files['single_files'])} 个")
+        print(f"   等压面数据文件: {len(downloaded_files['pressure_files'])} 个")
+        
+        return downloaded_files
+
+    def process_downloaded_data(self, data_info):
+        """
+        第二步：按月处理已下载的数据（支持多个年份文件）
+        """
+        single_files = data_info['single_files']
+        pressure_files = data_info['pressure_files']
+        
+        print(f"\n{'='*60}")
+        print("合并并加载数据...")
+        print(f"{'='*60}")
+        
+        # 合并所有年份的数据文件
+        import xarray as xr
+        
+        # 加载并合并单层数据
+        print(f"📥 加载 {len(single_files)} 个单层数据文件...")
+        ds_single_list = [xr.open_dataset(f) for f in single_files]
+        ds_single_merged = xr.concat(ds_single_list, dim='time') if len(ds_single_list) > 1 else ds_single_list[0]
+        
+        # 加载并合并等压面数据
+        if pressure_files:
+            print(f"📥 加载 {len(pressure_files)} 个等压面数据文件...")
+            ds_pressure_list = [xr.open_dataset(f) for f in pressure_files]
+            ds_pressure_merged = xr.concat(ds_pressure_list, dim='time') if len(ds_pressure_list) > 1 else ds_pressure_list[0]
+            self.ds = xr.merge([ds_single_merged, ds_pressure_merged])
+        else:
+            self.ds = ds_single_merged
+        
+        print(f"📊 ERA5数据加载完成: {dict(self.ds.dims)}")
+        self._initialize_coordinate_metadata()
+        
+        print(f"\n{'='*60}")
+        
+        print("开始处理数据（按月保存结果）")
+        print(f"{'='*60}")
+        
+        # 按年月分组进行处理和保存
         self.tracks_df['year_month'] = self.tracks_df['time'].dt.to_period('M')
         unique_months = sorted(self.tracks_df['year_month'].unique())
-        print(f"🗓️ 找到 {len(unique_months)} 个需要处理的月份: {[str(m) for m in unique_months]}")
-
+        print(f"🗓️ 将处理 {len(unique_months)} 个月份: {[str(m) for m in unique_months]}")
+        
         saved_files = []
         completed_months = self._detect_completed_months()
         
-        for month in unique_months:
+        for idx, month in enumerate(unique_months, 1):
             month_key = str(month)
             if month_key in completed_months:
                 print(f"⏭️ {month_key} 的结果已存在，跳过该月份。")
                 continue
-
-            print(f"\n{'='*25} 开始处理月份: {month} {'='*25}")
+            
+            print(f"\n{'='*25} 处理月份 [{idx}/{len(unique_months)}]: {month} {'='*25}")
             month_tracks_df = self.tracks_df[self.tracks_df['year_month'] == month]
-            start_date = month_tracks_df['time'].min().strftime('%Y-%m-%d')
-            end_date = month_tracks_df['time'].max().strftime('%Y-%m-%d')
-            print(f"📅 该月时间范围: {start_date} 到 {end_date}，共 {len(month_tracks_df)} 个路径点")
+            print(f"📊 该月共 {len(month_tracks_df)} 个路径点")
             
-            single_file = self.download_era5_data(start_date, end_date)
-            pressure_file = self.download_era5_pressure_data(start_date, end_date)
-            
-            if not single_file:
-                print(f"❌ 无法获取 {month} 的单层数据，跳过此月份")
-                continue
-
-            if not self.load_era5_data(single_file, pressure_file):
-                print(f"❌ 无法加载 {month} 的数据，跳过此月份")
-                if self.cleanup_intermediate: self._cleanup_intermediate_files([single_file, pressure_file])
-                continue
-
             # 并行或串行处理当前月份的路径点
             self._current_month_total_points = len(month_tracks_df)
             iterable = list(month_tracks_df.iterrows())
@@ -3238,7 +3328,7 @@ class CDSEnvironmentExtractor:
             if hasattr(self, "_current_month_total_points"):
                 delattr(self, "_current_month_total_points")
 
-            # *** 新增：为当前月份创建并保存结果 ***
+            # 为当前月份创建并保存结果
             if processed_this_month:
                 monthly_results = {
                     "metadata": {
@@ -3247,7 +3337,7 @@ class CDSEnvironmentExtractor:
                         "total_points_in_month": len(processed_this_month),
                         "month_processed": str(month),
                         "data_source": "ERA5_reanalysis",
-                        "processing_mode": "CDS_server_monthly_save"
+                        "processing_mode": "CDS_server_single_download_batch_process"
                     },
                     "environmental_analysis": sorted(processed_this_month, key=lambda x: x['time_idx'])
                 }
@@ -3256,14 +3346,296 @@ class CDSEnvironmentExtractor:
                 saved_path = self.save_results(monthly_results, output_file=monthly_output_file)
                 if saved_path:
                     saved_files.append(saved_path)
-            
-            # 清理当月下载的文件
-            if self.cleanup_intermediate:
-                print(f"🧹 正在清理 {month} 的中间文件...")
-                self._cleanup_intermediate_files([single_file, pressure_file])
 
         print(f"\n✅ 所有月份处理完毕。")
+        
+        # 清理下载的文件
+        if self.cleanup_intermediate:
+            print(f"\n🧹 正在清理下载的数据文件...")
+            all_files = single_files + pressure_files
+            self._cleanup_intermediate_files(all_files)
+        
         return saved_files
+
+    def download_month_data(self, year, month):
+        """
+        下载指定年月的ERA5数据
+        
+        Args:
+            year: 年份
+            month: 月份 (1-12)
+        
+        Returns:
+            (single_file, pressure_file) 文件路径元组
+        """
+        # 构建该月的日期范围
+        month_start = pd.Timestamp(year=year, month=month, day=1)
+        if month == 12:
+            month_end = pd.Timestamp(year=year + 1, month=1, day=1) - pd.Timedelta(days=1)
+        else:
+            month_end = pd.Timestamp(year=year, month=month + 1, day=1) - pd.Timedelta(days=1)
+        
+        start_date = month_start.strftime('%Y-%m-%d')
+        end_date = month_end.strftime('%Y-%m-%d')
+        
+        print(f"📥 下载 {year}-{month:02d} 数据: {start_date} 到 {end_date}")
+        
+        # 下载地面层数据
+        single_file = self.download_era5_data(start_date, end_date)
+        if not single_file:
+            print(f"❌ {year}-{month:02d} 地面层数据下载失败")
+            return None, None
+        
+        # 下载压力层数据（单月数据不需要分批）
+        pressure_file = self.download_era5_pressure_data_single_month(start_date, end_date)
+        if not pressure_file:
+            print(f"❌ {year}-{month:02d} 压力层数据下载失败")
+            return None, None
+        
+        return single_file, pressure_file
+    
+    def download_era5_pressure_data_single_month(self, start_date, end_date, levels=("850","500","200")):
+        """
+        下载单月ERA5等压面数据（不需要分批，单月数据量小）
+        
+        Args:
+            start_date: 开始日期 (YYYY-MM-DD)
+            end_date: 结束日期 (YYYY-MM-DD)
+            levels: 压力层列表
+        
+        Returns:
+            文件路径或None
+        """
+        output_file = self.output_dir / f"era5_pressure_{start_date.replace('-', '')}_{end_date.replace('-', '')}.nc"
+
+        # 检查文件是否已存在
+        if output_file.exists():
+            print(f"   ✅ 压力层数据已存在，跳过下载: {output_file.name}")
+            self._downloaded_files.append(str(output_file))
+            return str(output_file)
+
+        try:
+            date_range = pd.date_range(start=start_date, end=end_date, freq='D')
+            
+            # 提取所有唯一的年、月、日
+            years = sorted(list(set(date_range.year.astype(str))))
+            months = sorted(list(set(date_range.month.astype(str).str.zfill(2))))
+            days = sorted(list(set(date_range.day.astype(str).str.zfill(2))))
+            
+            print(f"   📥 请求压力层数据: 年={years}, 月={months}, {len(days)}天")
+            
+            # 单月数据不需要分批，直接请求
+            self.cds_client.retrieve(
+                'reanalysis-era5-pressure-levels',
+                {
+                    'product_type': 'reanalysis',
+                    'format': 'netcdf',
+                    'variable': [
+                        'u_component_of_wind', 'v_component_of_wind',
+                        'geopotential', 'temperature', 'relative_humidity'
+                    ],
+                    'pressure_level': list(levels),
+                    'year': years,
+                    'month': months,
+                    'day': days,
+                    'time': ['00:00', '06:00', '12:00', '18:00'],
+                },
+                str(output_file)
+            )
+
+            print(f"   ✅ 压力层数据下载完成: {output_file.name}")
+            self._downloaded_files.append(str(output_file))
+            return str(output_file)
+
+        except Exception as e:
+            print(f"   ❌ 压力层数据下载失败: {e}")
+            return None
+
+    def process_month_data(self, month_period, month_tracks_df):
+        """
+        处理单个月份的数据：下载 -> 加载 -> 分析 -> 保存 -> 删除
+        
+        Args:
+            month_period: 月份Period对象 (例如: 2006-03)
+            month_tracks_df: 该月份的路径数据
+        
+        Returns:
+            生成的结果文件路径或None
+        """
+        year = month_period.year
+        month = month_period.month
+        
+        print(f"\n{'='*70}")
+        print(f"处理月份: {month_period} ({year}年{month}月)")
+        print(f"{'='*70}")
+        print(f"📊 该月共 {len(month_tracks_df)} 个路径点")
+        
+        # 第一步：下载该月数据
+        print(f"\n{'='*25} 步骤1: 下载数据 {'='*25}")
+        single_file, pressure_file = self.download_month_data(year, month)
+        
+        if not single_file or not pressure_file:
+            print(f"❌ {month_period} 数据下载失败，跳过该月")
+            return None
+        
+        # 第二步：加载数据
+        print(f"\n{'='*25} 步骤2: 加载数据 {'='*25}")
+        
+        try:
+            import xarray as xr
+            
+            chunks = self._parse_chunks_from_env()
+            open_kwargs = {"chunks": chunks} if chunks else {}
+            
+            ds_single = xr.open_dataset(single_file, **open_kwargs)
+            ds_pressure = xr.open_dataset(pressure_file, **open_kwargs)
+            self.ds = xr.merge([ds_single, ds_pressure])
+            
+            print(f"   ✅ 数据加载完成: {dict(self.ds.dims)}")
+            self._initialize_coordinate_metadata()
+            
+        except Exception as e:
+            print(f"   ❌ 加载数据失败: {e}")
+            return None
+        
+        # 第三步：处理数据
+        print(f"\n{'='*25} 步骤3: 分析数据 {'='*25}")
+        
+        self._current_month_total_points = len(month_tracks_df)
+        iterable = list(month_tracks_df.iterrows())
+        
+        if self.max_workers and self.max_workers > 1:
+            print(f"   ⚙️ 使用 {self.max_workers} 个进程并行处理...")
+            with concurrent.futures.ProcessPoolExecutor(max_workers=self.max_workers) as executor:
+                processed_results = list(executor.map(self._process_track_point, iterable))
+        else:
+            print(f"   ⚙️ 使用串行模式处理...")
+            processed_results = [self._process_track_point(item) for item in iterable]
+        
+        if hasattr(self, "_current_month_total_points"):
+            delattr(self, "_current_month_total_points")
+        
+        # 第四步：保存结果
+        print(f"\n{'='*25} 步骤4: 保存结果 {'='*25}")
+        
+        saved_path = None
+        if processed_results:
+            monthly_results = {
+                "metadata": {
+                    "extraction_time": datetime.now().isoformat(),
+                    "tracks_file": str(self.tracks_file),
+                    "total_points_in_month": len(processed_results),
+                    "month_processed": str(month_period),
+                    "year": year,
+                    "month": month,
+                    "data_source": "ERA5_reanalysis",
+                    "processing_mode": "CDS_server_month_by_month_process"
+                },
+                "environmental_analysis": sorted(processed_results, key=lambda x: x['time_idx'])
+            }
+            
+            monthly_output_file = self.output_dir / f"cds_environment_analysis_{month_period}.json"
+            saved_path = self.save_results(monthly_results, output_file=monthly_output_file)
+            
+            if saved_path:
+                print(f"   ✅ 结果已保存: {Path(saved_path).name}")
+        
+        # 第五步：清理该月数据文件
+        print(f"\n{'='*25} 步骤5: 清理数据 {'='*25}")
+        
+        # 关闭数据集
+        if hasattr(self, 'ds') and self.ds is not None:
+            self.ds.close()
+            self.ds = None
+        
+        # 删除该月的数据文件
+        if self.cleanup_intermediate:
+            files_to_clean = [single_file, pressure_file]
+            for file_path in files_to_clean:
+                if file_path and Path(file_path).exists():
+                    try:
+                        file_size = Path(file_path).stat().st_size / 1024 / 1024  # MB
+                        Path(file_path).unlink()
+                        print(f"   🧹 已删除: {Path(file_path).name} ({file_size:.1f} MB)")
+                    except Exception as e:
+                        print(f"   ⚠️ 删除失败 {Path(file_path).name}: {e}")
+        
+        gc.collect()  # 强制垃圾回收
+        
+        print(f"✅ {month_period} 月份处理完成")
+        
+        return saved_path
+
+    def process_all_tracks(self):
+        """
+        逐月处理工作流程：
+        对于每个月份：
+            1. 下载该月数据（地面层 + 压力层）
+            2. 加载并分析该月数据
+            3. 保存结果JSON文件
+            4. 删除该月数据文件（释放磁盘空间）
+            5. 进入下一个月
+        
+        优势：
+        - 磁盘占用最小（同时只保存1个月的数据）
+        - 内存占用最小（只加载1个月的数据）
+        - 支持断点续传（已完成的月份会自动跳过）
+        """
+        # 获取整个数据集的时间范围
+        start_date = self.tracks_df['time'].min()
+        end_date = self.tracks_df['time'].max()
+        
+        print(f"{'='*70}")
+        print(f"CDS 逐月数据处理流程")
+        print(f"{'='*70}")
+        print(f"🗓️ 数据时间范围: {start_date.strftime('%Y-%m-%d')} 到 {end_date.strftime('%Y-%m-%d')}")
+        print(f"📊 总路径点数: {len(self.tracks_df)}")
+        print(f"💡 处理策略: 逐月下载->处理->删除，最小化磁盘占用")
+        
+        # 按月份分组
+        self.tracks_df['year_month'] = self.tracks_df['time'].dt.to_period('M')
+        unique_months = sorted(self.tracks_df['year_month'].unique())
+        print(f"📅 将逐月处理，共 {len(unique_months)} 个月份")
+        print(f"   月份列表: {', '.join([str(m) for m in unique_months[:5]])}{'...' if len(unique_months) > 5 else ''}")
+        
+        # 检测已完成的月份
+        completed_months = self._detect_completed_months()
+        
+        all_saved_files = []
+        
+        for month_idx, month_period in enumerate(unique_months, 1):
+            month_key = str(month_period)
+            
+            # 检查是否已完成
+            if month_key in completed_months:
+                print(f"\n{'='*70}")
+                print(f"月份进度: [{month_idx}/{len(unique_months)}] - {month_period}")
+                print(f"{'='*70}")
+                print(f"⏭️ {month_key} 的结果已存在，跳过该月份")
+                print(f"📊 总进度: 已完成 {month_idx}/{len(unique_months)} 月")
+                continue
+            
+            print(f"\n{'='*70}")
+            print(f"月份进度: [{month_idx}/{len(unique_months)}] - {month_period}")
+            print(f"{'='*70}")
+            
+            # 获取该月的路径数据
+            month_tracks_df = self.tracks_df[self.tracks_df['year_month'] == month_period].copy()
+            
+            # 处理该月数据
+            saved_path = self.process_month_data(month_period, month_tracks_df)
+            
+            if saved_path:
+                all_saved_files.append(saved_path)
+            
+            print(f"\n📊 总进度: 已完成 {month_idx}/{len(unique_months)} 月，共生成 {len(all_saved_files)} 个结果文件")
+        
+        print(f"\n{'='*70}")
+        print(f"✅ 所有月份处理完毕！")
+        print(f"{'='*70}")
+        print(f"📁 共生成 {len(all_saved_files)} 个月度结果文件")
+        
+        return all_saved_files
 
     def save_results(self, results, output_file=None):
         """保存结果到JSON文件"""
@@ -3331,7 +3703,7 @@ class CDSEnvironmentExtractor:
 
 
 def run_extraction(
-    tracks_file: str = 'western_pacific_typhoons_superfast.csv',
+    tracks_file: str = 'matched_cyclone_tracks_2021onwards.csv',
     output_dir: str | Path = './cds_output',
     *,
     max_points: int | None = None,
@@ -3367,7 +3739,7 @@ def main(cli_args: list[str] | None = None) -> list[str]:
     import argparse
 
     parser = argparse.ArgumentParser(description='CDS服务器环境气象系统提取器')
-    parser.add_argument('--tracks', default='western_pacific_typhoons_superfast.csv', help='台风路径CSV文件路径')
+    parser.add_argument('--tracks', default='matched_cyclone_tracks_2021onwards.csv', help='台风路径CSV文件路径')
     parser.add_argument('--output', default='./cds_output', help='输出目录')
     parser.add_argument('--max-points', type=int, default=None, help='最大处理路径点数（用于测试）')
     parser.add_argument('--no-clean', action='store_true', help='保留中间ERA5数据文件')
