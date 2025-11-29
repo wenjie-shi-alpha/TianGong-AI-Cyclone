@@ -1,0 +1,156 @@
+{
+    "tc_id": "2020211N14124",
+    "analysis_time": "2025-11-26T19:16:20.941533",
+    "time_series": [
+        {
+            "time": "2020-08-01T00:00:00",
+            "time_idx": 28,
+            "tc_position": {
+                "lat": 18.1,
+                "lon": 110.5
+            },
+            "tc_intensity_hpa": null,
+            "environmental_systems": []
+        },
+        {
+            "time": "2020-08-01T00:00:00",
+            "time_idx": 28,
+            "tc_position": {
+                "lat": 18.25,
+                "lon": 111.5
+            },
+            "tc_intensity_hpa": null,
+            "environmental_systems": []
+        },
+        {
+            "time": "2020-08-01T06:00:00",
+            "time_idx": 29,
+            "tc_position": {
+                "lat": 18.75,
+                "lon": 111.0
+            },
+            "tc_intensity_hpa": null,
+            "environmental_systems": []
+        },
+        {
+            "time": "2020-08-01T12:00:00",
+            "time_idx": 30,
+            "tc_position": {
+                "lat": 18.75,
+                "lon": 108.25
+            },
+            "tc_intensity_hpa": null,
+            "environmental_systems": []
+        },
+        {
+            "time": "2020-08-01T18:00:00",
+            "time_idx": 31,
+            "tc_position": {
+                "lat": 19.5,
+                "lon": 107.25
+            },
+            "tc_intensity_hpa": null,
+            "environmental_systems": []
+        },
+        {
+            "time": "2020-08-02T00:00:00",
+            "time_idx": 32,
+            "tc_position": {
+                "lat": 19.0,
+                "lon": 106.25
+            },
+            "tc_intensity_hpa": null,
+            "environmental_systems": []
+        },
+        {
+            "time": "2020-08-02T06:00:00",
+            "time_idx": 33,
+            "tc_position": {
+                "lat": 19.75,
+                "lon": 106.0
+            },
+            "tc_intensity_hpa": null,
+            "environmental_systems": []
+        },
+        {
+            "time": "2020-08-02T12:00:00",
+            "time_idx": 34,
+            "tc_position": {
+                "lat": 19.5,
+                "lon": 105.75
+            },
+            "tc_intensity_hpa": null,
+            "environmental_systems": []
+        },
+        {
+            "time": "2020-08-02T18:00:00",
+            "time_idx": 35,
+            "tc_position": {
+                "lat": 19.75,
+                "lon": 106.0
+            },
+            "tc_intensity_hpa": null,
+            "environmental_systems": []
+        },
+        {
+            "time": "2020-08-03T00:00:00",
+            "time_idx": 36,
+            "tc_position": {
+                "lat": 19.0,
+                "lon": 105.75
+            },
+            "tc_intensity_hpa": null,
+            "environmental_systems": []
+        },
+        {
+            "time": "2020-08-03T06:00:00",
+            "time_idx": 37,
+            "tc_position": {
+                "lat": 19.0,
+                "lon": 105.75
+            },
+            "tc_intensity_hpa": null,
+            "environmental_systems": []
+        },
+        {
+            "time": "2020-08-03T12:00:00",
+            "time_idx": 38,
+            "tc_position": {
+                "lat": 19.0,
+                "lon": 105.75
+            },
+            "tc_intensity_hpa": null,
+            "environmental_systems": []
+        },
+        {
+            "time": "2020-08-03T18:00:00",
+            "time_idx": 39,
+            "tc_position": {
+                "lat": 19.5,
+                "lon": 106.0
+            },
+            "tc_intensity_hpa": null,
+            "environmental_systems": []
+        },
+        {
+            "time": "2020-08-04T00:00:00",
+            "time_idx": 40,
+            "tc_position": {
+                "lat": 20.0,
+                "lon": 106.25
+            },
+            "tc_intensity_hpa": null,
+            "environmental_systems": []
+        },
+        {
+            "time": "2020-08-04T06:00:00",
+            "time_idx": 41,
+            "tc_position": {
+                "lat": 18.75,
+                "lon": 105.75
+            },
+            "tc_intensity_hpa": null,
+            "environmental_systems": []
+        }
+    ]
+}

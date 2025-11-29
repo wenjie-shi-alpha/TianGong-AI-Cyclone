@@ -101,24 +101,6 @@ def track_file_with_initials(
                 cache = {"msl": msl_2d, "10u": u10_2d, "10v": v10_2d}
                 if z2d is not None:
                     cache["z"] = z2d
-                
-                # Add temperature and wind data for warm core and vorticity
-                if adapter.idx_200hpa is not None:
-                    t_200 = adapter.t_at_level(time_idx, adapter.idx_200hpa)
-                    if t_200 is not None:
-                        cache["t_200"] = t_200
-                
-                if adapter.idx_850hpa is not None:
-                    t_850 = adapter.t_at_level(time_idx, adapter.idx_850hpa)
-                    u_850 = adapter.u_at_level(time_idx, adapter.idx_850hpa)
-                    v_850 = adapter.v_at_level(time_idx, adapter.idx_850hpa)
-                    if t_850 is not None:
-                        cache["t_850"] = t_850
-                    if u_850 is not None:
-                        cache["u_850"] = u_850
-                    if v_850 is not None:
-                        cache["v_850"] = v_850
-                
                 time_cache[time_idx] = cache
 
             surf_vars = {
@@ -136,18 +118,7 @@ def track_file_with_initials(
                 atmos_levels=[adapter.z_level_near_700 or 700],
             )
             static_vars = {"lsm": adapter.lsm}
-            
-            # Create batch with optional temperature and wind fields
-            batch = _SimpleBatch(
-                atmos_vars=atmos_vars, 
-                surf_vars=surf_vars, 
-                static_vars=static_vars, 
-                metadata=metadata,
-                t_200hpa=cache.get("t_200"),
-                t_850hpa=cache.get("t_850"),
-                u_850hpa=cache.get("u_850"),
-                v_850hpa=cache.get("v_850"),
-            )
+            batch = _SimpleBatch(atmos_vars=atmos_vars, surf_vars=surf_vars, static_vars=static_vars, metadata=metadata)
 
             try:
                 tracker.step(batch)

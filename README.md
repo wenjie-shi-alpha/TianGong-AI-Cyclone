@@ -11,6 +11,26 @@
 - `generate_nc_urls.py`：根据轨迹 CSV 中的时间戳，从多个模式前缀下枚举 S3 目录，生成可下载的 NetCDF 文件列表及元数据（CSV 输出）。
 - `list_all_nc_files.py`：遍历指定模式前缀的全部 NetCDF 对象，支持按年份过滤，并将结果写入 `output/all_nc_files.csv` 供批量分析或审计使用。
 
+## Google Earth Engine 版 GFS 处理脚本
+
+- `src/gee_gfs_pipeline.py` 直接在 Google Earth Engine (GEE) 上处理 `NOAA/GFS0P25` 历史预报集：追踪逻辑沿用 `initial_tracker` 的最低压差捕获策略，环境量提取参考了 `environment_extractor` 的环平均分析。
+- 重量运算全部由 GEE 完成（通过 `reduceRegion` / `pixelLonLat` 等服务器端算子）；本地只接收每个时次的统计值，原始格点不会下载，符合“算法在云端执行、结果再拉回”的要求。
+- 依赖：`earthengine-api`（已写入 `requirements.txt`）。首次运行需在 shell 中执行 `earthengine authenticate` 或让脚本自动触发交互授权。
+- 典型用法：
+  ```bash
+  python3 src/gee_gfs_pipeline.py \
+    --initials-csv input/matched_cyclone_tracks.csv \
+    --storm-id 2018243N15262 \
+    --start-time 2018-09-12T00:00Z \
+    --temporal-span-hours 144 \
+    --output-dir colab_outputs/gee_pipeline
+  ```
+  输出会按照台风 ID 存放在 `colab_outputs/gee_pipeline/<storm_id>/`，同目录下同时保存 `*_gee_track.csv` 与 `*_gee_track.json`，内容包括逐时位置、海平面气压、核心风速、外围压差以及水汽/温度/湿度等环境要素摘要。
+- 常用参数：
+  - `--analysis-only`：仅使用 `forecast_hour==0` 的分析场；若需要完整预报序列，可去掉该标志并通过 `--max-forecast-hour` 控制可接受的最大小时数。
+  - `--max-steps` 与 `--temporal-span-hours` 控制追踪长度；`--spatial-pad-deg` 用于设定检索区域。
+- 运行后即可直接下载（或同步到云端目录）这些已经分析好的 CSV/JSON，整个过程不会把原始 GFS NetCDF/格点拉回本地。
+
 ## Env Preparing
 
 Setup `venv`:

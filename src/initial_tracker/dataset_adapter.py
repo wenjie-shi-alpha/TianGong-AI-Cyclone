@@ -46,12 +46,6 @@ class _DsAdapter:
     z_idx_near_700: Optional[int]
     z_level_near_700: Optional[int]
     lsm: np.ndarray
-    # New fields for warm core and vorticity
-    t_name: Optional[str]
-    u_name: Optional[str]
-    v_name: Optional[str]
-    idx_200hpa: Optional[int]
-    idx_850hpa: Optional[int]
 
     @staticmethod
     def build(ds: xr.Dataset) -> "_DsAdapter":
@@ -115,22 +109,6 @@ class _DsAdapter:
                 sample = sample[0]
             lsm = np.zeros_like(sample)
 
-        # Extract temperature and wind fields for warm core and vorticity
-        t_da = _safe_get(ds, ["t", "temp", "temperature"])
-        t_name = str(t_da.name) if t_da is not None else None
-        
-        u_da = _safe_get(ds, ["u", "u_wind"])
-        v_da = _safe_get(ds, ["v", "v_wind"])
-        u_name = str(u_da.name) if u_da is not None else None
-        v_name = str(v_da.name) if v_da is not None else None
-        
-        # Find indices for 200hPa and 850hPa
-        idx_200hpa: Optional[int] = None
-        idx_850hpa: Optional[int] = None
-        if z_levels_hpa is not None:
-            idx_200hpa = int(np.argmin(np.abs(z_levels_hpa.astype(float) - 200.0)))
-            idx_850hpa = int(np.argmin(np.abs(z_levels_hpa.astype(float) - 850.0)))
-
         return _DsAdapter(
             ds=ds,
             lat_name=lat_name,
@@ -147,11 +125,6 @@ class _DsAdapter:
             z_idx_near_700=z_idx_near_700,
             z_level_near_700=z_level_near_700,
             lsm=lsm,
-            t_name=t_name,
-            u_name=u_name,
-            v_name=v_name,
-            idx_200hpa=idx_200hpa,
-            idx_850hpa=idx_850hpa,
         )
 
     def msl_at(self, time_idx: int) -> np.ndarray:
@@ -189,30 +162,6 @@ class _DsAdapter:
             z2d_da = z_sel.transpose(self.lat_name, self.lon_name)
             z2d = z2d_da.values
         return z2d
-
-    def t_at_level(self, time_idx: int, level_idx: int) -> Optional[np.ndarray]:
-        """Get temperature at a specific level index."""
-        if self.t_name is None or self.z_level_dim is None:
-            return None
-        t_sel = self.ds[self.t_name].isel(time=time_idx, **{self.z_level_dim: level_idx})
-        t2d_da = t_sel.transpose(self.lat_name, self.lon_name)
-        return t2d_da.values
-
-    def u_at_level(self, time_idx: int, level_idx: int) -> Optional[np.ndarray]:
-        """Get U wind component at a specific level index."""
-        if self.u_name is None or self.z_level_dim is None:
-            return None
-        u_sel = self.ds[self.u_name].isel(time=time_idx, **{self.z_level_dim: level_idx})
-        u2d_da = u_sel.transpose(self.lat_name, self.lon_name)
-        return u2d_da.values
-
-    def v_at_level(self, time_idx: int, level_idx: int) -> Optional[np.ndarray]:
-        """Get V wind component at a specific level index."""
-        if self.v_name is None or self.z_level_dim is None:
-            return None
-        v_sel = self.ds[self.v_name].isel(time=time_idx, **{self.z_level_dim: level_idx})
-        v2d_da = v_sel.transpose(self.lat_name, self.lon_name)
-        return v2d_da.values
 
 
 def _build_batch_from_ds_fast(adapter: _DsAdapter, time_idx: int) -> _SimpleBatch:

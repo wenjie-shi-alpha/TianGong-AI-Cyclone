@@ -9,3 +9,4 @@ scikit-image
 trackpy
 xarray
 pytest
+earthengine-api

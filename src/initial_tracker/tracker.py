@@ -11,7 +11,7 @@ import pandas as pd
 
 from .batching import _SimpleBatch
 from .exceptions import NoEyeException
-from .geo import get_box, get_closest_min, extrapolate, compute_relative_vorticity, check_warm_core
+from .geo import get_box, get_closest_min, extrapolate
 
 logger = logging.getLogger(__name__)
 
@@ -45,10 +45,6 @@ class Tracker:
         self.dissipation_reason: Optional[str] = None
         self.peak_pressure_drop_hpa: float = 0.0
         self.peak_wind: float = 0.0
-        # New fields for tracking warm core and vorticity
-        self.warm_core_detections: int = 0
-        self.cyclonic_vorticity_detections: int = 0
-        self.total_steps: int = 0
 
     def results(self) -> pd.DataFrame:
         """Assemble the current track as a DataFrame."""
@@ -96,41 +92,6 @@ class Tracker:
         lat = max(min(lat, 90), -90)
         lon = lon % 360
 
-        # ===== NEW: Warm core and vorticity checks =====
-        has_warm_core = False
-        warm_core_strength = 0.0
-        vorticity = 0.0
-        
-        # Check for warm core if temperature data is available
-        if batch.t_200hpa is not None and batch.t_850hpa is not None:
-            try:
-                has_warm_core, warm_core_strength = check_warm_core(
-                    batch.t_200hpa, batch.t_850hpa, lats, lons, lat, lon, delta=2.0
-                )
-                if has_warm_core:
-                    self.warm_core_detections += 1
-                    logger.debug("Warm core detected at %s: strength=%.2f K", time, warm_core_strength)
-            except Exception as e:
-                logger.debug("Warm core check failed: %s", e)
-        
-        # Check for cyclonic vorticity if wind data is available
-        if batch.u_850hpa is not None and batch.v_850hpa is not None:
-            try:
-                vorticity = compute_relative_vorticity(
-                    batch.u_850hpa, batch.v_850hpa, lats, lons, lat, lon, delta=2.0
-                )
-                # Northern hemisphere: positive vorticity indicates cyclonic rotation
-                # Southern hemisphere: negative vorticity indicates cyclonic rotation
-                is_cyclonic = (lat >= 0 and vorticity > 1e-5) or (lat < 0 and vorticity < -1e-5)
-                if is_cyclonic:
-                    self.cyclonic_vorticity_detections += 1
-                    logger.debug("Cyclonic vorticity detected at %s: %.2e s^-1", time, vorticity)
-            except Exception as e:
-                logger.debug("Vorticity check failed: %s", e)
-        
-        self.total_steps += 1
-        # ===== END NEW =====
-
         def is_clear(lat_val: float, lon_val: float, delta: float) -> bool:
             _, _, lsm_box = get_box(
                 lsm,
@@ -141,6 +102,8 @@ class Tracker:
                 lon_val - delta,
                 lon_val + delta,
             )
+            if lsm_box.size == 0:
+                return False
             return lsm_box.max() < 0.5
 
         snap = False
@@ -192,24 +155,6 @@ class Tracker:
                 logger.info("Failed at time %s. Extrapolating in a silly way.", time)
             else:
                 raise NoEyeException("Completely failed at the first step.")
-
-        # ===== NEW: Additional validation using warm core and vorticity =====
-        # If we have multiple steps, check if this looks like a tropical cyclone
-        if self.total_steps >= 5:  # Wait for at least 5 steps to accumulate evidence
-            warm_core_ratio = self.warm_core_detections / self.total_steps
-            vorticity_ratio = self.cyclonic_vorticity_detections / self.total_steps
-            
-            # If less than 30% of steps show warm core OR cyclonic vorticity, flag as suspicious
-            if warm_core_ratio < 0.3 and vorticity_ratio < 0.3:
-                logger.warning(
-                    "Weak tropical cyclone characteristics at %s: warm_core=%.1f%%, vorticity=%.1f%%",
-                    time, warm_core_ratio * 100, vorticity_ratio * 100
-                )
-                # Don't immediately fail, but increase fail counter
-                # This allows tracking to continue but makes it more likely to dissipate
-                if not snap:
-                    self.fails += 1
-        # ===== END NEW =====
 
         self.tracked_times.append(time)
         self.tracked_lats.append(lat)
