@@ -447,41 +447,41 @@ def streaming_from_csv(
 
             if parallel and executor:
                 detail("🧮 已提交环境分析任务 (并行)")
-            log_file = (
-                str((logs_dir / f"{nc_local.stem}.log").resolve())
-                if logs_dir is not None and not concise_log
-                else None
-            )
-            future = executor.submit(
-                _run_environment_analysis,
-                str(nc_local),
-                str(track_csv),
-                "final_single_output",
-                keep_nc,
-                log_file,
-                concise_log,
-            )
-            meta: dict[str, str] = {"label": nc_local.name, "stem": nc_stem}
-            if log_file:
-                meta["log"] = log_file
-            active_futures[future] = meta
-        else:
-            try:
-                success, error_msg, produced = _run_environment_analysis(
+                log_file = (
+                    str((logs_dir / f"{nc_local.stem}.log").resolve())
+                    if logs_dir is not None and not concise_log
+                    else None
+                )
+                future = executor.submit(
+                    _run_environment_analysis,
                     str(nc_local),
                     str(track_csv),
                     "final_single_output",
                     keep_nc,
-                    None,
+                    log_file,
                     concise_log,
                 )
-                if success:
-                    processed += 1
-                    _register_manifest_entries(existing_index, final_dir, nc_stem, produced)
-                elif error_msg:
-                    summary(f"❌ 环境分析失败: {error_msg}")
-            except Exception as e:
-                summary(f"❌ 环境分析失败: {e}")
+                meta: dict[str, str] = {"label": nc_local.name, "stem": nc_stem}
+                if log_file:
+                    meta["log"] = log_file
+                active_futures[future] = meta
+            else:
+                try:
+                    success, error_msg, produced = _run_environment_analysis(
+                        str(nc_local),
+                        str(track_csv),
+                        "final_single_output",
+                        keep_nc,
+                        None,
+                        concise_log,
+                    )
+                    if success:
+                        processed += 1
+                        _register_manifest_entries(existing_index, final_dir, nc_stem, produced)
+                    elif error_msg:
+                        summary(f"❌ 环境分析失败: {error_msg}")
+                except Exception as e:
+                    summary(f"❌ 环境分析失败: {e}")
 
     finally:
         if parallel and executor:

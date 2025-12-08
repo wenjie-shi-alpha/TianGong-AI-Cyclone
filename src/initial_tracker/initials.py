@@ -33,7 +33,8 @@ def _select_initials_for_time(
     """Select the best matching initial point for each storm near a target time."""
     if df_all.empty:
         return pd.DataFrame(columns=["storm_id", "init_time", "init_lat", "init_lon"])
-    delta = pd.Timedelta(hours=tol_hours)
+    # Slightly widen the time window to be robust to catalogue microsecond offsets
+    delta = pd.Timedelta(hours=tol_hours) + pd.Timedelta(seconds=60)
     sub = df_all.loc[(df_all["dt"] >= target_time - delta) & (df_all["dt"] <= target_time + delta)].copy()
     if sub.empty:
         return pd.DataFrame(columns=["storm_id", "init_time", "init_lat", "init_lon"])
