@@ -19,9 +19,11 @@ from typing import Any, Dict, Sequence
 
 import ee
 import pandas as pd
+import numpy as np
 from ee.ee_exception import EEException
 
 from initial_tracker.initials import _load_all_points, _select_initials_for_time
+from environment_extractor.extractor import TCEnvironmentalSystemsExtractor
 
 DEFAULT_BAND_MAP = {
     "msl": "mean_sea_level_pressure",
@@ -30,6 +32,16 @@ DEFAULT_BAND_MAP = {
     "precipitable_water": "precipitable_water_entire_atmosphere",
     "temp2m": "temperature_2m_above_ground",
     "rh2m": "relative_humidity_2m_above_ground",
+}
+
+# Mapping for extraction (GEE Band -> Standard Name)
+EXTRACTION_BAND_MAP = {
+    "geopotential_height_isobaric": "z",
+    "temperature_isobaric": "t",
+    "u_component_of_wind_isobaric": "u",
+    "v_component_of_wind_isobaric": "v",
+    "specific_humidity_isobaric": "q",
+    "vertical_velocity_isobaric": "w",
 }
 
 EE_MAX_PIXELS = 1_000_000_000
@@ -65,6 +77,7 @@ class TrackerOptions:
     max_consecutive_failures: int = 4
     failure_window_hours: float = 18.0
     wind_core_radius_km: float = 150.0
+    lsm_threshold: float = 0.5  # Threshold for Land-Sea Mask (0=Ocean, 1=Land)
 
 
 @dataclass
@@ -112,6 +125,9 @@ class GEERemotePipeline:
         self._ensure_ee_initialized()
         self.available_bands = self._discover_bands()
         self.active_band_map = self._build_active_band_map()
+        # Load Land-Sea Mask (1=Land, 0=Water)
+        # Using MODIS/006/MOD44W which has 'water_mask' (1=Water, 0=Land)
+        self.lsm_image = ee.Image("MODIS/006/MOD44W").select("water_mask").unmask(0).not_().rename("lsm")
 
     def _ensure_ee_initialized(self) -> None:
         try:
@@ -170,6 +186,10 @@ class GEERemotePipeline:
             augmented = augmented.addBands(image.select(band_map["temp2m"]).rename("temp2m_c"), overwrite=True)
         if "rh2m" in band_map:
             augmented = augmented.addBands(image.select(band_map["rh2m"]).rename("rh2m_pct"), overwrite=True)
+        
+        # Add LSM
+        augmented = augmented.addBands(self.lsm_image, overwrite=True)
+
         return augmented.set(
             {
                 "forecast_hours": forecast_hours,
@@ -185,13 +205,24 @@ class GEERemotePipeline:
         end: pd.Timestamp,
         center_lat: float,
         center_lon0360: float,
+        forecast_init: pd.Timestamp | None = None,
     ) -> ee.ImageCollection:
         pad_buffer_m = self.cfg.spatial_pad_deg * 111_000
         point = ee.Geometry.Point([_to_180(center_lon0360), center_lat])
         region = point.buffer(pad_buffer_m, 1000)
+        
+        collection = ee.ImageCollection(self.cfg.dataset_id)
+        
+        if forecast_init:
+            # Filter by specific forecast initialization time
+            # GFS 'system:time_start' is the initialization time
+            collection = collection.filterDate(forecast_init.isoformat(), forecast_init.advance(1, "hour").isoformat())
+        else:
+            # Fallback to window around valid time (approximate)
+            collection = collection.filterDate(start.isoformat(), end.isoformat())
+            
         collection = (
-            ee.ImageCollection(self.cfg.dataset_id)
-            .filterDate(start.isoformat(), end.isoformat())
+            collection
             .filterBounds(region)
             .map(self._augment_image)
         )
@@ -261,6 +292,15 @@ class GEERemotePipeline:
         tracker_cfg = self.cfg.tracker
         for delta in tracker_cfg.search_radii_deg:
             bbox = self._square_geometry(guess_lat, guess_lon0360, delta)
+            
+            # LSM Check: Ensure the search box is over water
+            # lsm band: 1=Land, 0=Water. We want max < threshold (i.e. no land)
+            lsm_stats = self._reduce_region(image, "lsm", bbox, ee.Reducer.max())
+            if lsm_stats and "lsm" in lsm_stats:
+                if lsm_stats["lsm"] >= tracker_cfg.lsm_threshold:
+                    # Land detected in the search box, skip this radius
+                    continue
+
             stats = self._reduce_region(image, "msl_pa", bbox, ee.Reducer.min())
             if not stats or "msl_pa" not in stats:
                 continue
@@ -370,13 +410,14 @@ class GEERemotePipeline:
         self,
         storm_id: str,
         init_row: pd.Series,
+        forecast_init: pd.Timestamp | None = None,
     ) -> list[dict[str, Any]]:
         init_time = pd.Timestamp(init_row["init_time"])
         start = init_time - pd.Timedelta(hours=self.cfg.time_window_hours)
         end = init_time + pd.Timedelta(hours=self.cfg.temporal_span_hours)
         init_lat = float(init_row["init_lat"])
         init_lon0360 = _to_0360(float(init_row["init_lon"]))
-        collection = self._build_collection(start, end, init_lat, init_lon0360)
+        collection = self._build_collection(start, end, init_lat, init_lon0360, forecast_init=forecast_init)
         count = int(collection.size().getInfo() or 0)
         if count == 0:
             logging.warning("[%s] No GFS images for requested window.", storm_id)
@@ -473,28 +514,62 @@ class GEERemotePipeline:
                 json.dump(history, fp, ensure_ascii=False, indent=2)
             logging.info("[%s] JSON summary saved to %s", storm_id, json_path)
 
+    def _export_analysis_only(self, storm_id: str, history: list[dict[str, Any]]) -> None:
+        """Persist only analyzed results; no raw downloads (GEE-only workflow)."""
+        if not history:
+            return
+        # Track CSV/JSON already written by _write_outputs; this is a hook for future summaries.
+        logging.info("[%s] Skipping raw downloads; analysis kept on server.", storm_id)
+
     def run(
         self,
         initials_csv: Path,
-        start_time: str,
+        start_time: str | None = None, # Kept for compatibility but logic changed
         storm_filter: list[str] | None = None,
     ) -> None:
         df_all = _load_all_points(initials_csv)
-        target_time = pd.Timestamp(start_time)
+
         if storm_filter:
             df_all = df_all[df_all["storm_id"].isin(storm_filter)]
-        candidates = _select_initials_for_time(df_all, target_time, tol_hours=self.cfg.time_window_hours)
-        if candidates.empty:
-            raise RuntimeError("No matching initial points within the requested time window.")
-        for _, row in candidates.iterrows():
-            storm_id = str(row["storm_id"])
+
+        for storm_id, group in df_all.groupby("storm_id"):
             logging.info("Processing storm %s ...", storm_id)
-            history = self._track_single_storm(storm_id, row)
-            if not history:
-                logging.warning("[%s] No history generated.", storm_id)
-                continue
-            self._write_outputs(storm_id, history)
-            time.sleep(0.5)
+
+            storm_start = pd.to_datetime(group["dt"]).min()
+            storm_end = pd.to_datetime(group["dt"]).max()
+
+            # Align forecast cycles to 6-hourly synoptic times, mirroring the notebook logic.
+            freq = "6H"
+            init_times = pd.date_range(
+                storm_start.floor(freq),
+                storm_end.ceil(freq),
+                freq=freq,
+            )
+
+            for init_time in init_times:
+                init_str = init_time.strftime("%Y-%m-%d %H:%M")
+                forecast_id = init_time.strftime("%Y%m%d_%H%M")
+
+                tracking_start = max(init_time, storm_start)
+
+                candidates = _select_initials_for_time(group, tracking_start, tol_hours=3)
+                if candidates.empty:
+                    continue
+
+                row = candidates.iloc[0]
+                logging.info("  Forecast %s (Start Track: %s)", init_str, tracking_start)
+
+                history = self._track_single_storm(str(storm_id), row, forecast_init=init_time)
+                if not history:
+                    continue
+
+                self._write_outputs(f"{storm_id}_{forecast_id}", history)
+
+                # Only persist analyzed results; no raw downloads.
+                self._export_analysis_only(f"{storm_id}_{forecast_id}", history)
+
+                time.sleep(0.5)
+
 
 
 def _build_arg_parser() -> argparse.ArgumentParser:
@@ -514,8 +589,8 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--start-time",
-        required=True,
-        help="Reference datetime (UTC) used to pick the initial seeds, e.g. 2018-09-12T00:00Z.",
+        required=False,
+        help="Reference datetime (UTC) used to pick the initial seeds. If omitted, processes all storms in CSV.",
     )
     parser.add_argument(
         "--time-window-hours",
