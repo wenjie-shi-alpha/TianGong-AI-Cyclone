@@ -12,7 +12,14 @@ import pandas as pd
 
 from .batching import _SimpleBatch
 from .exceptions import NoEyeException
-from .geo import get_box, get_closest_min, extrapolate, havdist, snap_to_grid
+from .geo import (
+    bilinear_interpolate,
+    get_box,
+    get_closest_min,
+    extrapolate,
+    havdist,
+    snap_to_grid,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -55,6 +62,7 @@ class Tracker:
         self._init_snapped: bool = False
         self._fix_lats: List[float] = [self.tracked_lats[0]]
         self._fix_lons: List[float] = [self.tracked_lons[0]]
+        self._stationary_steps: int = 0
 
         # Relaxed thresholds extend tolerance for weak or messy systems.
         self._max_consecutive_fails = 10 if not _RELAXED else 12
@@ -62,6 +70,9 @@ class Tracker:
         self._min_drop_hpa = 0.5 if not _RELAXED else 0.3
         self._min_drop_fraction = 0.2 if not _RELAXED else 0.1
         self._max_step_km = 350.0 if not _RELAXED else 450.0
+        self._stationary_distance_km = 60.0
+        self._max_stationary_steps = 6 if not _RELAXED else 8
+        self._stationary_intensity_fraction = 0.35 if not _RELAXED else 0.25
 
     def results(self) -> pd.DataFrame:
         """Assemble the current track as a DataFrame."""
@@ -138,7 +149,7 @@ class Tracker:
         lons = np.array(batch.metadata.lon)
         time = batch.metadata.time[0]
 
-        # Snap the initial catalog position onto the model grid once we know it.
+        # Constrain the initial catalogue position to the model domain once we know it.
         if not self._init_snapped:
             snapped_lat, snapped_lon = snap_to_grid(self.tracked_lats[0], self.tracked_lons[0], lats, lons)
             self.tracked_lats[0] = snapped_lat
@@ -269,6 +280,7 @@ class Tracker:
             except NoEyeException:
                 pass
 
+        movement_km = 0.0
         if snap and self._fix_lats:
             prev_lat = self._fix_lats[-1]
             prev_lon = self._fix_lons[-1]
@@ -278,6 +290,8 @@ class Tracker:
                     "Discarded jump of %.1f km (> %.1f km limit) between fixes", step_distance, self._max_step_km
                 )
                 snap = False
+            else:
+                movement_km = step_distance
 
         if snap:
             self.fails = 0
@@ -297,7 +311,7 @@ class Tracker:
             lat = self._fix_lats[-1]
             lon = self._fix_lons[-1]
 
-        # Always project the coordinate back onto the native grid to prevent off-grid drift.
+        # Keep the coordinate inside the native domain while preserving sub-grid offsets.
         lat, lon = snap_to_grid(lat, lon, lats, lons)
 
         if snap:
@@ -306,13 +320,17 @@ class Tracker:
             if len(self._fix_lats) > 16:
                 del self._fix_lats[:-16]
                 del self._fix_lons[:-16]
+        else:
+            movement_km = 0.0
+
+        if movement_km < self._stationary_distance_km:
+            self._stationary_steps += 1
+        else:
+            self._stationary_steps = 0
 
         self.tracked_times.append(time)
         self.tracked_lats.append(lat)
         self.tracked_lons.append(lon)
-
-        lat_idx = int(np.abs(lats - lat).argmin())
-        lon_idx = int(np.abs(((lons + 360.0) % 360.0) - lon).argmin())
 
         _, _, msl_crop = get_box(msl, lats, lons, lat - 1.5, lat + 1.5, lon - 1.5, lon + 1.5)
         _, _, wind_crop = get_box(wind, lats, lons, lat - 1.5, lat + 1.5, lon - 1.5, lon + 1.5)
@@ -327,11 +345,32 @@ class Tracker:
                 return float(fallback) if np.isfinite(fallback) else float("nan")
             return float(np.nanmax(arr))
 
-        center_msl = float(msl[lat_idx, lon_idx]) if msl.ndim >= 2 else float(msl)
-        center_wind = float(wind[lat_idx, lon_idx]) if wind.ndim >= 2 else float(wind)
+        if msl.ndim >= 2:
+            center_msl = bilinear_interpolate(msl, lats, lons, lat, lon)
+        else:
+            center_msl = float(msl)
+        if wind.ndim >= 2:
+            center_wind = bilinear_interpolate(wind, lats, lons, lat, lon)
+        else:
+            center_wind = float(wind)
 
-        min_msl = _safe_min(msl_crop, center_msl)
-        max_wind = _safe_max(wind_crop, center_wind)
+        if not np.isfinite(center_msl):
+            center_msl = _safe_min(msl_crop, np.nan)
+        if not np.isfinite(center_wind):
+            center_wind = _safe_max(wind_crop, np.nan)
+
+        grid_min_msl = _safe_min(msl_crop, center_msl)
+        grid_max_wind = _safe_max(wind_crop, center_wind)
+
+        if np.isfinite(center_msl) and np.isfinite(grid_min_msl):
+            min_msl = float(min(center_msl, grid_min_msl))
+        else:
+            min_msl = float(grid_min_msl)
+
+        if np.isfinite(center_wind) and np.isfinite(grid_max_wind):
+            max_wind = float(max(center_wind, grid_max_wind))
+        else:
+            max_wind = float(grid_max_wind)
 
         # Backfill the initial catalogue row so the first line is on-grid and has intensity.
         if np.isnan(self.tracked_msls[0]):
@@ -350,6 +389,7 @@ class Tracker:
             self.peak_wind = max(self.peak_wind, max_wind)
 
         self._check_dissipation(time, snap, pressure_drop_hpa, max_wind)
+        self._check_stationary_quit(time, pressure_drop_hpa, max_wind)
 
 
     def _compute_pressure_drop_hpa(
@@ -441,5 +481,53 @@ class Tracker:
         self.dissipation_reason = reason
         logger.info("Cyclone dissipated at %s: %s", time, reason)
         print(f"[TRACKER] Dissipated at {time} because: {reason}")
+
+    def _check_stationary_quit(
+        self,
+        time: datetime,
+        pressure_drop_hpa: Optional[float],
+        max_wind: float,
+    ) -> None:
+        if self.dissipated:
+            return
+        if len(self.tracked_times) < self._max_stationary_steps + 2:
+            return
+        if self._stationary_steps < self._max_stationary_steps:
+            return
+
+        ratio = self._current_intensity_ratio(pressure_drop_hpa, max_wind)
+        effective_ratio = ratio if ratio is not None else 0.0
+        if effective_ratio >= self._stationary_intensity_fraction:
+            # System remains strong relative to its peak — treat as meandering instead of dissipated.
+            self._stationary_steps = max(1, self._max_stationary_steps // 2)
+            logger.debug(
+                "Stationary but intensity still at %.0f%% of peak, continuing track",
+                effective_ratio * 100.0,
+            )
+            return
+
+        ratio_desc = "未知"
+        if ratio is not None:
+            ratio_desc = f"{max(min(ratio, 1.0), 0.0) * 100:.0f}%"
+
+        self._mark_dissipated(
+            time,
+            f"连续{self._stationary_steps}次几乎未移动且强度降至峰值的{ratio_desc}",
+        )
+
+    def _current_intensity_ratio(
+        self,
+        pressure_drop_hpa: Optional[float],
+        max_wind: float,
+    ) -> Optional[float]:
+        """Return the current/peak intensity ratio using drop or wind metrics."""
+        ratios: list[float] = []
+        if pressure_drop_hpa is not None and self.peak_pressure_drop_hpa > 0:
+            ratios.append(max(pressure_drop_hpa, 0.0) / self.peak_pressure_drop_hpa)
+        if np.isfinite(max_wind) and self.peak_wind > 0:
+            ratios.append(max_wind / self.peak_wind)
+        if not ratios:
+            return None
+        return float(np.clip(max(ratios), 0.0, 2.0))
 
 __all__ = ["Tracker"]

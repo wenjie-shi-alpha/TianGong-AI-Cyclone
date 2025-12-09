@@ -14,7 +14,7 @@ from scipy.ndimage import gaussian_filter
 
 from .batching import _SimpleBatch
 from .exceptions import NoEyeException
-from .geo import get_box, get_closest_min, extrapolate, snap_to_grid
+from .geo import bilinear_interpolate, get_box, get_closest_min, extrapolate, snap_to_grid
 
 logger = logging.getLogger(__name__)
 
@@ -132,9 +132,6 @@ class RobustTracker:
         self.tracked_lats.append(lat)
         self.tracked_lons.append(lon)
 
-        lat_idx = int(np.abs(lats - lat).argmin())
-        lon_idx = int(np.abs(((lons + 360.0) % 360.0) - lon).argmin())
-
         _, _, msl_box = get_box(msl, lats, lons, lat - 1.5, lat + 1.5, lon - 1.5, lon + 1.5)
         _, _, wind_box = get_box(wind, lats, lons, lat - 1.5, lat + 1.5, lon - 1.5, lon + 1.5)
 
@@ -148,11 +145,32 @@ class RobustTracker:
                 return float(fallback) if np.isfinite(fallback) else float("nan")
             return float(np.nanmax(arr))
 
-        center_msl = float(msl[lat_idx, lon_idx]) if msl.ndim >= 2 else float(msl)
-        center_wind = float(wind[lat_idx, lon_idx]) if wind.ndim >= 2 else float(wind)
+        if msl.ndim >= 2:
+            center_msl = bilinear_interpolate(msl, lats, lons, lat, lon)
+        else:
+            center_msl = float(msl)
+        if wind.ndim >= 2:
+            center_wind = bilinear_interpolate(wind, lats, lons, lat, lon)
+        else:
+            center_wind = float(wind)
 
-        min_msl = _safe_min(msl_box, center_msl)
-        max_wind = _safe_max(wind_box, center_wind)
+        if not np.isfinite(center_msl):
+            center_msl = _safe_min(msl_box, np.nan)
+        if not np.isfinite(center_wind):
+            center_wind = _safe_max(wind_box, np.nan)
+
+        grid_min_msl = _safe_min(msl_box, center_msl)
+        grid_max_wind = _safe_max(wind_box, center_wind)
+
+        if np.isfinite(center_msl) and np.isfinite(grid_min_msl):
+            min_msl = float(min(center_msl, grid_min_msl))
+        else:
+            min_msl = float(grid_min_msl)
+
+        if np.isfinite(center_wind) and np.isfinite(grid_max_wind):
+            max_wind = float(max(center_wind, grid_max_wind))
+        else:
+            max_wind = float(grid_max_wind)
 
         if np.isnan(self.tracked_msls[0]):
             self.tracked_msls[0] = min_msl
