@@ -4,6 +4,7 @@ Robust Tracker implementation designed for East Pacific / Weak Cyclones.
 from __future__ import annotations
 
 import logging
+import os
 from datetime import datetime, timedelta
 from typing import List, Optional
 
@@ -13,9 +14,11 @@ from scipy.ndimage import gaussian_filter
 
 from .batching import _SimpleBatch
 from .exceptions import NoEyeException
-from .geo import get_box, get_closest_min, extrapolate
+from .geo import get_box, get_closest_min, extrapolate, snap_to_grid
 
 logger = logging.getLogger(__name__)
+
+_RELAXED = os.getenv("RELAXED_TRACKING", "0").lower() in {"1", "true", "yes"}
 
 class RobustTracker:
     """
@@ -40,27 +43,27 @@ class RobustTracker:
     ) -> None:
         self.tracked_times: List[datetime] = [init_time]
         self.tracked_lats: List[float] = [init_lat]
-        self.tracked_lons: List[float] = [init_lon]
+        self.tracked_lons: List[float] = [(init_lon + 360.0) % 360.0]
         self.tracked_msls: List[float] = [init_msl if init_msl else np.nan]
         self.tracked_winds: List[float] = [init_wind if init_wind else np.nan]
+        self._init_snapped: bool = False
         
         self.fails: int = 0
         self.dissipated: bool = False
         self.dissipated_time: Optional[datetime] = None
         self.dissipation_reason: Optional[str] = None
         
-        # Configuration
-        # Search radii: Prioritize local (2.0), then expand slightly. 
-        # Avoid 5.0 deg which causes large jumps.
-        self.search_radii = [2.0, 3.0, 4.0] 
-        
-        # Gradient threshold: Center must be at least this much lower than surroundings (Pascals)
-        # 50 Pa = 0.5 hPa. Weak but non-zero.
-        self.gradient_threshold = 50.0 
-        
-        # Max consecutive fails before declaring dissipation
-        # 4 steps * 6 hours = 24 hours
-        self.max_consecutive_fails = 4
+        # Configuration tuned for weak systems; relaxed mode widens limits further.
+        # Search radii: prioritize local (2.0), then expand slightly.
+        self.search_radii = [2.0, 3.0, 4.0]
+
+        # Gradient threshold: center must be lower than surroundings. In relaxed
+        # mode we halve the requirement to avoid rejecting shallow minima.
+        self.gradient_threshold = 50.0 if not _RELAXED else 25.0
+
+        # Max consecutive fails before declaring dissipation. Relaxed mode allows
+        # more missed detections to keep tracks alive across reorganisations.
+        self.max_consecutive_fails = 4 if not _RELAXED else 8
 
     def results(self) -> pd.DataFrame:
         return pd.DataFrame({
@@ -83,6 +86,12 @@ class RobustTracker:
         lats = np.array(batch.metadata.lat)
         lons = np.array(batch.metadata.lon)
         time = batch.metadata.time[0]
+
+        if not self._init_snapped:
+            snap_lat, snap_lon = snap_to_grid(self.tracked_lats[0], self.tracked_lons[0], lats, lons)
+            self.tracked_lats[0] = snap_lat
+            self.tracked_lons[0] = snap_lon
+            self._init_snapped = True
         
         # 1. Extrapolate next position
         guess_lat, guess_lon = extrapolate(self.tracked_lats, self.tracked_lons)
@@ -94,42 +103,64 @@ class RobustTracker:
         
         for r in self.search_radii:
             try:
-                # Use existing helper to find local min
                 cand_lat, cand_lon = get_closest_min(
                     msl, lats, lons, guess_lat, guess_lon, delta_lat=r, delta_lon=r
                 )
-                
-                # Check if this minimum has structure (is a closed low)
-                if self._check_structure(msl, lats, lons, cand_lat, cand_lon):
+
+                # In relaxed mode, accept the first viable minimum without a strict
+                # structure check to keep weak systems alive.
+                if _RELAXED or self._check_structure(msl, lats, lons, cand_lat, cand_lon):
                     found_lat, found_lon = cand_lat, cand_lon
-                    break # Found a good one, stop searching
+                    break
             except NoEyeException:
                 continue
 
         # 3. Update State
         if found_lat is not None:
             self.fails = 0
-            self.tracked_times.append(time)
-            self.tracked_lats.append(found_lat)
-            self.tracked_lons.append(found_lon)
-            
-            # Get values at center
-            _, _, msl_box = get_box(msl, lats, lons, found_lat-1.5, found_lat+1.5, found_lon-1.5, found_lon+1.5)
-            _, _, wind_box = get_box(wind, lats, lons, found_lat-1.5, found_lat+1.5, found_lon-1.5, found_lon+1.5)
-            self.tracked_msls.append(float(np.nanmin(msl_box)) if msl_box.size > 0 else np.nan)
-            self.tracked_winds.append(float(np.nanmax(wind_box)) if wind_box.size > 0 else np.nan)
-            
+            lat, lon = snap_to_grid(found_lat, found_lon, lats, lons)
         else:
             self.fails += 1
-            if self.fails > self.max_consecutive_fails:
+            if self.fails >= self.max_consecutive_fails:
                 self._mark_dissipated(time, f"Lost track for {self.fails} steps")
-            else:
-                # Extrapolate blindly to keep the track alive
-                self.tracked_times.append(time)
-                self.tracked_lats.append(guess_lat)
-                self.tracked_lons.append(guess_lon)
-                self.tracked_msls.append(np.nan)
-                self.tracked_winds.append(np.nan)
+                return
+
+            # Hold position near the last valid fix to avoid runaway drift and still sample fields.
+            lat, lon = snap_to_grid(self.tracked_lats[-1], self.tracked_lons[-1], lats, lons)
+
+        self.tracked_times.append(time)
+        self.tracked_lats.append(lat)
+        self.tracked_lons.append(lon)
+
+        lat_idx = int(np.abs(lats - lat).argmin())
+        lon_idx = int(np.abs(((lons + 360.0) % 360.0) - lon).argmin())
+
+        _, _, msl_box = get_box(msl, lats, lons, lat - 1.5, lat + 1.5, lon - 1.5, lon + 1.5)
+        _, _, wind_box = get_box(wind, lats, lons, lat - 1.5, lat + 1.5, lon - 1.5, lon + 1.5)
+
+        def _safe_min(arr: np.ndarray, fallback: float) -> float:
+            if arr.size == 0 or not np.isfinite(arr).any():
+                return float(fallback) if np.isfinite(fallback) else float("nan")
+            return float(np.nanmin(arr))
+
+        def _safe_max(arr: np.ndarray, fallback: float) -> float:
+            if arr.size == 0 or not np.isfinite(arr).any():
+                return float(fallback) if np.isfinite(fallback) else float("nan")
+            return float(np.nanmax(arr))
+
+        center_msl = float(msl[lat_idx, lon_idx]) if msl.ndim >= 2 else float(msl)
+        center_wind = float(wind[lat_idx, lon_idx]) if wind.ndim >= 2 else float(wind)
+
+        min_msl = _safe_min(msl_box, center_msl)
+        max_wind = _safe_max(wind_box, center_wind)
+
+        if np.isnan(self.tracked_msls[0]):
+            self.tracked_msls[0] = min_msl
+        if np.isnan(self.tracked_winds[0]):
+            self.tracked_winds[0] = max_wind
+
+        self.tracked_msls.append(min_msl)
+        self.tracked_winds.append(max_wind)
 
     def _check_structure(self, msl, lats, lons, lat, lon):
         """
@@ -179,9 +210,8 @@ class RobustTracker:
             # Fallback if grid is very coarse
             center_val = float(np.min(box))
 
-        # Check gradient
-        # Threshold: 2 hPa = 200 Pa
-        return (min_perimeter - center_val) > 200.0
+        # Check gradient relative to configured threshold (Pa)
+        return (min_perimeter - center_val) > self.gradient_threshold
 
     def _mark_dissipated(self, time, reason):
         self.dissipated = True

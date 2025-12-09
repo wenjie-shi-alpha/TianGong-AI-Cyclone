@@ -87,17 +87,53 @@ def get_closest_min(
 
 
 def extrapolate(lats: list[float], lons: list[float]) -> Tuple[float, float]:
-    """Linearly extrapolate the next position using up to the last eight points."""
+    """Linearly extrapolate the next position using up to the last eight points.
+
+    Longitudes are unwrapped to avoid spurious jumps across the 0/360 boundary.
+    """
     if len(lats) == 0:
         raise ValueError("Cannot extrapolate from empty lists.")
     if len(lats) == 1:
         return lats[0], lons[0]
-    lats_recent = lats[-8:]
-    lons_recent = lons[-8:]
+
+    lats_recent = np.asarray(lats[-8:], dtype=float)
+    lons_recent = np.asarray(lons[-8:], dtype=float)
+
+    # Unwrap longitudes in radians, then fit in degrees to keep continuity
+    lons_unwrapped = np.rad2deg(np.unwrap(np.deg2rad(lons_recent)))
+
     n = len(lats_recent)
-    fit = np.polyfit(np.arange(n), np.stack((lats_recent, lons_recent), axis=-1), 1)
-    lat_pred, lon_pred = np.polyval(fit, n)
+    x = np.arange(n, dtype=float)
+    lat_fit = np.polyfit(x, lats_recent, 1)
+    lon_fit = np.polyfit(x, lons_unwrapped, 1)
+
+    lat_pred = np.polyval(lat_fit, n)
+    lon_pred = np.polyval(lon_fit, n)
+
+    # Wrap longitude back to [0, 360)
+    lon_pred = (lon_pred + 360.0) % 360.0
     return float(lat_pred), float(lon_pred)
 
 
-__all__ = ["get_box", "havdist", "get_closest_min", "extrapolate"]
+def snap_to_grid(lat: float, lon: float, lats: np.ndarray, lons: np.ndarray) -> Tuple[float, float]:
+    """Clamp a lat/lon pair to the nearest model grid point.
+
+    This prevents slow drift from repeated extrapolation steps by always
+    projecting back onto the discrete grid used by the underlying fields.
+    """
+
+    lat_arr = np.asarray(lats, dtype=float)
+    lon_arr = np.asarray(lons, dtype=float)
+
+    lon_norm = (lon + 360.0) % 360.0
+    lon_arr_norm = (lon_arr + 360.0) % 360.0
+
+    lat_idx = int(np.abs(lat_arr - lat).argmin())
+    lon_idx = int(np.abs(lon_arr_norm - lon_norm).argmin())
+
+    snapped_lat = float(lat_arr[lat_idx])
+    snapped_lon = float((lon_arr[lon_idx] + 360.0) % 360.0)
+    return snapped_lat, snapped_lon
+
+
+__all__ = ["get_box", "havdist", "get_closest_min", "extrapolate", "snap_to_grid"]

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from datetime import datetime, timedelta
 from typing import List, Optional
 
@@ -11,9 +12,13 @@ import pandas as pd
 
 from .batching import _SimpleBatch
 from .exceptions import NoEyeException
-from .geo import get_box, get_closest_min, extrapolate
+from .geo import get_box, get_closest_min, extrapolate, havdist, snap_to_grid
 
 logger = logging.getLogger(__name__)
+
+# Optional relaxed mode for weaker systems (e.g., EP/ATL lows). Enable by
+# setting environment variable RELAXED_TRACKING=1 when running the pipeline.
+_RELAXED = os.getenv("RELAXED_TRACKING", "0").lower() in {"1", "true", "yes"}
 
 
 class Tracker:
@@ -29,7 +34,9 @@ class Tracker:
     ) -> None:
         self.tracked_times: List[datetime] = [init_time]
         self.tracked_lats: List[float] = [init_lat]
-        self.tracked_lons: List[float] = [init_lon]
+        # Normalize longitude to [0, 360) to avoid wrap-induced extrapolation jumps
+        norm_init_lon = (init_lon + 360.0) % 360.0
+        self.tracked_lons: List[float] = [norm_init_lon]
         init_msl_val = float(init_msl) if init_msl is not None else np.nan
         init_wind_val = float(init_wind) if init_wind is not None else np.nan
         if not np.isfinite(init_msl_val):
@@ -45,10 +52,20 @@ class Tracker:
         self.dissipation_reason: Optional[str] = None
         self.peak_pressure_drop_hpa: float = 0.0
         self.peak_wind: float = 0.0
+        self._init_snapped: bool = False
+        self._fix_lats: List[float] = [self.tracked_lats[0]]
+        self._fix_lons: List[float] = [self.tracked_lons[0]]
+
+        # Relaxed thresholds extend tolerance for weak or messy systems.
+        self._max_consecutive_fails = 10 if not _RELAXED else 12
+        self._max_fail_hours = 24 if not _RELAXED else 36
+        self._min_drop_hpa = 0.5 if not _RELAXED else 0.3
+        self._min_drop_fraction = 0.2 if not _RELAXED else 0.1
+        self._max_step_km = 350.0 if not _RELAXED else 450.0
 
     def results(self) -> pd.DataFrame:
         """Assemble the current track as a DataFrame."""
-        return pd.DataFrame(
+        df = pd.DataFrame(
             {
                 "time": self.tracked_times,
                 "lat": self.tracked_lats,
@@ -57,6 +74,39 @@ class Tracker:
                 "wind": self.tracked_winds,
             }
         )
+
+        def _dlon(a: float, b: float) -> float:
+            diff = abs(a - b)
+            return min(diff, 360.0 - diff)
+
+        def _compute_stationary(frame: pd.DataFrame) -> list[bool]:
+            length = len(frame)
+            flags = [False] * length
+            if length < 2:
+                return flags
+            lat_vals = frame["lat"].to_numpy(dtype=float)
+            lon_vals = frame["lon"].to_numpy(dtype=float)
+            wind_vals = frame["wind"].to_numpy(dtype=float)
+            for idx in range(1, length):
+                still = abs(lat_vals[idx] - lat_vals[idx - 1]) < 0.05
+                still &= _dlon(lon_vals[idx], lon_vals[idx - 1]) < 0.05
+                wind_ok = (not np.isfinite(wind_vals[idx])) or wind_vals[idx] < 12.0
+                flags[idx] = bool(still and wind_ok)
+            return flags
+
+        # Prune trailing flat segments (little to no motion and weak winds) to avoid artificial plateaus.
+        if len(df) >= 5:
+            stationary = _compute_stationary(df)
+            cutoff = len(df)
+            while cutoff > 3:
+                if stationary[cutoff - 1]:
+                    cutoff -= 1
+                else:
+                    break
+            if cutoff < len(df):
+                df = df.iloc[:cutoff].reset_index(drop=True)
+
+        return df
 
     def step(self, batch: _SimpleBatch) -> None:
         """Advance the tracker by one time step using the provided batch."""
@@ -88,11 +138,29 @@ class Tracker:
         lons = np.array(batch.metadata.lon)
         time = batch.metadata.time[0]
 
-        lat, lon = extrapolate(self.tracked_lats, self.tracked_lons)
-        lat = max(min(lat, 90), -90)
-        lon = lon % 360
+        # Snap the initial catalog position onto the model grid once we know it.
+        if not self._init_snapped:
+            snapped_lat, snapped_lon = snap_to_grid(self.tracked_lats[0], self.tracked_lons[0], lats, lons)
+            self.tracked_lats[0] = snapped_lat
+            self.tracked_lons[0] = snapped_lon
+            self._fix_lats[0] = snapped_lat
+            self._fix_lons[0] = snapped_lon
+            self._init_snapped = True
 
-        def is_clear(lat_val: float, lon_val: float, delta: float) -> bool:
+        history_lats = self._fix_lats if self._fix_lats else self.tracked_lats
+        history_lons = self._fix_lons if self._fix_lons else self.tracked_lons
+        guess_lat, guess_lon = extrapolate(history_lats, history_lons)
+        guess_lat = max(min(guess_lat, 90), -90)
+        guess_lon = guess_lon % 360
+        lat, lon = guess_lat, guess_lon
+
+        def can_search(
+            lat_val: float,
+            lon_val: float,
+            delta: float,
+            allow_empty: bool,
+            max_land_fraction: float,
+        ) -> bool:
             _, _, lsm_box = get_box(
                 lsm,
                 lats,
@@ -103,34 +171,73 @@ class Tracker:
                 lon_val + delta,
             )
             if lsm_box.size == 0:
+                return allow_empty
+            lsm_vals = np.asarray(lsm_box, dtype=float)
+            if not np.isfinite(lsm_vals).any():
+                return True
+            lsm_vals = np.clip(np.nan_to_num(lsm_vals, nan=1.0), 0.0, 1.0)
+            land_fraction = float(np.mean(lsm_vals >= 0.8))
+            sea_fraction = float(np.mean(lsm_vals <= 0.2))
+            if sea_fraction <= 0 and not allow_empty:
                 return False
-            return lsm_box.max() < 0.5
+            return land_fraction <= max_land_fraction or sea_fraction >= 0.25
+
+        def build_search_radii() -> list[float]:
+            base = [5.0, 4.0, 3.0, 2.0, 1.5]
+            max_radius = min(5.0 + self.fails, 8.0)
+            extras: list[float] = []
+            current = max_radius
+            while current > 5.0 + 1e-6:
+                extras.append(current)
+                current -= 1.0
+            ordered = extras + base
+            seen: set[float] = set()
+            radii: list[float] = []
+            for val in ordered:
+                capped = max(1.5, min(val, max_radius))
+                key = round(capped, 2)
+                if key not in seen:
+                    radii.append(capped)
+                    seen.add(key)
+            return radii
 
         snap = False
-        for delta in [5, 4, 3, 2, 1.5]:
+        search_radii = build_search_radii()
+        for delta in search_radii:
             try:
-                if is_clear(lat, lon, delta):
+                if can_search(lat, lon, delta, allow_empty=False, max_land_fraction=0.6):
                     lat, lon = get_closest_min(msl, lats, lons, lat, lon, delta_lat=delta, delta_lon=delta)
                     snap = True
                     break
             except NoEyeException:
                 pass
 
+        if not snap:
+            for delta in search_radii:
+                try:
+                    if can_search(lat, lon, delta, allow_empty=True, max_land_fraction=0.95):
+                        lat, lon = get_closest_min(msl, lats, lons, lat, lon, delta_lat=delta, delta_lon=delta)
+                        snap = True
+                        break
+                except NoEyeException:
+                    pass
+
         if not snap and z700 is not None:
             try:
+                z_delta = search_radii[0] if search_radii else 5.0
                 lat, lon = get_closest_min(
                     z700,
                     lats,
                     lons,
                     lat,
                     lon,
-                    delta_lat=5,
-                    delta_lon=5,
+                    delta_lat=z_delta,
+                    delta_lon=z_delta,
                 )
                 snap = True
-                for delta in [5, 4, 3, 2, 1.5]:
+                for delta in search_radii:
                     try:
-                        if is_clear(lat, lon, delta):
+                        if can_search(lat, lon, delta, allow_empty=False, max_land_fraction=0.6):
                             lat, lon = get_closest_min(
                                 msl,
                                 lats,
@@ -143,8 +250,34 @@ class Tracker:
                             break
                     except NoEyeException:
                         pass
+                if snap:
+                    for delta in search_radii:
+                        try:
+                            if can_search(lat, lon, delta, allow_empty=True, max_land_fraction=0.95):
+                                lat, lon = get_closest_min(
+                                    msl,
+                                    lats,
+                                    lons,
+                                    lat,
+                                    lon,
+                                    delta_lat=delta,
+                                    delta_lon=delta,
+                                )
+                                break
+                        except NoEyeException:
+                            pass
             except NoEyeException:
                 pass
+
+        if snap and self._fix_lats:
+            prev_lat = self._fix_lats[-1]
+            prev_lon = self._fix_lons[-1]
+            step_distance = havdist(prev_lat, prev_lon, lat, lon)
+            if step_distance > self._max_step_km:
+                logger.debug(
+                    "Discarded jump of %.1f km (> %.1f km limit) between fixes", step_distance, self._max_step_km
+                )
+                snap = False
 
         if snap:
             self.fails = 0
@@ -156,14 +289,56 @@ class Tracker:
             else:
                 raise NoEyeException("Completely failed at the first step.")
 
+            if self.fails >= self._max_consecutive_fails:
+                self._mark_dissipated(time, f"连续{self.fails}次未找到中心，终止追踪")
+                return
+
+            # Use the last known good position to avoid runaway drift between steps.
+            lat = self._fix_lats[-1]
+            lon = self._fix_lons[-1]
+
+        # Always project the coordinate back onto the native grid to prevent off-grid drift.
+        lat, lon = snap_to_grid(lat, lon, lats, lons)
+
+        if snap:
+            self._fix_lats.append(lat)
+            self._fix_lons.append(lon)
+            if len(self._fix_lats) > 16:
+                del self._fix_lats[:-16]
+                del self._fix_lons[:-16]
+
         self.tracked_times.append(time)
         self.tracked_lats.append(lat)
         self.tracked_lons.append(lon)
 
+        lat_idx = int(np.abs(lats - lat).argmin())
+        lon_idx = int(np.abs(((lons + 360.0) % 360.0) - lon).argmin())
+
         _, _, msl_crop = get_box(msl, lats, lons, lat - 1.5, lat + 1.5, lon - 1.5, lon + 1.5)
         _, _, wind_crop = get_box(wind, lats, lons, lat - 1.5, lat + 1.5, lon - 1.5, lon + 1.5)
-        min_msl = float(np.nanmin(msl_crop))
-        max_wind = float(np.nanmax(wind_crop))
+
+        def _safe_min(arr: np.ndarray, fallback: float) -> float:
+            if arr.size == 0 or not np.isfinite(arr).any():
+                return float(fallback) if np.isfinite(fallback) else float("nan")
+            return float(np.nanmin(arr))
+
+        def _safe_max(arr: np.ndarray, fallback: float) -> float:
+            if arr.size == 0 or not np.isfinite(arr).any():
+                return float(fallback) if np.isfinite(fallback) else float("nan")
+            return float(np.nanmax(arr))
+
+        center_msl = float(msl[lat_idx, lon_idx]) if msl.ndim >= 2 else float(msl)
+        center_wind = float(wind[lat_idx, lon_idx]) if wind.ndim >= 2 else float(wind)
+
+        min_msl = _safe_min(msl_crop, center_msl)
+        max_wind = _safe_max(wind_crop, center_wind)
+
+        # Backfill the initial catalogue row so the first line is on-grid and has intensity.
+        if np.isnan(self.tracked_msls[0]):
+            self.tracked_msls[0] = min_msl
+        if np.isnan(self.tracked_winds[0]):
+            self.tracked_winds[0] = max_wind
+
         self.tracked_msls.append(min_msl)
         self.tracked_winds.append(max_wind)
 
@@ -235,22 +410,28 @@ class Tracker:
         if self.dissipated:
             return
 
-        if not snap and self.fails >= 3 and self.last_success_time is not None:
+        life_len = len(self.tracked_times)
+        # Do not declare dissipation in the first few steps; early fields can be noisy.
+        if life_len < 4:
+            return
+
+        if (not snap) and self.fails >= self._max_consecutive_fails and self.last_success_time is not None:
             duration = time - self.last_success_time
-            if duration >= timedelta(hours=18):
-                self._mark_dissipated(time, "连续追踪失败18小时")
+            if duration >= timedelta(hours=self._max_fail_hours):
+                self._mark_dissipated(time, f"连续追踪失败{self._max_fail_hours}小时")
                 return
 
+        # Require a minimal number of successful samples before evaluating structure-based dissipation.
+        if life_len < 10:
+            return
+
         if pressure_drop_hpa is not None:
-            if pressure_drop_hpa < 1.0:
-                self._mark_dissipated(time, "中心-外围压差低于1.0 hPa")
-                return
-            if self.peak_pressure_drop_hpa > 0 and pressure_drop_hpa < 0.25 * self.peak_pressure_drop_hpa:
-                self._mark_dissipated(time, "结构强度降至峰值的25%以下 (压差)")
+            if pressure_drop_hpa < self._min_drop_hpa:
+                self._mark_dissipated(time, f"中心-外围压差低于{self._min_drop_hpa:.1f} hPa")
                 return
         elif np.isfinite(max_wind) and self.peak_wind > 0:
-            if max_wind < 0.25 * self.peak_wind:
-                self._mark_dissipated(time, "结构强度降至峰值的25%以下 (10米风)")
+            if max_wind < self._min_drop_fraction * self.peak_wind:
+                self._mark_dissipated(time, "结构强度降至峰值的极小比例 (10米风)")
 
     def _mark_dissipated(self, time: datetime, reason: str) -> None:
         if self.dissipated:
@@ -259,5 +440,6 @@ class Tracker:
         self.dissipated_time = time
         self.dissipation_reason = reason
         logger.info("Cyclone dissipated at %s: %s", time, reason)
+        print(f"[TRACKER] Dissipated at {time} because: {reason}")
 
 __all__ = ["Tracker"]

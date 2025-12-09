@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from pathlib import Path
 from typing import Dict, List, Optional
 
@@ -15,6 +16,10 @@ from .dataset_adapter import _DsAdapter
 from .exceptions import NoEyeException
 from .initials import _select_initials_for_time
 from .tracker import Tracker
+from .robust_tracker import RobustTracker
+
+_RELAXED = os.getenv("RELAXED_TRACKING", "0").lower() in {"1", "true", "yes"}
+_DEFAULT_TIME_WINDOW_HOURS = 12 if _RELAXED else 6
 
 logger = logging.getLogger(__name__)
 
@@ -31,7 +36,7 @@ def track_file_with_initials(
     all_points: pd.DataFrame,
     output_dir: Path,
     max_storms: Optional[int] = None,
-    time_window_hours: int = 6,
+    time_window_hours: int = _DEFAULT_TIME_WINDOW_HOURS,
 ) -> List[Path]:
     """Track all storms within a NetCDF file and export results as CSV files."""
     ds = xr.open_dataset(nc_path)
@@ -58,6 +63,8 @@ def track_file_with_initials(
     count = 0
     time_cache: Dict[int, Dict[str, np.ndarray]] = {}
 
+    tracker_cls = RobustTracker if os.getenv("RELAXED_TRACKING", "0").lower() in {"1", "true", "yes"} else Tracker
+
     for _, row in initials.iterrows():
         if max_storms is not None and count >= max_storms:
             break
@@ -83,7 +90,7 @@ def track_file_with_initials(
         if init_msl is not None:
             init_msl *= 100.0  # catalogue provides hPa, tracker persists Pascals
 
-        tracker = Tracker(
+        tracker = tracker_cls(
             init_lat=init_lat,
             init_lon=init_lon,
             init_time=times[0],
