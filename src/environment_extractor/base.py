@@ -40,8 +40,17 @@ class BaseExtractor:
         # 保存配置
         self.enable_detailed_shape_analysis = enable_detailed_shape_analysis
         
-        # 保持原有初始化逻辑不变
-        self.ds = xr.open_dataset(forecast_data_path)
+        # 保持原有初始化逻辑不变；为避免大文件一次性载入内存，优先按需分块读取
+        open_kwargs: dict[str, object] = {"cache": False}
+        try:
+            import dask  # noqa: F401
+
+            open_kwargs["chunks"] = "auto"
+        except ImportError:
+            # dask 非必选，缺失时回退为常规打开方式
+            pass
+
+        self.ds = xr.open_dataset(forecast_data_path, **open_kwargs)
         try:
             p = Path(forecast_data_path)
             self.nc_filename = p.name
@@ -59,15 +68,10 @@ class BaseExtractor:
         self._coslat = np.cos(np.deg2rad(self.lat))
         self._coslat_safe = np.where(np.abs(self._coslat) < 1e-6, np.nan, self._coslat)
 
-        self._grad_cache: dict[int, tuple[np.ndarray, np.ndarray]] = {}
-
         def _raw_gradients(arr: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-            key = id(arr)
-            if key in self._grad_cache:
-                return self._grad_cache[key]
+            # 直接计算梯度，避免跨时间步缓存大量大数组导致内存膨胀
             gy = np.gradient(arr, axis=0)
             gx = np.gradient(arr, axis=1)
-            self._grad_cache[key] = (gy, gx)
             return gy, gx
 
         self._raw_gradients: Callable[[np.ndarray], tuple[np.ndarray, np.ndarray]] = _raw_gradients

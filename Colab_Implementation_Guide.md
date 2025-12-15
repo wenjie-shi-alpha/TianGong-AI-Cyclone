@@ -2,6 +2,22 @@
 
 本文档详细说明如何在 Google Colab 环境中，利用 `gs://weatherbench2/datasets/hres` 数据集实现气旋路径追踪和天气系统提取。
 
+## 0. Drive 挂载与数据持久化（强烈推荐）
+
+Colab 会话随时可能断开，因此建议**第一步**就把 Google Drive 挂载到 `/content/drive`，并把整个项目目录与 `colab_outputs` 持久化到 Drive。示例：
+
+```python
+from pathlib import Path
+from google.colab import drive
+drive.mount("/content/drive")
+
+PROJECT_PATH = Path("/content/drive/MyDrive/TianGong-AI-Cyclone")
+OUTPUT_ROOT = PROJECT_PATH / "colab_outputs"
+OUTPUT_ROOT.mkdir(parents=True, exist_ok=True)
+```
+
+这样追踪/提取生成的 CSV、JSON、NetCDF 子集都会实时写入 Drive，避免运行到一半掉线导致结果丢失。只有在明确不需要持久化时才可以把 `PROJECT_PATH` 切回 `/content/TianGong-AI-Cyclone`。
+
 ## 1. 环境准备
 
 在 Colab Notebook 中，首先需要安装必要的 Python 库以支持 Zarr 数据读取、GCS 访问以及项目依赖。
@@ -14,6 +30,7 @@
 此外，你需要将本项目代码上传至 Colab 或挂载 Google Drive，确保 Python path 包含 `src` 目录，以便导入现有的追踪和提取模块。
 
 ```python
+from pathlib import Path
 import sys
 import os
 from google.colab import drive
@@ -28,9 +45,12 @@ sys.path.append(os.path.join(PROJECT_PATH, 'src'))
 # 验证导入
 try:
     import initial_tracker
+    import environment_extractor
     print("项目模块导入成功")
-except ImportError:
-    print("请检查路径设置")
+    print("Tracker 来自:", Path(initial_tracker.__file__).resolve())
+    print("Extractor 来自:", Path(environment_extractor.__file__).resolve())
+except ImportError as exc:
+    raise RuntimeError("请确认 PROJECT_PATH 指向挂载的仓库并包含 src") from exc
 ```
 
 ## 2. 数据访问 (WeatherBench 2)
@@ -78,7 +98,7 @@ ds_adapted = ds_raw[list(rename_map.keys())].rename(rename_map)
 
 ## 3. 气旋追踪实现
 
-利用现有的 `initial_tracker` 包，我们可以构建一个在内存中处理 Zarr 数据的追踪流程，替代原有的基于 NetCDF 文件的流程。
+利用现有的 `initial_tracker` 包，我们可以构建一个在内存中处理 Zarr 数据的追踪流程，替代原有的基于 NetCDF 文件的流程。**不要在 Notebook 里重新实现追踪算法**；所有核心逻辑都应直接复用 `src/initial_tracker` 中的类和 helper，以保持与仓库版本一致。
 
 ### 3.1 核心组件
 
@@ -156,7 +176,7 @@ for _, storm in initials.iterrows():
 
 ## 4. 环境系统提取实现
 
-环境提取逻辑在 `src/environment_extractor` 中。原逻辑 (`TCEnvironmentalSystemsExtractor`) 设计为处理单个 NetCDF 文件。在 Colab + Zarr 环境下，建议进行如下调整：
+环境提取逻辑在 `src/environment_extractor` 中。原逻辑 (`TCEnvironmentalSystemsExtractor`) 设计为处理单个 NetCDF 文件。在 Colab + Zarr 环境下，建议进行如下调整，并保持所有调用来自 `environment_extractor` 包以避免与本地实现不一致：
 
 ### 4.1 调整策略
 
