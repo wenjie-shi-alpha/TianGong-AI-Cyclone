@@ -2,9 +2,19 @@
 
 本文档详细说明如何在 Google Colab 环境中，利用 `gs://weatherbench2/datasets/hres` 数据集实现气旋路径追踪和天气系统提取。
 
-## 0. Drive 挂载与数据持久化（强烈推荐）
+## 0. Drive 挂载与数据持久化（可选）
 
-Colab 会话随时可能断开，因此建议**第一步**就把 Google Drive 挂载到 `/content/drive`，并把整个项目目录与 `colab_outputs` 持久化到 Drive。示例：
+如果你已经在云端/HPC 上**手动克隆**了本项目，并且当前工作目录就在仓库根目录（包含 `src/`），可以直接把输出写到项目目录内（不使用 Google Drive 同步）：
+
+```python
+from pathlib import Path
+
+PROJECT_PATH = Path.cwd().resolve()
+OUTPUT_ROOT = PROJECT_PATH / "colab_outputs"
+OUTPUT_ROOT.mkdir(parents=True, exist_ok=True)
+```
+
+如果你是在 Google Colab 且担心会话断开导致丢数据，可以选择把 Google Drive 挂载到 `/content/drive`，并把整个项目目录与 `colab_outputs` 持久化到 Drive。示例：
 
 ```python
 from pathlib import Path
@@ -23,8 +33,10 @@ OUTPUT_ROOT.mkdir(parents=True, exist_ok=True)
 在 Colab Notebook 中，首先需要安装必要的 Python 库以支持 Zarr 数据读取、GCS 访问以及项目依赖。
 
 ```python
-# 安装依赖
-!pip install xarray[complete] zarr gcsfs pandas netCDF4
+# 安装项目依赖（在仓库根目录运行）
+!pip install -r requirements.txt
+# 额外依赖（用于 WeatherBench 2 + Zarr/GCS 访问）
+!pip install xarray[complete] zarr gcsfs google-cloud-storage tqdm
 ```
 
 此外，你需要将本项目代码上传至 Colab 或挂载 Google Drive，确保 Python path 包含 `src` 目录，以便导入现有的追踪和提取模块。
