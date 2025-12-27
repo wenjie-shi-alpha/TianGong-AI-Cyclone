@@ -1,5 +1,8 @@
 black
 boto3
+dask
+fsspec
+gcsfs
 h5netcdf
 netCDF4
 numpy
@@ -8,5 +11,6 @@ scipy
 scikit-image
 trackpy
 xarray
+zarr
 pytest
 earthengine-api

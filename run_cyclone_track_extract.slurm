@@ -150,6 +150,11 @@ NC_URLS_CSV="${NC_URLS_CSV:-$PROJECT_DIR/output/nc_file_urls_new.csv}"
 # 输入：初始点 CSV（matched_cyclone_tracks.csv）
 INITIALS_CSV="${INITIALS_CSV:-$PROJECT_DIR/input/matched_cyclone_tracks.csv}"
 
+# 选择流水线：
+# - s3_csv: 现有默认（NOAA 公共 S3 上的 NetCDF 列表 -> 下载 -> 追踪 -> 提取）
+# - wb2_hres: WeatherBench2 HRES (gs://weatherbench2/... Zarr) -> 子集下载为 NetCDF -> 追踪 -> 提取
+PIPELINE="${PIPELINE:-s3_csv}"
+
 # 并行进程数（默认=分配 CPU）
 PROCESSES="${PROCESSES:-${SLURM_CPUS_PER_TASK:-16}}"
 
@@ -172,6 +177,73 @@ mkdir -p "$OUTPUT_ROOT"
 cd "$OUTPUT_ROOT"
 
 mkdir -p inputs logs
+
+# === Pipeline: WeatherBench2 HRES ===
+if [[ "$PIPELINE" == "wb2_hres" ]]; then
+  HRES_DATASET_URL="${HRES_DATASET_URL:-gs://weatherbench2/datasets/hres/2016-2022-0012-1440x721.zarr}"
+  HRES_TRACKS_CSV="${HRES_TRACKS_CSV:-$PROJECT_DIR/input/matched_cyclone_tracks.csv}"
+  HRES_INITIALS_CSV="${HRES_INITIALS_CSV:-$HRES_TRACKS_CSV}"
+  HRES_CACHE_DIR="${HRES_CACHE_DIR:-$OUTPUT_ROOT/wb2_cache}"
+  HRES_STORM_ID="${HRES_STORM_ID:-}"                     # 指定单个 storm_id（可选）
+  HRES_LIMIT_STORMS="${HRES_LIMIT_STORMS:-0}"            # 处理多少个 storm（0=全量）
+  HRES_MAX_FORECASTS_PER_STORM="${HRES_MAX_FORECASTS_PER_STORM:-0}"  # 0=不限
+  HRES_MAX_STEPS="${HRES_MAX_STEPS:-40}"                 # 6h/步
+
+  if [[ ! -f "$HRES_TRACKS_CSV" ]]; then
+    echo "❌ HRES_TRACKS_CSV 不存在: $HRES_TRACKS_CSV"
+    exit 2
+  fi
+  if [[ ! -f "$HRES_INITIALS_CSV" ]]; then
+    echo "❌ HRES_INITIALS_CSV 不存在: $HRES_INITIALS_CSV"
+    exit 2
+  fi
+
+  cp -f "$HRES_TRACKS_CSV" "inputs/$(basename "$HRES_TRACKS_CSV")"
+  if [[ "$(basename "$HRES_INITIALS_CSV")" != "$(basename "$HRES_TRACKS_CSV")" ]]; then
+    cp -f "$HRES_INITIALS_CSV" "inputs/$(basename "$HRES_INITIALS_CSV")"
+  fi
+
+  HRES_TRACKS_LOCAL="inputs/$(basename "$HRES_TRACKS_CSV")"
+  HRES_INITIALS_LOCAL="inputs/$(basename "$HRES_INITIALS_CSV")"
+
+  cmd=(python3 -u "$PROJECT_DIR/src/wb2_hres_pipeline.py"
+    --dataset-url "$HRES_DATASET_URL"
+    --tracks-csv "$HRES_TRACKS_LOCAL"
+    --initials-csv "$HRES_INITIALS_LOCAL"
+    --output-root "."
+    --cache-dir "$HRES_CACHE_DIR"
+    --processes "$PROCESSES"
+    --max-forecasts-per-storm "$HRES_MAX_FORECASTS_PER_STORM"
+    --max-steps "$HRES_MAX_STEPS"
+  )
+
+  if [[ -n "$HRES_STORM_ID" ]]; then
+    cmd+=(--storm-id "$HRES_STORM_ID")
+  fi
+  if [[ "$HRES_LIMIT_STORMS" != "0" && -n "$HRES_LIMIT_STORMS" ]]; then
+    cmd+=(--limit-storms "$HRES_LIMIT_STORMS")
+  fi
+  if [[ "$CONCISE_LOG" == "1" ]]; then
+    cmd+=(--concise-log 1)
+  fi
+  if [[ "$KEEP_NC" == "1" ]]; then
+    cmd+=(--keep-nc 1)
+  fi
+
+  echo "=== Running WB2 HRES pipeline ==="
+  printf '  %q' "${ENV_RUNNER[@]}" "${cmd[@]}"
+  echo
+
+  set +e
+  "${ENV_RUNNER[@]}" "${cmd[@]}" 2>&1 | tee -a "logs/run_${SLURM_JOB_ID}_wb2_hres.log"
+  status=${PIPESTATUS[0]}
+  set -e
+
+  echo "=== Pipeline exit code: $status ==="
+  echo "=== Job finished at $(date) ==="
+  exit "$status"
+fi
+
 if [[ ! -f "$NC_URLS_CSV" ]]; then
   echo "❌ NC_URLS_CSV 不存在: $NC_URLS_CSV"
   exit 2
