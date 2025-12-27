@@ -14,35 +14,93 @@
 set -euo pipefail
 
 # === 环境（参考 build_wildfire_hazard.slurm）===
-# Stanford HPC 常见：module load mamba，然后用 mamba run 进入环境
-module load mamba
+# 有些集群提供 `mamba` module；也有集群只提供 `conda/miniconda/anaconda`。
+# 这里尽量加载常见 module，但不会因为缺少某个 module 而直接失败。
+if ! command -v module >/dev/null 2>&1; then
+  if [[ -f /etc/profile.d/modules.sh ]]; then
+    # shellcheck source=/etc/profile.d/modules.sh
+    source /etc/profile.d/modules.sh
+  elif [[ -f /usr/share/Modules/init/bash ]]; then
+    # shellcheck source=/usr/share/Modules/init/bash
+    source /usr/share/Modules/init/bash
+  fi
+fi
+
+if command -v module >/dev/null 2>&1; then
+  for mod in mamba micromamba miniconda3 anaconda3 miniforge3 mambaforge; do
+    if module --ignore_cache load "$mod" >/dev/null 2>&1 || module load "$mod" >/dev/null 2>&1; then
+      echo "Loaded module: $mod"
+      break
+    fi
+  done
+fi
 
 echo "=== Job started on $(hostname) at $(date) ==="
 echo "SLURM_JOB_ID=${SLURM_JOB_ID:-}"
 echo "SLURM_CPUS_PER_TASK=${SLURM_CPUS_PER_TASK:-}"
 echo "SLURM_MEM_PER_NODE=${SLURM_MEM_PER_NODE:-}"
+echo "SCRIPT_FILE=${BASH_SOURCE[0]}"
+command -v sha1sum >/dev/null 2>&1 && echo "SCRIPT_SHA1=$(sha1sum "${BASH_SOURCE[0]}" | awk '{print $1}')" || true
 command -v mamba >/dev/null 2>&1 && echo "mamba: $(command -v mamba)" || true
+command -v conda >/dev/null 2>&1 && echo "conda: $(command -v conda)" || true
+command -v micromamba >/dev/null 2>&1 && echo "micromamba: $(command -v micromamba)" || true
 
 # 多 NC/并发下载时可能触发 “too many open files”
 ulimit -n 4096 2>/dev/null || true
 
 # === 目录结构适配 ===
-# 你的目录结构（截图）：slurm 脚本放在父目录，项目在 TianGong-AI-Cyclone/ 内。
-# 这里自动根据脚本位置推断 PROJECT_DIR；也支持 sbatch --export=PROJECT_DIR=... 手工覆盖。
+# Open OnDemand/Job Composer 会把脚本复制到 OOD 的 job 目录执行（如 ~/ondemand/.../myjobs/...）。
+# 因此不能假设脚本所在目录就是项目根目录。这里按一组常见候选路径自动定位项目根目录；
+# 也支持在提交时显式设置 PROJECT_DIR（推荐）。
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-if [[ -z "${PROJECT_DIR:-}" ]]; then
-  if [[ -d "$SCRIPT_DIR/src" && -f "$SCRIPT_DIR/requirements.txt" ]]; then
-    PROJECT_DIR="$SCRIPT_DIR"
-  elif [[ -d "$SCRIPT_DIR/TianGong-AI-Cyclone/src" && -f "$SCRIPT_DIR/TianGong-AI-Cyclone/requirements.txt" ]]; then
-    PROJECT_DIR="$SCRIPT_DIR/TianGong-AI-Cyclone"
-  else
-    PROJECT_DIR="$HOME/TianGong-AI-Cyclone"
-  fi
+USER_PROJECT_DIR="${PROJECT_DIR:-}"
+if [[ -n "$USER_PROJECT_DIR" && -d "$USER_PROJECT_DIR" ]]; then
+  USER_PROJECT_DIR="$(cd "$USER_PROJECT_DIR" && pwd)"
 fi
 
-if [[ ! -d "$PROJECT_DIR/src" ]]; then
-  echo "❌ 未找到项目目录（缺少 src/）：PROJECT_DIR=$PROJECT_DIR"
-  echo "   你可以通过 sbatch --export=PROJECT_DIR=/path/to/TianGong-AI-Cyclone 指定。"
+PROJECT_DIR=""
+declare -a CANDIDATES=()
+if [[ -n "$USER_PROJECT_DIR" ]]; then
+  CANDIDATES+=("$USER_PROJECT_DIR")
+fi
+if [[ -n "${SLURM_SUBMIT_DIR:-}" ]]; then
+  CANDIDATES+=("${SLURM_SUBMIT_DIR}" "${SLURM_SUBMIT_DIR}/TianGong-AI-Cyclone")
+fi
+CANDIDATES+=(
+  "$SCRIPT_DIR"
+  "$SCRIPT_DIR/TianGong-AI-Cyclone"
+  "$PWD"
+  "$PWD/TianGong-AI-Cyclone"
+  "$HOME/TianGong-AI-Cyclone"
+  "/scratch/users/${USER}/TianGong-AI-Cyclone"
+  "/scratch/${USER}/TianGong-AI-Cyclone"
+)
+
+for cand in "${CANDIDATES[@]}"; do
+  [[ -z "$cand" ]] && continue
+  if [[ -d "$cand/src" && -f "$cand/requirements.txt" ]]; then
+    PROJECT_DIR="$cand"
+    break
+  fi
+done
+
+if [[ -z "$PROJECT_DIR" || ! -d "$PROJECT_DIR/src" ]]; then
+  echo "❌ 未找到项目目录（需要包含 src/ 和 requirements.txt）。"
+  echo "   SCRIPT_DIR=$SCRIPT_DIR"
+  echo "   PWD=$PWD"
+  echo "   SLURM_SUBMIT_DIR=${SLURM_SUBMIT_DIR:-}"
+  echo "   尝试过的候选路径："
+  for cand in "${CANDIDATES[@]}"; do
+    [[ -z "$cand" ]] && continue
+    if [[ -d "$cand" ]]; then
+      echo "     - $cand (exists)"
+    else
+      echo "     - $cand"
+    fi
+  done
+  echo "   解决：在提交时设置 PROJECT_DIR，例如："
+  echo "     export PROJECT_DIR=/scratch/users/${USER}/TianGong-AI-Cyclone"
+  echo "     # 或 sbatch --export=PROJECT_DIR=/scratch/users/${USER}/TianGong-AI-Cyclone run_cyclone_track_extract.slurm"
   exit 2
 fi
 
@@ -53,6 +111,38 @@ OUTPUT_ROOT="${OUTPUT_ROOT:-$PROJECT_DIR/colab_outputs}"
 
 # mamba/conda 环境名（需包含 requirements.txt 里的依赖）
 ENV_NAME="${ENV_NAME:-tianGong_cyclone}"
+
+# 选择环境运行器：
+# 你当前报错的 prefix 位于 ~/.local/share/mamba/envs/，这通常是 micromamba 的默认根目录；
+# 即使你在 ~/miniforge3 里用 conda 创建过环境，mamba/micromamba 仍可能因为 root prefix 不一致而找不到。
+# 为了避免这个坑，这里默认直接用 `conda run`（最符合你“能 conda activate”的现实情况）。
+ENV_RUNNER=()
+
+# 可选：强制指定 runner（二选一：conda/mamba/micromamba）
+FORCE_RUNNER="${FORCE_RUNNER:-}"
+if [[ -n "$FORCE_RUNNER" ]]; then
+  case "$FORCE_RUNNER" in
+    conda) ENV_RUNNER=(conda run -n "$ENV_NAME") ;;
+    mamba) ENV_RUNNER=(mamba run -n "$ENV_NAME") ;;
+    micromamba) ENV_RUNNER=(micromamba run -n "$ENV_NAME") ;;
+    *)
+      echo "❌ FORCE_RUNNER=$FORCE_RUNNER 不支持（仅 conda/mamba/micromamba）"
+      exit 2
+      ;;
+  esac
+elif command -v conda >/dev/null 2>&1; then
+  ENV_RUNNER=(conda run -n "$ENV_NAME")
+elif command -v mamba >/dev/null 2>&1; then
+  ENV_RUNNER=(mamba run -n "$ENV_NAME")
+elif command -v micromamba >/dev/null 2>&1; then
+  ENV_RUNNER=(micromamba run -n "$ENV_NAME")
+else
+  echo "❌ 未找到 conda/mamba/micromamba，无法进入 Python 环境：$ENV_NAME"
+  echo "   解决：module load (mini)conda/anaconda/miniforge，或把 conda 加入 PATH。"
+  exit 2
+fi
+
+echo "ENV_RUNNER=${ENV_RUNNER[*]}"
 
 # 输入：NC URL 列表 CSV（含 s3_url）
 NC_URLS_CSV="${NC_URLS_CSV:-$PROJECT_DIR/output/nc_file_urls_new.csv}"
@@ -108,7 +198,7 @@ echo "AUTO_TRACK=$AUTO_TRACK CONCISE_LOG=$CONCISE_LOG KEEP_NC=$KEEP_NC"
 
 echo "=== Preflight: 统计将处理/跳过的条目 ==="
 TODO_COUNT="$(
-mamba run -n "$ENV_NAME" python3 - "$NC_URLS_LOCAL" "$LIMIT" <<'PY'
+"${ENV_RUNNER[@]}" python3 - "$NC_URLS_LOCAL" "$LIMIT" <<'PY'
 from __future__ import annotations
 
 from pathlib import Path
@@ -183,12 +273,12 @@ if [[ "$KEEP_NC" == "1" ]]; then
 fi
 
 echo "=== Running command ==="
-printf '  %q' mamba run -n "$ENV_NAME" "${cmd[@]}"
+printf '  %q' "${ENV_RUNNER[@]}" "${cmd[@]}"
 echo
 
 # 同时写入日志文件，便于 tail -f
 set +e
-mamba run -n "$ENV_NAME" "${cmd[@]}" 2>&1 | tee -a "logs/run_${SLURM_JOB_ID}.log"
+"${ENV_RUNNER[@]}" "${cmd[@]}" 2>&1 | tee -a "logs/run_${SLURM_JOB_ID}.log"
 status=${PIPESTATUS[0]}
 set -e
 

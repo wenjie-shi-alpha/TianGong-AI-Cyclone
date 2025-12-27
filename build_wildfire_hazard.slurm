@@ -12,7 +12,24 @@
 #SBATCH --mail-user=ziqianx@stanford.edu
 
 # === 环境 ===
-module load mamba
+if ! command -v module >/dev/null 2>&1; then
+  if [[ -f /etc/profile.d/modules.sh ]]; then
+    # shellcheck source=/etc/profile.d/modules.sh
+    source /etc/profile.d/modules.sh
+  elif [[ -f /usr/share/Modules/init/bash ]]; then
+    # shellcheck source=/usr/share/Modules/init/bash
+    source /usr/share/Modules/init/bash
+  fi
+fi
+
+if command -v module >/dev/null 2>&1; then
+  for mod in mamba micromamba miniconda3 anaconda3 miniforge3 mambaforge; do
+    if module --ignore_cache load "$mod" >/dev/null 2>&1 || module load "$mod" >/dev/null 2>&1; then
+      echo "Loaded module: $mod"
+      break
+    fi
+  done
+fi
 
 echo "=== Job started on $(hostname) at $(date) ==="
 
@@ -23,7 +40,20 @@ cd $WORKDIR
 DATA_PATH=/scratch/users/ziqianx/fire_archive_M-C61_680419.csv
 
 # === 使用 mamba run 运行 Python 脚本 ===
-mamba run -n climada_env python3 <<'PYCODE'
+ENV_NAME="${ENV_NAME:-climada_env}"
+ENV_RUNNER=()
+if command -v mamba >/dev/null 2>&1; then
+  ENV_RUNNER=(mamba run -n "$ENV_NAME")
+elif command -v conda >/dev/null 2>&1; then
+  ENV_RUNNER=(conda run -n "$ENV_NAME")
+elif command -v micromamba >/dev/null 2>&1; then
+  ENV_RUNNER=(micromamba run -n "$ENV_NAME")
+else
+  echo "❌ 未找到 mamba/conda/micromamba，无法进入 Python 环境：$ENV_NAME"
+  exit 2
+fi
+
+"${ENV_RUNNER[@]}" python3 <<'PYCODE'
 
 import pandas as pd
 import numpy as np
