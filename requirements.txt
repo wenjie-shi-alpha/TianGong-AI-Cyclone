@@ -1,6 +1,10 @@
 black
 boto3
+cdsapi
 dask
+ecmwf-api-client
+eccodes
+cfgrib
 fsspec
 gcsfs
 h5netcdf
@@ -9,6 +13,8 @@ numpy
 pandas
 scipy
 scikit-image
+s3fs
+tenacity
 trackpy
 xarray
 zarr

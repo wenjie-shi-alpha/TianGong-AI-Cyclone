@@ -88,7 +88,20 @@ class BaseExtractor:
         )
 
         self.tc_tracks = pd.read_csv(tc_tracks_path)
-        self.tc_tracks["time"] = pd.to_datetime(self.tc_tracks["time"])
+        has_time_column = "time" in self.tc_tracks.columns
+        if has_time_column:
+            self.tc_tracks["time"] = pd.to_datetime(
+                self.tc_tracks["time"], errors="coerce", utc=True
+            )
+        else:
+            self.tc_tracks["time"] = pd.NaT
+
+        ds_times = (
+            pd.to_datetime(self.ds.time.values, utc=True)
+            if "time" in self.ds.coords
+            else pd.DatetimeIndex([])
+        )
+        self._align_track_times_with_dataset(ds_times, has_time_column)
 
         print(f"📊 加载{len(self.tc_tracks)}个热带气旋路径点")
         print(
@@ -155,6 +168,48 @@ class BaseExtractor:
         lat_mask = (self.lat >= center_lat - radius_deg) & (self.lat <= center_lat + radius_deg)
         lon_mask = (self.lon >= center_lon - radius_deg) & (self.lon <= center_lon + radius_deg)
         return np.outer(lat_mask, lon_mask)
+
+    def _align_track_times_with_dataset(self, ds_times, has_time_column: bool) -> None:
+        """Align track rows to the dataset time axis and ensure ``time_idx`` is usable."""
+
+        if has_time_column and len(ds_times) > 0:
+            ds_values = ds_times.view("int64")
+            if len(ds_values) > 1:
+                diffs = np.diff(ds_values)
+                approx_step = pd.to_timedelta(np.median(np.abs(diffs)), unit="ns")
+            else:
+                approx_step = pd.Timedelta(hours=6)
+            tolerance = approx_step / 2 + pd.Timedelta(minutes=5)
+            tolerance = max(tolerance, pd.Timedelta(minutes=15))
+
+            def nearest_idx(ts: pd.Timestamp) -> int | None:
+                if pd.isna(ts):
+                    return None
+                deltas = np.abs(ds_values - ts.value)
+                idx = int(np.argmin(deltas))
+                delta_ns = abs(ds_values[idx] - ts.value)
+                if pd.to_timedelta(delta_ns, unit="ns") > tolerance:
+                    return None
+                return idx
+
+            idx_series = self.tc_tracks["time"].apply(nearest_idx)
+            invalid = idx_series.isna()
+            if invalid.any():
+                print(
+                    f"⚠️ 有 {invalid.sum()} 个轨迹时间点未能在 NC 时间轴 ±{tolerance} 内匹配，已忽略"
+                )
+            self.tc_tracks = self.tc_tracks.loc[~invalid].copy()
+            if self.tc_tracks.empty:
+                raise ValueError("轨迹文件中的时间点无法与NC时间轴匹配")
+            self.tc_tracks["time_idx"] = idx_series.loc[~invalid].astype(int).to_numpy()
+        elif "time_idx" in self.tc_tracks.columns:
+            self.tc_tracks["time_idx"] = (
+                pd.to_numeric(self.tc_tracks["time_idx"], errors="coerce")
+                .fillna(0)
+                .astype(int)
+            )
+        else:
+            self.tc_tracks["time_idx"] = np.arange(len(self.tc_tracks))
 
     # --- 数据访存 ---
 

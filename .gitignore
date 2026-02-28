@@ -156,3 +156,8 @@ preprocessed_data/
 generated_data/
 dataprepare/
 docs/
+compare_data/
+.cdsapirc
+.ecmwfapirc
+cdsapirc.txt
+ecmwfapirc.txt

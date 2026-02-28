@@ -62,8 +62,23 @@ def track_file_with_initials(
     written: List[Path] = []
     count = 0
     time_cache: Dict[int, Dict[str, np.ndarray]] = {}
+    ds_times_utc = pd.to_datetime(pd.Index(times), errors="coerce", utc=True)
+    ds_time_values = (
+        ds_times_utc.view("int64")
+        if len(ds_times_utc) > 0
+        else np.array([], dtype="int64")
+    )
 
     tracker_cls = RobustTracker if os.getenv("RELAXED_TRACKING", "0").lower() in {"1", "true", "yes"} else Tracker
+
+    def _nearest_time_idx(ts: object) -> int:
+        if len(ds_time_values) == 0:
+            return 0
+        parsed = pd.to_datetime(ts, errors="coerce", utc=True)
+        if pd.isna(parsed):
+            return 0
+        deltas = np.abs(ds_time_values - parsed.value)
+        return int(np.argmin(deltas))
 
     for _, row in initials.iterrows():
         if max_storms is not None and count >= max_storms:
@@ -153,6 +168,15 @@ def track_file_with_initials(
         out_df = tracker.results()
         if len(out_df) <= 1:
             continue
+
+        out_df["particle"] = storm_id
+        out_df["storm_id"] = storm_id
+        if "time" in out_df.columns:
+            out_df["time_idx"] = (
+                out_df["time"].apply(_nearest_time_idx).astype(int)
+            )
+        else:
+            out_df["time_idx"] = np.arange(len(out_df), dtype=int)
 
         output_dir.mkdir(parents=True, exist_ok=True)
         stem = nc_path.stem
