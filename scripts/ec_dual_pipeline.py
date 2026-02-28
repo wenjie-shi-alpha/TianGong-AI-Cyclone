@@ -27,6 +27,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 import boto3
+import numpy as np
 import pandas as pd
 from botocore import UNSIGNED
 from botocore.config import Config
@@ -42,6 +43,10 @@ if str(SRC_DIR) not in sys.path:
 AWS_SOURCE = "aws_open_data"
 TIGGE_SOURCE = "tigge_webapi"
 S3_BUCKET = "ecmwf-forecasts"
+REQUIRED_PRESSURE_LEVELS = [1000, 925, 850, 700, 500, 300, 200]
+TIGGE_SURFACE_PARAM_CODES = "151/165/166/34/167"  # msl, 10u, 10v, sst, 2t
+TIGGE_PRESSURE_PARAM_CODES = "129/130/131/132"  # z, t, u, v
+TIGGE_VERTICAL_VELOCITY_PARAM_CODES = "135"  # w (optional)
 
 
 @dataclass
@@ -58,6 +63,7 @@ class PipelineConfig:
     mp_context: str
     cleanup_intermediates_before_run: bool
     keep_failed_artifacts: bool
+    ignore_state: bool
     max_jobs: int | None
 
     @property
@@ -188,17 +194,83 @@ def _to_step_expr(steps: list[int]) -> str:
     return f"{steps[0]}/to/{steps[-1]}/by/{delta}"
 
 
+def _subset_pressure_levels(ds: "Any", wanted_levels: list[int]) -> "Any":
+    for level_dim in ["isobaricInhPa", "level", "pressure"]:
+        if level_dim not in ds.coords:
+            continue
+        try:
+            raw_vals = np.asarray(ds[level_dim].values, dtype=float)
+        except Exception:
+            continue
+
+        if raw_vals.size == 0:
+            continue
+
+        # normalize unit to hPa for matching; if values look like Pa then divide by 100
+        vals_hpa = raw_vals / 100.0 if np.nanmax(raw_vals) > 2000 else raw_vals
+        keep_native: list[float] = []
+        for target in wanted_levels:
+            idx = int(np.nanargmin(np.abs(vals_hpa - float(target))))
+            if abs(float(vals_hpa[idx]) - float(target)) <= 5.0:
+                keep_native.append(float(raw_vals[idx]))
+
+        if not keep_native:
+            continue
+
+        unique_keep = sorted(set(keep_native))
+        try:
+            return ds.sel({level_dim: unique_keep})
+        except Exception:
+            continue
+    return ds
+
+
+def _normalize_forecast_time(ds: "Any") -> "Any":
+    if "step" in ds.dims:
+        if "valid_time" in ds.coords:
+            valid_times = pd.DatetimeIndex(ds["valid_time"].values)
+        else:
+            base_raw = ds["time"].values
+            base = pd.Timestamp(base_raw.ravel()[0] if hasattr(base_raw, "ravel") else base_raw)
+            valid_times = pd.DatetimeIndex([base + pd.Timedelta(s) for s in ds["step"].values])
+
+        ds = ds.drop_vars("time", errors="ignore")
+        if "valid_time" not in ds.coords:
+            ds = ds.assign_coords(valid_time=("step", valid_times))
+        ds = ds.swap_dims({"step": "valid_time"})
+        ds = ds.drop_vars("step", errors="ignore")
+        ds = ds.rename({"valid_time": "time"})
+    elif "time" not in ds.dims:
+        ds = ds.expand_dims("time")
+    return ds
+
+
 def _convert_grib_to_nc(grib_path: Path, nc_path: Path) -> None:
     import xarray as xr
 
     datasets = []
-    for short_name in ["msl", "10u", "10v", "sst"]:
+    filters: list[tuple[dict[str, str], list[int] | None]] = [
+        ({"shortName": "msl"}, None),
+        ({"shortName": "10u"}, None),
+        ({"shortName": "10v"}, None),
+        ({"shortName": "sst"}, None),
+        ({"shortName": "2t"}, None),
+        ({"shortName": "u", "typeOfLevel": "isobaricInhPa"}, REQUIRED_PRESSURE_LEVELS),
+        ({"shortName": "v", "typeOfLevel": "isobaricInhPa"}, REQUIRED_PRESSURE_LEVELS),
+        ({"shortName": "z", "typeOfLevel": "isobaricInhPa"}, REQUIRED_PRESSURE_LEVELS),
+        ({"shortName": "t", "typeOfLevel": "isobaricInhPa"}, REQUIRED_PRESSURE_LEVELS),
+        ({"shortName": "w", "typeOfLevel": "isobaricInhPa"}, [700]),
+    ]
+
+    for filter_keys, wanted_levels in filters:
         try:
             ds = xr.open_dataset(
                 grib_path,
                 engine="cfgrib",
-                backend_kwargs={"filter_by_keys": {"shortName": short_name}, "indexpath": ""},
+                backend_kwargs={"filter_by_keys": filter_keys, "indexpath": ""},
             )
+            if wanted_levels is not None:
+                ds = _subset_pressure_levels(ds, wanted_levels)
             datasets.append(ds)
         except Exception:
             continue
@@ -218,23 +290,32 @@ def _convert_grib_to_nc(grib_path: Path, nc_path: Path) -> None:
     if rename_map:
         ds_merged = ds_merged.rename(rename_map)
 
-    if "step" in ds_merged.dims:
-        if "valid_time" in ds_merged.coords:
-            valid_times = pd.DatetimeIndex(ds_merged.valid_time.values)
-        else:
-            base = pd.Timestamp(ds_merged.time.values)
-            valid_times = pd.DatetimeIndex([base + pd.Timedelta(s) for s in ds_merged.step.values])
+    ds_merged = _normalize_forecast_time(ds_merged)
+    if "time" in ds_merged.coords:
+        ds_merged = ds_merged.sortby("time")
 
-        ds_merged = ds_merged.drop_vars("time", errors="ignore")
-        if "valid_time" not in ds_merged.coords:
-            ds_merged = ds_merged.assign_coords(valid_time=("step", valid_times))
-        ds_merged = ds_merged.swap_dims({"step": "valid_time"})
-        ds_merged = ds_merged.drop_vars("step", errors="ignore")
-        ds_merged = ds_merged.rename({"valid_time": "time"})
-    elif "time" not in ds_merged.dims:
-        ds_merged = ds_merged.expand_dims("time")
+    # ECMWF z is usually geopotential (m^2 s^-2); convert to gpm for consistency with thresholds.
+    if "z" in ds_merged.data_vars:
+        z_da = ds_merged["z"]
+        units = str(z_da.attrs.get("units", "")).lower()
+        try:
+            sample = float(np.nanmedian(np.abs(z_da.values)))
+        except Exception:
+            sample = np.nan
+        looks_like_geopotential = ("m**2" in units and "s**-2" in units) or ("m^2" in units and "s^-2" in units)
+        if looks_like_geopotential or (np.isfinite(sample) and sample > 15000):
+            ds_merged["z"] = z_da / 9.80665
+            ds_merged["z"].attrs.update(
+                {
+                    "units": "gpm",
+                    "original_units": units or "unknown",
+                    "note": "converted from geopotential by dividing 9.80665",
+                }
+            )
 
     ds_merged.to_netcdf(nc_path)
+    vars_short = ",".join(sorted(str(v) for v in ds_merged.data_vars))
+    logging.info("converted %s -> %s | vars=%s", grib_path.name, nc_path.name, vars_short)
     for ds in datasets:
         ds.close()
     ds_merged.close()
@@ -320,35 +401,97 @@ def _download_one_job_tigge(date_str: str, run_hour: int, nc_path: Path, grib_pa
         "class": "ti",
         "dataset": "tigge",
         "expver": "prod",
-        "levtype": "sfc",
         "origin": "ecmf",
         "type": "cf",
         "grid": "0.5/0.5",
-        "param": "151/165/166/34",
         "date": date_str,
         "time": f"{run_hour:02d}",
         "step": _to_step_expr(steps),
     }
 
     server = ECMWFDataServer()
-    tmp_nc = nc_path.with_suffix(".tmp.nc")
-    tmp_grib = grib_path.with_suffix(".tmp.grib")
-    try:
-        req_nc = {**request_common, "format": "netcdf", "target": str(tmp_nc)}
-        server.retrieve(req_nc)
-        if not tmp_nc.exists() or tmp_nc.stat().st_size == 0:
-            raise RuntimeError("empty netcdf from TIGGE")
-        tmp_nc.replace(nc_path)
-        return
-    except Exception:
-        _cleanup_file(tmp_nc)
+    tmp_sfc = grib_path.with_suffix(".tmp.sfc.grib")
+    tmp_pl = grib_path.with_suffix(".tmp.pl.grib")
+    tmp_w = grib_path.with_suffix(".tmp.w.grib")
+    tmp_combined = grib_path.with_suffix(".tmp.grib")
 
-    req_grib = {**request_common, "target": str(tmp_grib)}
-    server.retrieve(req_grib)
-    if not tmp_grib.exists() or tmp_grib.stat().st_size == 0:
-        raise RuntimeError("empty grib from TIGGE")
-    tmp_grib.replace(grib_path)
-    _convert_grib_to_nc(grib_path, nc_path)
+    def _retrieve(request: dict[str, str], target: Path) -> None:
+        req = {**request, "target": str(target)}
+        server.retrieve(req)
+        if not target.exists() or target.stat().st_size == 0:
+            raise RuntimeError(f"empty TIGGE response: {target.name}")
+
+    pl_level_options = [
+        REQUIRED_PRESSURE_LEVELS,
+        [850, 700, 500, 300, 200],
+        [850, 700, 500, 200],
+    ]
+
+    try:
+        _retrieve(
+            {
+                **request_common,
+                "levtype": "sfc",
+                "param": TIGGE_SURFACE_PARAM_CODES,
+            },
+            tmp_sfc,
+        )
+
+        last_pl_error: Exception | None = None
+        pl_ok = False
+        for levels in pl_level_options:
+            _cleanup_file(tmp_pl)
+            try:
+                _retrieve(
+                    {
+                        **request_common,
+                        "levtype": "pl",
+                        "levelist": "/".join(str(v) for v in levels),
+                        "param": TIGGE_PRESSURE_PARAM_CODES,
+                    },
+                    tmp_pl,
+                )
+                pl_ok = True
+                break
+            except Exception as exc:
+                last_pl_error = exc
+                continue
+
+        if not pl_ok:
+            raise RuntimeError(f"TIGGE pressure-level retrieve failed: {last_pl_error}")
+
+        _cleanup_file(tmp_w)
+        try:
+            _retrieve(
+                {
+                    **request_common,
+                    "levtype": "pl",
+                    "levelist": "700",
+                    "param": TIGGE_VERTICAL_VELOCITY_PARAM_CODES,
+                },
+                tmp_w,
+            )
+        except Exception as exc:
+            logging.warning("optional TIGGE w@700 retrieve failed for %s_%02d: %s", date_str, run_hour, exc)
+            _cleanup_file(tmp_w)
+
+        with tmp_combined.open("wb") as fw:
+            for src in [tmp_sfc, tmp_pl, tmp_w]:
+                if not src.exists() or src.stat().st_size == 0:
+                    continue
+                with src.open("rb") as fr:
+                    shutil.copyfileobj(fr, fw)
+
+        if not tmp_combined.exists() or tmp_combined.stat().st_size == 0:
+            raise RuntimeError("empty merged grib from TIGGE")
+
+        tmp_combined.replace(grib_path)
+        _convert_grib_to_nc(grib_path, nc_path)
+    finally:
+        _cleanup_file(tmp_sfc)
+        _cleanup_file(tmp_pl)
+        _cleanup_file(tmp_w)
+        _cleanup_file(tmp_combined)
 
 
 def _run_single_job(date_str: str, run_hour: int, payload: dict[str, Any]) -> dict[str, Any]:
@@ -404,6 +547,16 @@ def _run_single_job(date_str: str, run_hour: int, payload: dict[str, Any]) -> di
         for track_csv in track_files:
             if not track_csv.exists():
                 continue
+
+            # Force refresh per storm output to avoid reusing stale cached JSON from older logic.
+            try:
+                track_df = pd.read_csv(track_csv, usecols=["particle"])
+                particle_ids = sorted(set(str(v) for v in track_df["particle"].dropna().tolist()))
+            except Exception:
+                particle_ids = []
+            for particle_id in particle_ids:
+                _cleanup_file(env_dir / f"{nc_path.stem}_TC_Analysis_{particle_id}.json")
+
             pre = {p.name for p in env_dir.glob("*.json")}
             with TCEnvironmentalSystemsExtractor(str(nc_path), str(track_csv)) as extractor:
                 extractor.analyze_and_export_as_json(output_dir=str(env_dir))
@@ -451,7 +604,11 @@ def _save_state(path: Path, done_set: set[str], failed_set: set[str]) -> None:
 
 def run_source(cfg: PipelineConfig) -> dict[str, Any]:
     _ensure_dirs(cfg.project_root)
-    done_set, failed_set = _load_state(cfg.state_file)
+    if cfg.ignore_state:
+        done_set, failed_set = set(), set()
+        print(f"[{cfg.source}] ignoring existing state file: {cfg.state_file}")
+    else:
+        done_set, failed_set = _load_state(cfg.state_file)
 
     if cfg.cleanup_intermediates_before_run:
         dirs = _ensure_dirs(cfg.project_root)
@@ -550,6 +707,7 @@ def main() -> None:
     parser.add_argument("--no-cleanup-intermediates-before-run", dest="cleanup", action="store_false")
     parser.set_defaults(cleanup=True)
     parser.add_argument("--keep-failed-artifacts", action="store_true")
+    parser.add_argument("--ignore-state", action="store_true")
     parser.add_argument("--max-jobs", type=int, default=None)
     args = parser.parse_args()
 
@@ -577,6 +735,7 @@ def main() -> None:
             mp_context=args.mp_context,
             cleanup_intermediates_before_run=bool(args.cleanup),
             keep_failed_artifacts=bool(args.keep_failed_artifacts),
+            ignore_state=bool(args.ignore_state),
             max_jobs=args.max_jobs,
         )
         summaries.append(run_source(cfg))

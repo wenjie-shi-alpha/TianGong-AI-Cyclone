@@ -169,6 +169,15 @@ def track_file_with_initials(
         if len(out_df) <= 1:
             continue
 
+        # Remove duplicated timestamps (init point + first step often overlap at t0).
+        if "time" in out_df.columns:
+            out_df["time"] = pd.to_datetime(out_df["time"], errors="coerce", utc=True)
+            out_df = out_df.dropna(subset=["time"]).copy()
+            out_df = out_df.sort_values("time").drop_duplicates(subset=["time"], keep="last").reset_index(drop=True)
+
+        if len(out_df) <= 1:
+            continue
+
         out_df["particle"] = storm_id
         out_df["storm_id"] = storm_id
         if "time" in out_df.columns:

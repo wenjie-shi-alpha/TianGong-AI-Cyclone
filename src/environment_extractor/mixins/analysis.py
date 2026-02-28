@@ -93,6 +93,14 @@ class AnalysisMixin:
                         "environmental_systems": environmental_systems,
                     }
                 )
+
+            non_empty_steps = sum(1 for item in event_data["time_series"] if item["environmental_systems"])
+            if event_data["time_series"] and non_empty_steps == 0:
+                print(
+                    f"⚠️ 事件 {tc_id} 的环境系统在全部 {len(event_data['time_series'])} 个时次均为空。"
+                    "通常表示输入NC缺少高空层变量(u/v/z/t/w)。"
+                )
+
             all_typhoon_events[str(tc_id)] = event_data
 
         for tc_id, data in all_typhoon_events.items():

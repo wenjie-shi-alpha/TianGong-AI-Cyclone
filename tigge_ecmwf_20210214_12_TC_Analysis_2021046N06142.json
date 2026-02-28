@@ -1,0 +1,426 @@
+{
+    "tc_id": "2021046N06142",
+    "analysis_time": "2026-02-28T14:54:11.893339",
+    "time_series": [
+        {
+            "time": "2021-02-14T12:00:00+00:00",
+            "time_idx": 0,
+            "tc_position": {
+                "lat": 5.9,
+                "lon": 141.60000000000002
+            },
+            "tc_intensity_hpa": null,
+            "environmental_systems": []
+        },
+        {
+            "time": "2021-02-14T12:00:00+00:00",
+            "time_idx": 0,
+            "tc_position": {
+                "lat": 4.0,
+                "lon": 141.5
+            },
+            "tc_intensity_hpa": null,
+            "environmental_systems": []
+        },
+        {
+            "time": "2021-02-14T18:00:00+00:00",
+            "time_idx": 1,
+            "tc_position": {
+                "lat": 4.0,
+                "lon": 141.5
+            },
+            "tc_intensity_hpa": null,
+            "environmental_systems": []
+        },
+        {
+            "time": "2021-02-15T00:00:00+00:00",
+            "time_idx": 2,
+            "tc_position": {
+                "lat": 6.029022462938023,
+                "lon": 140.58915125977364
+            },
+            "tc_intensity_hpa": null,
+            "environmental_systems": []
+        },
+        {
+            "time": "2021-02-15T06:00:00+00:00",
+            "time_idx": 3,
+            "tc_position": {
+                "lat": 6.097433473631964,
+                "lon": 140.52006588463462
+            },
+            "tc_intensity_hpa": null,
+            "environmental_systems": []
+        },
+        {
+            "time": "2021-02-15T12:00:00+00:00",
+            "time_idx": 4,
+            "tc_position": {
+                "lat": 6.840402991458216,
+                "lon": 140.14123086056838
+            },
+            "tc_intensity_hpa": null,
+            "environmental_systems": []
+        },
+        {
+            "time": "2021-02-15T18:00:00+00:00",
+            "time_idx": 5,
+            "tc_position": {
+                "lat": 6.706852002487845,
+                "lon": 138.45384210506995
+            },
+            "tc_intensity_hpa": null,
+            "environmental_systems": []
+        },
+        {
+            "time": "2021-02-16T00:00:00+00:00",
+            "time_idx": 6,
+            "tc_position": {
+                "lat": 7.0,
+                "lon": 137.5
+            },
+            "tc_intensity_hpa": null,
+            "environmental_systems": []
+        },
+        {
+            "time": "2021-02-16T06:00:00+00:00",
+            "time_idx": 7,
+            "tc_position": {
+                "lat": 7.414873181906016,
+                "lon": 136.41194337881052
+            },
+            "tc_intensity_hpa": null,
+            "environmental_systems": []
+        },
+        {
+            "time": "2021-02-16T12:00:00+00:00",
+            "time_idx": 8,
+            "tc_position": {
+                "lat": 7.339520179445344,
+                "lon": 135.00554914422264
+            },
+            "tc_intensity_hpa": null,
+            "environmental_systems": []
+        },
+        {
+            "time": "2021-02-16T18:00:00+00:00",
+            "time_idx": 9,
+            "tc_position": {
+                "lat": 7.133622701238867,
+                "lon": 134.08763278560116
+            },
+            "tc_intensity_hpa": null,
+            "environmental_systems": []
+        },
+        {
+            "time": "2021-02-17T00:00:00+00:00",
+            "time_idx": 10,
+            "tc_position": {
+                "lat": 7.5,
+                "lon": 132.5
+            },
+            "tc_intensity_hpa": null,
+            "environmental_systems": []
+        },
+        {
+            "time": "2021-02-17T06:00:00+00:00",
+            "time_idx": 11,
+            "tc_position": {
+                "lat": 8.434972573032306,
+                "lon": 132.32500956754689
+            },
+            "tc_intensity_hpa": null,
+            "environmental_systems": []
+        },
+        {
+            "time": "2021-02-17T12:00:00+00:00",
+            "time_idx": 12,
+            "tc_position": {
+                "lat": 7.502784151752565,
+                "lon": 130.62335933914346
+            },
+            "tc_intensity_hpa": null,
+            "environmental_systems": []
+        },
+        {
+            "time": "2021-02-17T18:00:00+00:00",
+            "time_idx": 13,
+            "tc_position": {
+                "lat": 7.67397985366722,
+                "lon": 130.8437681997102
+            },
+            "tc_intensity_hpa": null,
+            "environmental_systems": []
+        },
+        {
+            "time": "2021-02-18T00:00:00+00:00",
+            "time_idx": 14,
+            "tc_position": {
+                "lat": 7.092628319464726,
+                "lon": 129.57477486003813
+            },
+            "tc_intensity_hpa": null,
+            "environmental_systems": []
+        },
+        {
+            "time": "2021-02-18T06:00:00+00:00",
+            "time_idx": 15,
+            "tc_position": {
+                "lat": 6.5,
+                "lon": 129.5
+            },
+            "tc_intensity_hpa": null,
+            "environmental_systems": []
+        },
+        {
+            "time": "2021-02-18T12:00:00+00:00",
+            "time_idx": 16,
+            "tc_position": {
+                "lat": 5.5,
+                "lon": 129.0
+            },
+            "tc_intensity_hpa": null,
+            "environmental_systems": []
+        },
+        {
+            "time": "2021-02-18T18:00:00+00:00",
+            "time_idx": 17,
+            "tc_position": {
+                "lat": 5.63008936668262,
+                "lon": 128.38858617722985
+            },
+            "tc_intensity_hpa": null,
+            "environmental_systems": []
+        },
+        {
+            "time": "2021-02-19T00:00:00+00:00",
+            "time_idx": 18,
+            "tc_position": {
+                "lat": 5.304473025499077,
+                "lon": 127.858320275138
+            },
+            "tc_intensity_hpa": null,
+            "environmental_systems": []
+        },
+        {
+            "time": "2021-02-19T06:00:00+00:00",
+            "time_idx": 19,
+            "tc_position": {
+                "lat": 5.162537727132373,
+                "lon": 127.96648598706554
+            },
+            "tc_intensity_hpa": null,
+            "environmental_systems": []
+        },
+        {
+            "time": "2021-02-19T12:00:00+00:00",
+            "time_idx": 20,
+            "tc_position": {
+                "lat": 4.497454621066326,
+                "lon": 126.0323135087408
+            },
+            "tc_intensity_hpa": null,
+            "environmental_systems": []
+        },
+        {
+            "time": "2021-02-19T18:00:00+00:00",
+            "time_idx": 21,
+            "tc_position": {
+                "lat": 4.5,
+                "lon": 125.0
+            },
+            "tc_intensity_hpa": null,
+            "environmental_systems": []
+        },
+        {
+            "time": "2021-02-20T00:00:00+00:00",
+            "time_idx": 22,
+            "tc_position": {
+                "lat": 4.5,
+                "lon": 124.5
+            },
+            "tc_intensity_hpa": null,
+            "environmental_systems": []
+        },
+        {
+            "time": "2021-02-20T06:00:00+00:00",
+            "time_idx": 23,
+            "tc_position": {
+                "lat": 3.0,
+                "lon": 124.0
+            },
+            "tc_intensity_hpa": null,
+            "environmental_systems": []
+        },
+        {
+            "time": "2021-02-20T12:00:00+00:00",
+            "time_idx": 24,
+            "tc_position": {
+                "lat": 3.322361694168383,
+                "lon": 123.43943222910345
+            },
+            "tc_intensity_hpa": null,
+            "environmental_systems": []
+        },
+        {
+            "time": "2021-02-20T18:00:00+00:00",
+            "time_idx": 25,
+            "tc_position": {
+                "lat": 4.182050638284411,
+                "lon": 122.99256842313956
+            },
+            "tc_intensity_hpa": null,
+            "environmental_systems": []
+        },
+        {
+            "time": "2021-02-21T00:00:00+00:00",
+            "time_idx": 26,
+            "tc_position": {
+                "lat": 5.239997799700337,
+                "lon": 121.12571968168912
+            },
+            "tc_intensity_hpa": null,
+            "environmental_systems": []
+        },
+        {
+            "time": "2021-02-21T06:00:00+00:00",
+            "time_idx": 27,
+            "tc_position": {
+                "lat": 4.30855855856193,
+                "lon": 120.54054054053256
+            },
+            "tc_intensity_hpa": null,
+            "environmental_systems": []
+        },
+        {
+            "time": "2021-02-21T12:00:00+00:00",
+            "time_idx": 28,
+            "tc_position": {
+                "lat": 5.0,
+                "lon": 120.5
+            },
+            "tc_intensity_hpa": null,
+            "environmental_systems": []
+        },
+        {
+            "time": "2021-02-21T18:00:00+00:00",
+            "time_idx": 29,
+            "tc_position": {
+                "lat": 5.0,
+                "lon": 120.5
+            },
+            "tc_intensity_hpa": null,
+            "environmental_systems": []
+        },
+        {
+            "time": "2021-02-22T00:00:00+00:00",
+            "time_idx": 30,
+            "tc_position": {
+                "lat": 6.607572031272041,
+                "lon": 120.45843080799034
+            },
+            "tc_intensity_hpa": null,
+            "environmental_systems": []
+        },
+        {
+            "time": "2021-02-22T06:00:00+00:00",
+            "time_idx": 31,
+            "tc_position": {
+                "lat": 6.0,
+                "lon": 118.0
+            },
+            "tc_intensity_hpa": null,
+            "environmental_systems": []
+        },
+        {
+            "time": "2021-02-22T12:00:00+00:00",
+            "time_idx": 32,
+            "tc_position": {
+                "lat": 6.746158481470282,
+                "lon": 115.55430852666473
+            },
+            "tc_intensity_hpa": null,
+            "environmental_systems": []
+        },
+        {
+            "time": "2021-02-22T18:00:00+00:00",
+            "time_idx": 33,
+            "tc_position": {
+                "lat": 7.084567213874037,
+                "lon": 114.50426667254636
+            },
+            "tc_intensity_hpa": null,
+            "environmental_systems": []
+        },
+        {
+            "time": "2021-02-23T00:00:00+00:00",
+            "time_idx": 34,
+            "tc_position": {
+                "lat": 7.10875259464282,
+                "lon": 114.03137046555253
+            },
+            "tc_intensity_hpa": null,
+            "environmental_systems": []
+        },
+        {
+            "time": "2021-02-23T06:00:00+00:00",
+            "time_idx": 35,
+            "tc_position": {
+                "lat": 7.5,
+                "lon": 113.0
+            },
+            "tc_intensity_hpa": null,
+            "environmental_systems": []
+        },
+        {
+            "time": "2021-02-23T12:00:00+00:00",
+            "time_idx": 36,
+            "tc_position": {
+                "lat": 7.51433345322771,
+                "lon": 111.12101938750344
+            },
+            "tc_intensity_hpa": null,
+            "environmental_systems": []
+        },
+        {
+            "time": "2021-02-23T18:00:00+00:00",
+            "time_idx": 37,
+            "tc_position": {
+                "lat": 7.198045451899161,
+                "lon": 110.2125659150588
+            },
+            "tc_intensity_hpa": null,
+            "environmental_systems": []
+        },
+        {
+            "time": "2021-02-24T00:00:00+00:00",
+            "time_idx": 38,
+            "tc_position": {
+                "lat": 6.8732184640346325,
+                "lon": 109.63987777249838
+            },
+            "tc_intensity_hpa": null,
+            "environmental_systems": []
+        },
+        {
+            "time": "2021-02-24T06:00:00+00:00",
+            "time_idx": 39,
+            "tc_position": {
+                "lat": 6.842171318774972,
+                "lon": 109.34459901761797
+            },
+            "tc_intensity_hpa": null,
+            "environmental_systems": []
+        },
+        {
+            "time": "2021-02-24T12:00:00+00:00",
+            "time_idx": 40,
+            "tc_position": {
+                "lat": 6.572983429107958,
+                "lon": 108.65196330627224
+            },
+            "tc_intensity_hpa": null,
+            "environmental_systems": []
+        }
+    ]
+}
