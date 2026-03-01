@@ -1,0 +1,129 @@
+source,key,ok,elapsed_s,error,traceback_head,tracks_reported,env_reported,stage_guess,before_raw,before_nc,before_track_count,before_env_count,after_raw,after_nc,after_track_count,after_env_count,raw_size_mb,nc_size_mb,error_group
+tigge,2021-02-14_12,False,3.54,APIException: 'ecmwf.API error 1: Access token disabled',"Traceback (most recent call last):
+  File ""/home/jovyan/TianGong-AI-Cyclone/scripts/ec_dual_pipeline.py"", line 531, in _run_single_job
+    _download_one_job_tigge(date_str, run_hour, nc_path, grib_path, steps)
+  File ""/opt/conda/lib/python3.11/site-packages/tenacity/__init__.py"", line 331, in wrapped_f
+    return copy(f, *args, **kw)
+           ^^^^^^^^^^^^^^^^^^^^
+  File ""/opt/conda/lib/python3.11/site-packages/tenacity/__init__.py"", line 470, in __call__
+    do = self.iter(retry_state=retry_state)",0,0,download_or_early_failure,False,False,0,0,False,False,0,0,0.0,0.0,APIException: 'ecmwf.API error 1
+tigge,2021-02-15_00,False,3.37,APIException: 'ecmwf.API error 1: Access token disabled',"Traceback (most recent call last):
+  File ""/home/jovyan/TianGong-AI-Cyclone/scripts/ec_dual_pipeline.py"", line 531, in _run_single_job
+    _download_one_job_tigge(date_str, run_hour, nc_path, grib_path, steps)
+  File ""/opt/conda/lib/python3.11/site-packages/tenacity/__init__.py"", line 331, in wrapped_f
+    return copy(f, *args, **kw)
+           ^^^^^^^^^^^^^^^^^^^^
+  File ""/opt/conda/lib/python3.11/site-packages/tenacity/__init__.py"", line 470, in __call__
+    do = self.iter(retry_state=retry_state)",0,0,download_or_early_failure,False,False,0,0,False,False,0,0,0.0,0.0,APIException: 'ecmwf.API error 1
+tigge,2021-02-15_12,False,3.38,APIException: 'ecmwf.API error 1: Access token disabled',"Traceback (most recent call last):
+  File ""/home/jovyan/TianGong-AI-Cyclone/scripts/ec_dual_pipeline.py"", line 531, in _run_single_job
+    _download_one_job_tigge(date_str, run_hour, nc_path, grib_path, steps)
+  File ""/opt/conda/lib/python3.11/site-packages/tenacity/__init__.py"", line 331, in wrapped_f
+    return copy(f, *args, **kw)
+           ^^^^^^^^^^^^^^^^^^^^
+  File ""/opt/conda/lib/python3.11/site-packages/tenacity/__init__.py"", line 470, in __call__
+    do = self.iter(retry_state=retry_state)",0,0,download_or_early_failure,False,False,0,0,False,False,0,0,0.0,0.0,APIException: 'ecmwf.API error 1
+tigge,2021-02-16_00,False,3.35,APIException: 'ecmwf.API error 1: Access token disabled',"Traceback (most recent call last):
+  File ""/home/jovyan/TianGong-AI-Cyclone/scripts/ec_dual_pipeline.py"", line 531, in _run_single_job
+    _download_one_job_tigge(date_str, run_hour, nc_path, grib_path, steps)
+  File ""/opt/conda/lib/python3.11/site-packages/tenacity/__init__.py"", line 331, in wrapped_f
+    return copy(f, *args, **kw)
+           ^^^^^^^^^^^^^^^^^^^^
+  File ""/opt/conda/lib/python3.11/site-packages/tenacity/__init__.py"", line 470, in __call__
+    do = self.iter(retry_state=retry_state)",0,0,download_or_early_failure,False,False,0,0,False,False,0,0,0.0,0.0,APIException: 'ecmwf.API error 1
+tigge,2021-02-16_12,False,3.32,APIException: 'ecmwf.API error 1: Access token disabled',"Traceback (most recent call last):
+  File ""/home/jovyan/TianGong-AI-Cyclone/scripts/ec_dual_pipeline.py"", line 531, in _run_single_job
+    _download_one_job_tigge(date_str, run_hour, nc_path, grib_path, steps)
+  File ""/opt/conda/lib/python3.11/site-packages/tenacity/__init__.py"", line 331, in wrapped_f
+    return copy(f, *args, **kw)
+           ^^^^^^^^^^^^^^^^^^^^
+  File ""/opt/conda/lib/python3.11/site-packages/tenacity/__init__.py"", line 470, in __call__
+    do = self.iter(retry_state=retry_state)",0,0,download_or_early_failure,False,False,0,0,False,False,0,0,0.0,0.0,APIException: 'ecmwf.API error 1
+tigge,2021-02-17_00,False,3.34,APIException: 'ecmwf.API error 1: Access token disabled',"Traceback (most recent call last):
+  File ""/home/jovyan/TianGong-AI-Cyclone/scripts/ec_dual_pipeline.py"", line 531, in _run_single_job
+    _download_one_job_tigge(date_str, run_hour, nc_path, grib_path, steps)
+  File ""/opt/conda/lib/python3.11/site-packages/tenacity/__init__.py"", line 331, in wrapped_f
+    return copy(f, *args, **kw)
+           ^^^^^^^^^^^^^^^^^^^^
+  File ""/opt/conda/lib/python3.11/site-packages/tenacity/__init__.py"", line 470, in __call__
+    do = self.iter(retry_state=retry_state)",0,0,download_or_early_failure,False,False,0,0,False,False,0,0,0.0,0.0,APIException: 'ecmwf.API error 1
+tigge,2021-02-17_12,False,3.32,APIException: 'ecmwf.API error 1: Access token disabled',"Traceback (most recent call last):
+  File ""/home/jovyan/TianGong-AI-Cyclone/scripts/ec_dual_pipeline.py"", line 531, in _run_single_job
+    _download_one_job_tigge(date_str, run_hour, nc_path, grib_path, steps)
+  File ""/opt/conda/lib/python3.11/site-packages/tenacity/__init__.py"", line 331, in wrapped_f
+    return copy(f, *args, **kw)
+           ^^^^^^^^^^^^^^^^^^^^
+  File ""/opt/conda/lib/python3.11/site-packages/tenacity/__init__.py"", line 470, in __call__
+    do = self.iter(retry_state=retry_state)",0,0,download_or_early_failure,False,False,0,0,False,False,0,0,0.0,0.0,APIException: 'ecmwf.API error 1
+tigge,2021-02-18_00,False,3.34,APIException: 'ecmwf.API error 1: Access token disabled',"Traceback (most recent call last):
+  File ""/home/jovyan/TianGong-AI-Cyclone/scripts/ec_dual_pipeline.py"", line 531, in _run_single_job
+    _download_one_job_tigge(date_str, run_hour, nc_path, grib_path, steps)
+  File ""/opt/conda/lib/python3.11/site-packages/tenacity/__init__.py"", line 331, in wrapped_f
+    return copy(f, *args, **kw)
+           ^^^^^^^^^^^^^^^^^^^^
+  File ""/opt/conda/lib/python3.11/site-packages/tenacity/__init__.py"", line 470, in __call__
+    do = self.iter(retry_state=retry_state)",0,0,download_or_early_failure,False,False,0,0,False,False,0,0,0.0,0.0,APIException: 'ecmwf.API error 1
+aws,2021-02-14_12,False,3.45,RuntimeError: no available S3 prefix for 2021-02-14_12,"Traceback (most recent call last):
+  File ""/home/jovyan/TianGong-AI-Cyclone/scripts/ec_dual_pipeline.py"", line 526, in _run_single_job
+    _download_one_job_aws(date_str, run_hour, grib_path, steps)
+  File ""/opt/conda/lib/python3.11/site-packages/tenacity/__init__.py"", line 331, in wrapped_f
+    return copy(f, *args, **kw)
+           ^^^^^^^^^^^^^^^^^^^^
+  File ""/opt/conda/lib/python3.11/site-packages/tenacity/__init__.py"", line 470, in __call__
+    do = self.iter(retry_state=retry_state)",0,0,aws_data_unavailable_or_s3,False,False,0,0,False,False,0,0,0.0,0.0,RuntimeError: no available S3 prefix for 2021-02-14_12
+aws,2021-02-15_00,False,3.36,RuntimeError: no available S3 prefix for 2021-02-15_00,"Traceback (most recent call last):
+  File ""/home/jovyan/TianGong-AI-Cyclone/scripts/ec_dual_pipeline.py"", line 526, in _run_single_job
+    _download_one_job_aws(date_str, run_hour, grib_path, steps)
+  File ""/opt/conda/lib/python3.11/site-packages/tenacity/__init__.py"", line 331, in wrapped_f
+    return copy(f, *args, **kw)
+           ^^^^^^^^^^^^^^^^^^^^
+  File ""/opt/conda/lib/python3.11/site-packages/tenacity/__init__.py"", line 470, in __call__
+    do = self.iter(retry_state=retry_state)",0,0,aws_data_unavailable_or_s3,False,False,0,0,False,False,0,0,0.0,0.0,RuntimeError: no available S3 prefix for 2021-02-15_00
+aws,2021-02-15_12,False,3.38,RuntimeError: no available S3 prefix for 2021-02-15_12,"Traceback (most recent call last):
+  File ""/home/jovyan/TianGong-AI-Cyclone/scripts/ec_dual_pipeline.py"", line 526, in _run_single_job
+    _download_one_job_aws(date_str, run_hour, grib_path, steps)
+  File ""/opt/conda/lib/python3.11/site-packages/tenacity/__init__.py"", line 331, in wrapped_f
+    return copy(f, *args, **kw)
+           ^^^^^^^^^^^^^^^^^^^^
+  File ""/opt/conda/lib/python3.11/site-packages/tenacity/__init__.py"", line 470, in __call__
+    do = self.iter(retry_state=retry_state)",0,0,aws_data_unavailable_or_s3,False,False,0,0,False,False,0,0,0.0,0.0,RuntimeError: no available S3 prefix for 2021-02-15_12
+aws,2021-02-16_00,False,3.3,RuntimeError: no available S3 prefix for 2021-02-16_00,"Traceback (most recent call last):
+  File ""/home/jovyan/TianGong-AI-Cyclone/scripts/ec_dual_pipeline.py"", line 526, in _run_single_job
+    _download_one_job_aws(date_str, run_hour, grib_path, steps)
+  File ""/opt/conda/lib/python3.11/site-packages/tenacity/__init__.py"", line 331, in wrapped_f
+    return copy(f, *args, **kw)
+           ^^^^^^^^^^^^^^^^^^^^
+  File ""/opt/conda/lib/python3.11/site-packages/tenacity/__init__.py"", line 470, in __call__
+    do = self.iter(retry_state=retry_state)",0,0,aws_data_unavailable_or_s3,False,False,0,0,False,False,0,0,0.0,0.0,RuntimeError: no available S3 prefix for 2021-02-16_00
+aws,2021-02-16_12,False,3.23,RuntimeError: no available S3 prefix for 2021-02-16_12,"Traceback (most recent call last):
+  File ""/home/jovyan/TianGong-AI-Cyclone/scripts/ec_dual_pipeline.py"", line 526, in _run_single_job
+    _download_one_job_aws(date_str, run_hour, grib_path, steps)
+  File ""/opt/conda/lib/python3.11/site-packages/tenacity/__init__.py"", line 331, in wrapped_f
+    return copy(f, *args, **kw)
+           ^^^^^^^^^^^^^^^^^^^^
+  File ""/opt/conda/lib/python3.11/site-packages/tenacity/__init__.py"", line 470, in __call__
+    do = self.iter(retry_state=retry_state)",0,0,aws_data_unavailable_or_s3,False,False,0,0,False,False,0,0,0.0,0.0,RuntimeError: no available S3 prefix for 2021-02-16_12
+aws,2021-02-17_00,False,3.37,RuntimeError: no available S3 prefix for 2021-02-17_00,"Traceback (most recent call last):
+  File ""/home/jovyan/TianGong-AI-Cyclone/scripts/ec_dual_pipeline.py"", line 526, in _run_single_job
+    _download_one_job_aws(date_str, run_hour, grib_path, steps)
+  File ""/opt/conda/lib/python3.11/site-packages/tenacity/__init__.py"", line 331, in wrapped_f
+    return copy(f, *args, **kw)
+           ^^^^^^^^^^^^^^^^^^^^
+  File ""/opt/conda/lib/python3.11/site-packages/tenacity/__init__.py"", line 470, in __call__
+    do = self.iter(retry_state=retry_state)",0,0,aws_data_unavailable_or_s3,False,False,0,0,False,False,0,0,0.0,0.0,RuntimeError: no available S3 prefix for 2021-02-17_00
+aws,2021-02-17_12,False,3.28,RuntimeError: no available S3 prefix for 2021-02-17_12,"Traceback (most recent call last):
+  File ""/home/jovyan/TianGong-AI-Cyclone/scripts/ec_dual_pipeline.py"", line 526, in _run_single_job
+    _download_one_job_aws(date_str, run_hour, grib_path, steps)
+  File ""/opt/conda/lib/python3.11/site-packages/tenacity/__init__.py"", line 331, in wrapped_f
+    return copy(f, *args, **kw)
+           ^^^^^^^^^^^^^^^^^^^^
+  File ""/opt/conda/lib/python3.11/site-packages/tenacity/__init__.py"", line 470, in __call__
+    do = self.iter(retry_state=retry_state)",0,0,aws_data_unavailable_or_s3,False,False,0,0,False,False,0,0,0.0,0.0,RuntimeError: no available S3 prefix for 2021-02-17_12
+aws,2021-02-18_00,False,3.3,RuntimeError: no available S3 prefix for 2021-02-18_00,"Traceback (most recent call last):
+  File ""/home/jovyan/TianGong-AI-Cyclone/scripts/ec_dual_pipeline.py"", line 526, in _run_single_job
+    _download_one_job_aws(date_str, run_hour, grib_path, steps)
+  File ""/opt/conda/lib/python3.11/site-packages/tenacity/__init__.py"", line 331, in wrapped_f
+    return copy(f, *args, **kw)
+           ^^^^^^^^^^^^^^^^^^^^
+  File ""/opt/conda/lib/python3.11/site-packages/tenacity/__init__.py"", line 470, in __call__
+    do = self.iter(retry_state=retry_state)",0,0,aws_data_unavailable_or_s3,False,False,0,0,False,False,0,0,0.0,0.0,RuntimeError: no available S3 prefix for 2021-02-18_00

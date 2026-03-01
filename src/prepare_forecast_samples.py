@@ -908,7 +908,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument(
         "--truth-csv",
         type=Path,
-        default=Path("input") / "western_pacific_typhoons_superfast.csv",
+        default=Path("input") / "matched_cyclone_tracks_2021onwards.csv",
         help="真实气旋路径CSV路径",
     )
     parser.add_argument(

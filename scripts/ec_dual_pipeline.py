@@ -701,7 +701,7 @@ def main() -> None:
     parser.add_argument("--steps", default=",".join(str(s) for s in range(0, 241, 6)))
     parser.add_argument("--workers", type=int, default=2)
     parser.add_argument("--match-tol-hours", type=int, default=6)
-    parser.add_argument("--initials-csv", default=str(PROJECT_ROOT / "input" / "western_pacific_typhoons_superfast.csv"))
+    parser.add_argument("--initials-csv", default=str(PROJECT_ROOT / "input" / "matched_cyclone_tracks_2021onwards.csv"))
     parser.add_argument("--mp-context", default="fork")
     parser.add_argument("--cleanup-intermediates-before-run", dest="cleanup", action="store_true")
     parser.add_argument("--no-cleanup-intermediates-before-run", dest="cleanup", action="store_false")

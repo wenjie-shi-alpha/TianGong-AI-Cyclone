@@ -46,7 +46,7 @@ def main(args: Optional[List[str]] = None) -> None:
     parser = argparse.ArgumentParser(description="基于初始点与 NetCDF 文件的热带气旋逐步追踪")
     parser.add_argument(
         "--initials_csv",
-        default=str(Path("input") / "western_pacific_typhoons_superfast.csv"),
+        default=str(Path("input") / "matched_cyclone_tracks_2021onwards.csv"),
         help="包含每个气旋起始点的 CSV 路径",
     )
     parser.add_argument(

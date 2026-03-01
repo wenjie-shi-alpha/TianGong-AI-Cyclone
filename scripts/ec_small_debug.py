@@ -304,7 +304,7 @@ def main() -> None:
     parser.add_argument("--steps", default="0,6,12,18,24")
     parser.add_argument(
         "--initials",
-        default=str(PROJECT_ROOT / "input" / "western_pacific_typhoons_superfast.csv"),
+        default=str(PROJECT_ROOT / "input" / "matched_cyclone_tracks_2021onwards.csv"),
     )
     parser.add_argument("--max-storms", type=int, default=3)
     parser.add_argument("--time-window-hours", type=int, default=6)

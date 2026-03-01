@@ -65,7 +65,7 @@ pip freeze > requirements_freeze.txt
 
 aws s3 ls --no-sign-request --region us-east-1 s3://noaa-oar-mlwp-data/
 
-# 使用默认数据集 (western_pacific_typhoons_superfast.csv)
+# 使用默认数据集 (matched_cyclone_tracks_2021onwards.csv)
 python3 src/extractSyst.py --csv output/nc_file_urls.csv --limit 10 --processes 15 --concise-log --auto
 python3 src/extractSyst.py --csv output/nc_file_urls.csv --limit 1 --auto --no-clean
 

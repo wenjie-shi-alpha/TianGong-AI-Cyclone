@@ -108,7 +108,7 @@ def main():
     )
     parser.add_argument(
         "--input",
-        default="input/western_pacific_typhoons_superfast.csv",
+        default="input/matched_cyclone_tracks_2021onwards.csv",
         help="Input CSV path with 'datetime' column",
     )
     parser.add_argument("--output", default="output/nc_file_urls.csv", help="Output CSV path")

@@ -32,7 +32,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--memory", type=int, default=3, help="追踪记忆时间步")
     parser.add_argument(
         "--initials",
-        default=str(Path("input") / "western_pacific_typhoons_superfast.csv"),
+        default=str(Path("input") / "matched_cyclone_tracks_2021onwards.csv"),
         help="initialTracker 初始点CSV",
     )
     parser.add_argument(
@@ -98,7 +98,7 @@ def _prepare_batch_targets(
     if initials_csv.exists():
         initials_path = initials_csv
     else:
-        fallback = Path("input/western_pacific_typhoons_superfast.csv")
+        fallback = Path("input/matched_cyclone_tracks_2021onwards.csv")
         if fallback.exists():
             summary(f"⚠️ 指定初始点文件不存在, 使用默认: {fallback}")
             initials_path = fallback

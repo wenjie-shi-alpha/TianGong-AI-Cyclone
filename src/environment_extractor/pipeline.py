@@ -375,7 +375,7 @@ def streaming_from_csv(
             if track_csv is None:
                 try:
                     detail("🧭 使用 initialTracker 执行追踪...")
-                    initials_path = initials_csv or Path("input/western_pacific_typhoons_superfast.csv")
+                    initials_path = initials_csv or Path("input/matched_cyclone_tracks_2021onwards.csv")
                     initials_df = it_load_initial_points(initials_path)
                     per_storm_csvs = it_track_file_with_initials(
                         Path(nc_local), initials_df, track_dir
@@ -660,7 +660,7 @@ def process_nc_files(
                     initials_path = (
                         Path(args.initials)
                         if args.initials
-                        else Path("input/western_pacific_typhoons_superfast.csv")
+                        else Path("input/matched_cyclone_tracks_2021onwards.csv")
                     )
                     initials_df = it_load_initial_points(initials_path)
                     out_dir = Path("track_single")
